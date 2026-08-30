@@ -1,0 +1,8 @@
+# 运行时数据（含登录会话，切勿随项目分发）
+data/
+.test/
+
+node_modules/
+*.log
+.DS_Store
+Thumbs.db

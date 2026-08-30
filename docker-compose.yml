@@ -1,0 +1,14 @@
+services:
+  jm-web:
+    build: .
+    container_name: jm-web
+    restart: unless-stopped
+    ports:
+      - "3210:3210"
+    environment:
+      # 访问口令（建议设置，避免站点被陌生人访问）
+      - ACCESS_PASSWORD=${ACCESS_PASSWORD:-}
+      # API 域名覆盖（可选，逗号分隔多个候选）
+      - JM_API_BASE=${JM_API_BASE:-}
+    volumes:
+      - ./data:/app/data
