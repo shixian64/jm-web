@@ -5,7 +5,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const root = path.join(__dirname, '..');
-const files = [path.join(root, 'server.js')];
+const files = [path.join(root, 'server.js'), path.join(root, 'public', 'sw.js')];
 for (const dir of ['lib', path.join('public', 'js')]) {
   const absolute = path.join(root, dir);
   for (const name of fs.readdirSync(absolute).sort()) {

@@ -6,7 +6,7 @@
  *
  * 环境变量：
  *  PORT            监听端口（默认 3210）
- *  HOST            监听地址（默认 0.0.0.0）
+ *  HOST            监听地址（默认 127.0.0.1）
  *  ACCESS_PASSWORD 设置后所有 /api 需要访问口令（简单访问保护）
  *  JM_API_BASE     固定 API 域名（逗号分隔；设置后锁定，接口不可更改）
  *  JM_UA           上游 UA（默认 okhttp/4.9.3）
@@ -35,7 +35,8 @@ const PORT = portIsValid ? configuredPort : 3210;
 if (process.env.PORT && !portIsValid) {
   console.warn(`[警告] PORT=${JSON.stringify(process.env.PORT)} 非法，已回退到 3210（允许 1-65535 的整数）`);
 }
-const HOST = process.env.HOST || '0.0.0.0';
+// 直接运行默认只监听回环；容器内需要端口发布时由镜像显式设置 0.0.0.0。
+const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const ACCESS_PASSWORD = process.env.ACCESS_PASSWORD || '';
 
@@ -107,7 +108,7 @@ if (nodeMajor < 20 || typeof fetch !== 'function') {
   process.exit(1);
 }
 if (!ACCESS_PASSWORD) {
-  console.warn('[警告] 未设置 ACCESS_PASSWORD：任何访客都可以使用本站，并可在设置中切换自己的 API 线路');
+  console.warn('[警告] 未设置 ACCESS_PASSWORD：普通功能不受口令保护；运维日志和全局 DoH 仅允许无反代的直接回环访问，容器/反代部署需配置口令');
 }
 
 // 环境变量指定的 API 域名优先级最高且锁定（仅内存，不写入设置文件）
@@ -196,13 +197,29 @@ function readBody(req, limit = 1 << 20) {
 }
 
 async function readJsonBody(req) {
+  const contentType = String((req.headers && req.headers['content-type']) || '')
+    .split(';', 1)[0].trim().toLowerCase();
+  if (contentType !== 'application/json' && !/^application\/[a-z0-9!#$&^_.+-]+\+json$/.test(contentType)) {
+    // 已能在读取正文前判定 415，但仍让 IncomingMessage 进入 flowing 模式并
+    // 丢弃剩余字节，避免未消费请求体占住 keep-alive 连接或阻塞后续请求。
+    if (typeof req.resume === 'function') req.resume();
+    throw new ApiError('Content-Type 必须为 application/json', 415);
+  }
   const buf = await readBody(req);
   if (!buf.length) return {};
+  let value;
   try {
-    return JSON.parse(buf.toString('utf8'));
+    value = JSON.parse(buf.toString('utf8'));
   } catch (_) {
     throw new ApiError('请求体不是合法 JSON', 400);
   }
+  // 所有当前 POST 接口都使用具名字段；拒绝 null、数组和 JSON 原始值，
+  // 避免下游读取 body.foo 时抛出 TypeError，也让各接口保持一致的 400 语义。
+  if (value === null || typeof value !== 'object' || Array.isArray(value) ||
+      Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new ApiError('请求体必须是 JSON 对象', 400);
+  }
+  return value;
 }
 
 function getCookie(req, name) {
@@ -370,10 +387,56 @@ function checkAccess(req) {
 }
 
 function checkPassword(password) {
+  if (!ACCESS_PASSWORD) return false;
   // 比较双方口令的 sha256（长度恒定），可用 timingSafeEqual 防时序侧信道
   const given = crypto.createHash('sha256').update(String(password)).digest();
   const expected = crypto.createHash('sha256').update(ACCESS_PASSWORD).digest();
   return crypto.timingSafeEqual(given, expected);
+}
+
+function requestTargetsLoopbackHost(req) {
+  const raw = req.headers && req.headers.host;
+  if (typeof raw !== 'string' || !raw || raw.includes(',')) return false;
+  try {
+    const parsed = new URL(`http://${raw}`);
+    if (parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) return false;
+    const hostname = parsed.hostname.toLowerCase();
+    return hostname === 'localhost' || isLoopbackIp(normalizeIp(hostname));
+  } catch (_) {
+    return false;
+  }
+}
+
+function requestHasSafeBrowserContext(req) {
+  const fetchSite = req.headers && req.headers['sec-fetch-site'];
+  if (fetchSite !== undefined && fetchSite !== 'same-origin' && fetchSite !== 'none') return false;
+
+  const origin = req.headers && req.headers.origin;
+  if (origin === undefined) return true; // curl/脚本没有浏览器来源元数据。
+  if (typeof origin !== 'string' || !origin || origin === 'null') return false;
+  try {
+    const scheme = requestIsSecure(req) ? 'https' : 'http';
+    return new URL(origin).origin === new URL(`${scheme}://${req.headers.host}`).origin;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * 日志和全局 DoH 设置属于实例级运维能力，而不是普通访客设置。
+ * - 配置访问口令后，沿用站点口令鉴权；
+ * - 未配置口令时只允许直接 TCP 回环、回环 Host、同源 JSON 请求。
+ *   该模式刻意不信任反代/NAT；容器或反向代理部署必须配置口令。
+ */
+function checkOperationalAccess(req) {
+  if (ACCESS_PASSWORD) return checkAccess(req);
+  const peer = normalizeIp(req.socket && req.socket.remoteAddress);
+  if (!isLoopbackIp(peer)) return false;
+  // 无口令模式不支持任何反代链，避免本机反代错误保留 Host 时把远端当本机。
+  const forwardingHeaders = new Set(['forwarded', 'x-real-ip', 'cf-connecting-ip', 'true-client-ip', 'via']);
+  if (req.headers && Object.keys(req.headers).some((name) =>
+    forwardingHeaders.has(name) || name.startsWith('x-forwarded-'))) return false;
+  return requestTargetsLoopbackHost(req) && requestHasSafeBrowserContext(req);
 }
 
 /* ----------------------------- 图片代理 ----------------------------- */
@@ -648,7 +711,14 @@ async function sendUpstreamImage(res, response, cacheDays, requestSignal, drainT
 }
 
 function imageErrorStatus(e) {
-  return e instanceof ApiError && e.code >= 400 && e.code < 600 ? e.code : 502;
+  const candidate = e instanceof ApiError ? Number(e.code) : NaN;
+  return Number.isInteger(candidate) && candidate >= 400 && candidate < 600 ? candidate : 502;
+}
+
+function publicErrorMessage(error, fallback) {
+  return error instanceof ApiError && error.expose === true
+    ? (error.publicMessage || error.message || fallback)
+    : fallback;
 }
 
 async function proxyImage(res, urlStr, cacheDays = 7, clientSignal) {
@@ -663,7 +733,10 @@ async function proxyImage(res, urlStr, cacheDays = 7, clientSignal) {
     await sendUpstreamImage(res, response, cacheDays, fetched.signal);
   } catch (e) {
     if ((clientSignal && clientSignal.aborted) || isClientDisconnectError(e) || res.destroyed) return;
-    if (!res.headersSent) sendJson(res, imageErrorStatus(e), { error: '图片获取失败：' + e.message });
+    if (!(e instanceof ApiError) || e.expose !== true) console.error('[image] 内部错误:', e);
+    if (!res.headersSent) sendJson(res, imageErrorStatus(e), {
+      error: publicErrorMessage(e, '图片获取失败'),
+    });
     else res.destroy();
   } finally {
     if (fetched) fetched.cleanup();
@@ -712,7 +785,12 @@ async function proxyImagePath(res, p, clientSignal) {
         if (!res.destroyed) res.destroy();
         return;
       }
-      lastError = e.message || lastError;
+      if (!(e instanceof ApiError) || e.expose !== true) {
+        console.error('[image] 内部错误:', e);
+        lastError = '图片获取失败';
+      } else {
+        lastError = publicErrorMessage(e, lastError);
+      }
       lastStatus = imageErrorStatus(e);
       // 只对网络层故障做负缓存；MIME/重定向安全拒绝不污染域名健康状态。
       if (!(e instanceof ApiError)) imageHostFailedUntil.set(host, now + 60000);
@@ -804,7 +882,8 @@ async function api(req, res, u, requestSignal) {
         hasAccessPassword: !!ACCESS_PASSWORD,
         advanced: {
           ai: features.aiConfig(),
-          doh: features.getDohState(),
+          // DoH 自定义地址和运行策略只经受保护的 /api/doh 返回。
+          doh: { available: true },
           localFolders: true,
           offline: true,
         },
@@ -1209,7 +1288,25 @@ async function api(req, res, u, requestSignal) {
     }
 
     case '/doh': {
-      if (req.method === 'GET') return sendJson(res, 200, features.getDohState());
+      if (req.method === 'GET') {
+        const doh = features.getDohState();
+        if (checkOperationalAccess(req)) return sendJson(res, 200, doh);
+        // 普通访客仍需加载“数据源”页面，但不得读取自定义解析地址/名称。
+        return sendJson(res, 200, {
+          enabled: !!doh.enabled,
+          configuredEnabled: !!doh.configuredEnabled,
+          autoStart: !!doh.autoStart,
+          preferIpv6: !!doh.preferIpv6,
+          current: String(doh.current || ''),
+          customName: '',
+          customUrl: '',
+          certificatePolicy: String(doh.certificatePolicy || ''),
+          providers: (doh.providers || []).map((provider) => provider.id === 'custom'
+            ? { id: 'custom', name: '自定义 DoH', url: '' }
+            : { id: String(provider.id || ''), name: String(provider.name || ''), url: String(provider.url || '') }),
+          restricted: true,
+        });
+      }
       const body = await readJsonBody(req);
       return sendJson(res, 200, features.setDohState(body));
     }
@@ -1252,31 +1349,37 @@ async function api(req, res, u, requestSignal) {
 /* ----------------------------- 静态文件 ----------------------------- */
 
 function serveStatic(req, res, u) {
+  // 静态错误不能被浏览器或 CDN 负缓存。否则一次发布时序或拼写错误
+  // 可能让随后已经存在的同名资源继续返回缓存的 404。
+  const staticErrorHeaders = () => baseHeaders({
+    'Content-Type': 'text/plain; charset=utf-8',
+    'Cache-Control': 'no-store',
+  });
   let p;
   try {
     p = decodeURIComponent(u.pathname);
   } catch (_) {
-    res.writeHead(400, baseHeaders());
+    res.writeHead(400, staticErrorHeaders());
     return res.end('Bad Request');
   }
   // Node 的 fs API 会对含 NUL 的路径同步抛错；在进入异步文件操作前拒绝，
   // 避免 async request listener 产生未处理 rejection 并终止进程。
   if (p.includes('\0')) {
-    res.writeHead(400, baseHeaders());
+    res.writeHead(400, staticErrorHeaders());
     return res.end('Bad Request');
   }
   if (p === '/') p = '/index.html';
   const file = path.normalize(path.join(PUBLIC_DIR, p));
   // 防目录穿越：必须在 public 内（附加分隔符，避免 public* 兄弟目录被前缀匹配放行）
   if (file !== PUBLIC_DIR && !file.startsWith(PUBLIC_DIR + path.sep)) {
-    res.writeHead(403, baseHeaders());
+    res.writeHead(403, staticErrorHeaders());
     return res.end('Forbidden');
   }
 
   const sendKnownFile = (target, st, isSpaFallback = false) => {
     if (!st || !st.isFile()) {
       if (isSpaFallback) {
-        res.writeHead(500, baseHeaders());
+        res.writeHead(500, staticErrorHeaders());
         return res.end('index.html missing');
       }
       return fallbackOrNotFound();
@@ -1303,7 +1406,7 @@ function serveStatic(req, res, u) {
     fs.readFile(target, (error, buf) => {
       if (error) {
         if (isSpaFallback) {
-          res.writeHead(500, baseHeaders());
+          res.writeHead(500, staticErrorHeaders());
           return res.end('index.html missing');
         }
         return fallbackOrNotFound();
@@ -1321,13 +1424,13 @@ function serveStatic(req, res, u) {
       const index = path.join(PUBLIC_DIR, 'index.html');
       return fs.stat(index, (error, st) => {
         if (error) {
-          res.writeHead(500, baseHeaders());
+          res.writeHead(500, staticErrorHeaders());
           return res.end('index.html missing');
         }
         sendKnownFile(index, st, true);
       });
     }
-    res.writeHead(404, baseHeaders());
+    res.writeHead(404, staticErrorHeaders());
     return res.end('Not Found');
   };
 
@@ -1350,7 +1453,8 @@ const server = http.createServer(async (req, res) => {
   }
   res.on('finish', () => {
     if (u.pathname.startsWith('/api/') && u.pathname !== '/api/img') {
-      const message = `${req.method} ${u.pathname}${u.search} -> ${res.statusCode} (${Date.now() - started}ms)`;
+      // 查询参数可能包含搜索词、用户标识或临时凭据；访问日志只记录路由。
+      const message = `${req.method} ${u.pathname} -> ${res.statusCode} (${Date.now() - started}ms)`;
       console.log(`[api] ${message}`);
       features.addLog(res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info', message);
     }
@@ -1382,12 +1486,19 @@ const server = http.createServer(async (req, res) => {
       if (ACCESS_PASSWORD && u.pathname !== '/api/auth' && !checkAccess(req)) {
         return sendJson(res, 401, { error: '需要访问口令', needAuth: true });
       }
+      const operationalRoute = route === '/logs' || (route === '/doh' && req.method !== 'GET') || route === '/doh/test';
+      if (operationalRoute && !checkOperationalAccess(req)) {
+        return sendJson(res, 403, { error: '该运维操作仅限站点管理员' });
+      }
       await api(req, res, u, clientAbort.signal);
     } catch (e) {
       if (clientAbort.signal.aborted || res.destroyed || isClientDisconnectError(e)) return;
-      const status = e instanceof ApiError ? (e.code >= 400 && e.code < 600 ? e.code : 502) : 500;
-      if (!(e instanceof ApiError)) console.error('[api] 内部错误:', e);
-      if (!res.headersSent) sendJson(res, status, { error: e.message || '服务器内部错误' });
+      const status = e instanceof ApiError ? imageErrorStatus(e) : 500;
+      const exposed = e instanceof ApiError && e.expose === true;
+      if (!exposed) console.error(`[api] 内部错误 ${req.method} ${u.pathname}:`, e);
+      // 只有显式标为可公开的 ApiError 才能回显；5xx 默认只保留在服务端诊断日志。
+      const publicMessage = exposed ? (e.publicMessage || e.message || '请求处理失败') : '服务器内部错误';
+      if (!res.headersSent) sendJson(res, status, { error: publicMessage });
       else res.end();
     } finally {
       clientAbort.cleanup();

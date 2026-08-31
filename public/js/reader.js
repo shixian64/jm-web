@@ -13,6 +13,37 @@ import {
 
 const RAW_CACHE_LIMIT = 24;
 const READER_TUTORIAL_KEY = 'jmw_reader_tutorial_dismissed_v1';
+const SAFE_IMAGE_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']);
+
+export function normalizeChapterImages(value) {
+  if (!Array.isArray(value)) return [];
+  const images = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    let parsed;
+    try { parsed = new URL(String(item.url || '').trim()); } catch (_) { continue; }
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password) continue;
+    parsed.hash = '';
+    const fallbackName = parsed.pathname.split('/').pop() || `page-${images.length + 1}`;
+    images.push({
+      ...item,
+      url: parsed.href,
+      name: String(item.name || fallbackName),
+      page: String(item.page || '').trim(),
+    });
+  }
+  return images;
+}
+
+export function normalizeReaderSeries(value) {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item) => item && typeof item === 'object' && /^\d+$/.test(String(item.id || '')))
+    .map((item, index) => ({
+      id: String(item.id),
+      name: String(item.name || '').trim(),
+      sort: Number(item.sort) || index,
+    }));
+}
 
 export function mountReader(root, photoId, query, options = {}) {
   const aid = query.get('aid') || '';
@@ -702,20 +733,23 @@ export function mountReader(root, photoId, query, options = {}) {
       return;
     }
     if (state.destroyed) return;
-    const d = data.data || {};
-    state.images = d.images || [];
+    const d = data && data.data && typeof data.data === 'object' && !Array.isArray(data.data)
+      ? data.data : {};
+    state.images = normalizeChapterImages(d.images);
+    if (!state.images.length) {
+      showFatal('章节没有返回可读取的安全图片，请稍后重试或切换线路');
+      return;
+    }
     state.scrambleId = d.scrambleId || 0;
     state.speed = d.speed || '';
     activeImageShunt = requestedShunt;
 
     const album = await albumPromise;
     if (state.destroyed) return;
-    if (album && album.data) {
-      state.albumName = album.data.name || '';
+    if (album && album.data && typeof album.data === 'object' && !Array.isArray(album.data)) {
+      state.albumName = String(album.data.name || '');
       state.cover = imgSrc({ id: state.aid, image: album.data.image });
-      const series = (album.data.series || []).map((s) => ({
-        id: String(s.id), name: String(s.name || '').trim(), sort: Number(s.sort) || 0,
-      }));
+      const series = normalizeReaderSeries(album.data.series);
       if (series.length > 1 || (series.length === 1 && album.data.series_id && album.data.series_id !== '0')) {
         series.sort((a, b) => a.sort - b.sort);
         state.chapters = series;
@@ -829,12 +863,14 @@ export function mountReader(root, photoId, query, options = {}) {
     try {
       const data = await readerRequest(`/chapter?id=${encodeURIComponent(state.photoId)}&shunt=${encodeURIComponent(shunt)}`);
       if (state.destroyed || seq !== sourceRefreshSeq) return;
-      const next = data && data.data || {};
-      if (!Array.isArray(next.images) || !next.images.length) throw new Error('新线路没有返回有效图片');
+      const next = data && data.data && typeof data.data === 'object' && !Array.isArray(data.data)
+        ? data.data : {};
+      const nextImages = normalizeChapterImages(next.images);
+      if (!nextImages.length) throw new Error('新线路没有返回有效图片');
 
       const previousTotal = state.images.length;
       restartImagePipeline({ reuseDecoded: false });
-      state.images = next.images;
+      state.images = nextImages;
       state.scrambleId = next.scrambleId || 0;
       state.speed = next.speed || '';
       state.cur = Math.max(0, Math.min(state.images.length - 1, state.cur));
@@ -909,7 +945,14 @@ export function mountReader(root, photoId, query, options = {}) {
         signal: imageSignal,
       });
       if (!res.ok) throw new Error(`图片 ${idx + 1} 获取失败（${res.status}）`);
+      const responseMime = String(res.headers?.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
+      if (!SAFE_IMAGE_MIME.has(responseMime)) {
+        throw new Error(`图片 ${idx + 1} 返回了不支持的内容类型`);
+      }
       blob = await res.blob();
+      if (!(blob instanceof Blob) || !blob.size) throw new Error(`图片 ${idx + 1} 返回了空内容`);
+      const blobMime = String(blob.type || '').split(';', 1)[0].trim().toLowerCase();
+      if (!SAFE_IMAGE_MIME.has(blobMime)) throw new Error(`图片 ${idx + 1} 返回了无效图片内容`);
     }
     assertImageActive(generation, imageSignal);
     state.raws.set(idx, blob);

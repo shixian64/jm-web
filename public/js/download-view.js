@@ -38,6 +38,12 @@ function bytes(value) {
   return `${n >= 10 || unit === 0 ? n.toFixed(0) : n.toFixed(1)} ${units[unit]}`;
 }
 
+function emptyState(title, description = '') {
+  return element('div', { class: 'download-empty' },
+    element('strong', { text: title }),
+    description ? element('span', { text: description }) : null);
+}
+
 function confirmLargePdf(chapters, selectedIds = null) {
   const wanted = selectedIds && selectedIds.length ? new Set(selectedIds.map(String)) : null;
   const selected = chapters.filter((chapter) => chapter.complete
@@ -124,7 +130,7 @@ export function mountDownloadCenter(root, options = {}) {
   element('label', { class: 'download-select-all' }, selectAll, selectAllText),
   batchSummary,
   element('div', { class: 'download-batch-actions' }, ...batchButtons));
-  const taskEmpty = element('div', { class: 'download-empty', text: '还没有下载任务，可从漫画详情页选择下载。' });
+  const taskEmpty = emptyState('还没有下载任务', '可从漫画详情页选择章节或整本下载。');
   taskArea.append(
     element('div', { class: 'download-section-heading' }, taskHeading, batchToggle),
     batchToolbar,
@@ -135,6 +141,7 @@ export function mountDownloadCenter(root, options = {}) {
   const container = element('div', { class: 'download-center' },
     element('header', { class: 'download-center-head' },
       element('div', null,
+        element('span', { class: 'download-kicker', text: 'LOCAL LIBRARY' }),
         element('h1', { text: '下载与离线' }),
         element('p', { text: '下载后的正文保存在当前浏览器，可断网阅读。' }),
       ),
@@ -561,7 +568,7 @@ export function mountDownloadCenter(root, options = {}) {
         ));
       }
       const libraryNodes = [element('h2', { text: `离线资料库 (${albums.length})` }), albumGrid];
-      if (!albums.length) libraryNodes.push(element('div', { class: 'download-empty', text: '暂无离线漫画。' }));
+      if (!albums.length) libraryNodes.push(emptyState('离线资料库为空', '下载完成的漫画会显示在这里。'));
       libraryArea.replaceChildren(...libraryNodes);
       for (const url of coverUrls) URL.revokeObjectURL(url);
       coverUrls.clear();
@@ -585,7 +592,7 @@ export function mountDownloadCenter(root, options = {}) {
       if (!destroyed) {
         for (const url of coverUrls) URL.revokeObjectURL(url);
         coverUrls.clear();
-        libraryArea.replaceChildren(element('div', { class: 'download-empty', text: error.message || '下载中心加载失败' }));
+        libraryArea.replaceChildren(emptyState('下载中心加载失败', error.message || '请稍后重试。'));
       }
     }).finally(() => { libraryRenderPromise = null; });
     return libraryRenderPromise;
@@ -608,7 +615,7 @@ export function mountDownloadCenter(root, options = {}) {
 
   const unsubscribe = downloads.subscribe(handleDownloadChange);
   refresh().catch((error) => {
-    if (!destroyed) libraryArea.replaceChildren(element('div', { class: 'download-empty', text: error.message || '下载中心加载失败' }));
+    if (!destroyed) libraryArea.replaceChildren(emptyState('下载中心加载失败', error.message || '请稍后重试。'));
   });
   runAutomaticIntegrityCheck();
 

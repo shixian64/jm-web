@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('assert');
+const { spawn } = require('child_process');
 const crypto = require('crypto');
 const { EventEmitter, once } = require('events');
 const fs = require('fs');
@@ -29,7 +30,10 @@ process.env.JMW_MAX_API_RESPONSE_BYTES = String(1 << 20);
 const settings = require('../lib/settings');
 const sessions = require('../lib/sessions');
 const features = require('../lib/features');
-const { upstreamRequest, assertPublicUrl, positiveTimeout, MAX_API_RESPONSE_BYTES } = require('../lib/jm-api');
+const {
+  ApiError, upstreamRequest, assertPublicUrl, positiveTimeout,
+  MAX_API_RESPONSE_BYTES, BUILTIN_API_HOSTS,
+} = require('../lib/jm-api');
 const {
   server,
   bindClientAbort,
@@ -81,6 +85,57 @@ async function rawRequest(port, request) {
 async function closeServer() {
   if (!server.listening) return;
   await new Promise((resolve) => server.close(resolve));
+}
+
+async function withProtectedServer(run) {
+  const protectedDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'jmw-protected-test-'));
+  const entry = path.join(__dirname, '..', 'server.js');
+  const script = `
+    const { server } = require(${JSON.stringify(entry)});
+    server.listen(0, '127.0.0.1', () => process.send({ port: server.address().port }));
+    process.on('message', (message) => {
+      if (message === 'close') server.close(() => process.exit(0));
+    });
+  `;
+  const child = spawn(process.execPath, ['-e', script], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      ACCESS_PASSWORD: 'protected-test-password',
+      JMW_DATA_DIR: protectedDataDir,
+    },
+    stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+  });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  try {
+    const protectedPort = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`protected server start timeout: ${stderr}`)), 5000);
+      child.once('error', (error) => { clearTimeout(timer); reject(error); });
+      child.once('exit', (code, signal) => {
+        clearTimeout(timer);
+        reject(new Error(`protected server exited early (${code ?? signal}): ${stderr}`));
+      });
+      child.once('message', (message) => {
+        if (!message || !Number.isInteger(message.port)) return;
+        clearTimeout(timer);
+        resolve(message.port);
+      });
+    });
+    await run(protectedPort);
+  } finally {
+    if (child.exitCode === null && child.connected) child.send('close');
+    if (child.exitCode === null) {
+      await new Promise((resolve) => {
+        let timer;
+        const finish = () => { clearTimeout(timer); resolve(); };
+        child.once('exit', finish);
+        timer = setTimeout(() => { child.kill(); finish(); }, 3000);
+        if (child.exitCode !== null) finish();
+      });
+    }
+    fs.rmSync(protectedDataDir, { recursive: true, force: true });
+  }
 }
 
 class MockServerResponse extends EventEmitter {
@@ -141,6 +196,39 @@ class MockServerResponse extends EventEmitter {
     assert.strictEqual(settings.normalizeHost('example.com'), 'https://example.com');
     assert.strictEqual(settings.isTrustedApiHost('https://example.com'), false);
     assert.strictEqual(settings.isTrustedApiHost(settings.apiHosts()[0]), true);
+    assert.strictEqual(
+      features.normalizeGithubReleaseUrl('owner/repo', 'https://github.com/owner/repo/releases/tag/v1.2.3'),
+      'https://github.com/owner/repo/releases/tag/v1.2.3'
+    );
+    for (const unsafeReleaseUrl of [
+      'http://github.com/owner/repo/releases',
+      'https://evil.example/owner/repo/releases',
+      'https://github.com/other/repo/releases',
+      'https://user:pass@github.com/owner/repo/releases',
+    ]) assert.strictEqual(features.normalizeGithubReleaseUrl('owner/repo', unsafeReleaseUrl), '');
+
+    // 更新检查以 200 降级时也不能把 DNS/TLS/代理底层错误塞进 message；
+    // 详细信息只进入服务端 stderr，浏览器获得稳定通用文案。
+    const originalLookup = require('dns').promises.lookup;
+    const originalRepo = process.env.JMW_UPDATE_REPO;
+    const originalConsoleErrorForUpdate = console.error;
+    const updateSecret = 'PRIVATE_UPDATE_DNS_DETAIL_6c19';
+    let updateDiagnostic = '';
+    require('dns').promises.lookup = async () => { throw new Error(updateSecret); };
+    process.env.JMW_UPDATE_REPO = 'owner/repo';
+    console.error = (...args) => { updateDiagnostic += args.map(String).join(' '); };
+    let degradedUpdate;
+    try {
+      degradedUpdate = await features.checkUpdate();
+    } finally {
+      require('dns').promises.lookup = originalLookup;
+      if (originalRepo === undefined) delete process.env.JMW_UPDATE_REPO;
+      else process.env.JMW_UPDATE_REPO = originalRepo;
+      console.error = originalConsoleErrorForUpdate;
+    }
+    assert.strictEqual(degradedUpdate.message, '更新检查暂时不可用，请稍后重试。');
+    assert.ok(!JSON.stringify(degradedUpdate).includes(updateSecret));
+    assert.ok(updateDiagnostic.includes(updateSecret));
     await assert.rejects(
       () => assertPublicUrl('https://198.18.0.1/'),
       (error) => error.code === 403,
@@ -161,6 +249,10 @@ class MockServerResponse extends EventEmitter {
     }
     assert.strictEqual(positiveTimeout('80.9', 20000), 80);
     assert.strictEqual(positiveTimeout(String(Number.MAX_SAFE_INTEGER), 20000), 0x7fffffff);
+    assert.deepStrictEqual(BUILTIN_API_HOSTS.slice(0, 2), [
+      'https://www.cdngwc.net',
+      'https://www.cdngwc.cc',
+    ]);
 
     // 直连对端不采信 XFF；只有环回或 JMW_TRUST_PROXY 显式配置的对端可剥离代理链。
     assert.strictEqual(clientIp({
@@ -213,6 +305,15 @@ class MockServerResponse extends EventEmitter {
       assert.strictEqual((await head.arrayBuffer()).byteLength, 0, pathname);
     }
 
+    // 根级与资源目录的静态 404 都必须禁止负缓存；否则 CDN 可能在
+    // 新版本资源已经上线后继续命中旧的 404。
+    for (const pathname of ['/__missing_release_asset__.js', '/js/__missing_release_asset__.js']) {
+      response = await originalFetch(`http://127.0.0.1:${port}${pathname}`);
+      assert.strictEqual(response.status, 404, pathname);
+      assert.strictEqual(response.headers.get('cache-control'), 'no-store', pathname);
+      assert.match(response.headers.get('content-type') || '', /^text\/plain\b/i, pathname);
+    }
+
     response = await originalFetch(`http://127.0.0.1:${port}/api/logout`);
     assert.strictEqual(response.status, 405);
     assert.strictEqual(response.headers.get('allow'), 'POST');
@@ -236,12 +337,55 @@ class MockServerResponse extends EventEmitter {
       headers: { 'X-Forwarded-Proto': 'https' },
     });
     assert.match(response.headers.get('set-cookie') || '', /;\s*Secure/i);
+    const publicConfig = await response.json();
+    assert.deepStrictEqual(publicConfig.advanced.doh, { available: true });
+    assert.ok(!JSON.stringify(publicConfig).includes('customUrl'), '公共配置不得泄露自定义 DoH 地址');
     response = await originalFetch(`http://127.0.0.1:${port}/api/config/api-host`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Cookie: sidCookie },
       body: JSON.stringify({ apiHost: settings.apiHosts()[0] }),
     });
     assert.strictEqual(response.status, 200);
+
+    // 所有读取具名字段的 JSON POST 路由都必须把顶层 null 统一拒绝为 400，
+    // 不能因 body.foo 触发 TypeError 并变成 500。
+    const nullBodyRoutes = [
+      'config/api-host', 'auth', 'login', 'daily_chk', 'comment',
+      'comment_vote', 'favorite_folder', 'history/delete', 'ai/search',
+    ];
+    for (const route of nullBodyRoutes) {
+      response = await originalFetch(`http://127.0.0.1:${port}/api/${route}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: sidCookie },
+        body: 'null',
+      });
+      assert.strictEqual(response.status, 400, `${route} null body`);
+      assert.match((await response.json()).error, /JSON 对象/, route);
+    }
+    // 数组及 JSON 原始值同样不是接口契约中的对象。
+    for (const rawBody of ['[]', '"text"', '123', 'true']) {
+      response = await originalFetch(`http://127.0.0.1:${port}/api/daily_chk`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: sidCookie },
+        body: rawBody,
+      });
+      assert.strictEqual(response.status, 400, rawBody);
+      assert.match((await response.json()).error, /JSON 对象/, rawBody);
+    }
+    response = await originalFetch(`http://127.0.0.1:${port}/api/daily_chk`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: sidCookie },
+      body: '{',
+    });
+    assert.strictEqual(response.status, 400);
+    assert.match((await response.json()).error, /合法 JSON/);
+    response = await originalFetch(`http://127.0.0.1:${port}/api/daily_chk`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain', Cookie: sidCookie },
+      body: '{}',
+    });
+    assert.strictEqual(response.status, 415);
+    assert.match((await response.json()).error, /application\/json/);
 
     // 评论、评论点赞和漫画点赞只能由显式 POST 触发，GET 不得误执行上游写操作。
     for (const route of ['comment', 'comment_vote', 'like']) {
@@ -286,17 +430,152 @@ class MockServerResponse extends EventEmitter {
       }
     );
     response = await originalFetch(`http://127.0.0.1:${port}/api/doh`, {
-      headers: { Cookie: sidCookie },
+      headers: { 'Content-Type': 'application/json', Cookie: sidCookie },
     });
     dohState = await response.json();
     assert.strictEqual(dohState.enabled, true);
     assert.strictEqual(dohState.current, 'aliyun');
+
+    // 配置契约必须使用真正的 JSON boolean；字符串 "false" 不能被
+    // JavaScript truthy coercion 误当成启用，且失败请求不得改变现有状态。
+    for (const invalid of [
+      { enabled: 'false' }, { autoStart: 0 }, { preferIpv6: 'true' },
+      { provider: false }, { customName: {} }, { customUrl: [] },
+    ]) {
+      response = await originalFetch(`http://127.0.0.1:${port}/api/doh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: sidCookie },
+        body: JSON.stringify(invalid),
+      });
+      assert.strictEqual(response.status, 400, JSON.stringify(invalid));
+      assert.strictEqual(features.getDohState().enabled, true, JSON.stringify(invalid));
+      assert.strictEqual(features.getDohState().current, 'aliyun', JSON.stringify(invalid));
+    }
     response = await originalFetch(`http://127.0.0.1:${port}/api/doh`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Cookie: sidCookie },
-      body: JSON.stringify({ enabled: false, provider: 'aliyun' }),
+      body: JSON.stringify({
+        enabled: false,
+        provider: 'aliyun',
+        customName: 'PRIVATE_DOH_NAME_91ad',
+        customUrl: 'https://dns.example/dns-query',
+      }),
     });
     assert.strictEqual(response.status, 200);
+
+    // 未配置 ACCESS_PASSWORD 时，本机仍可管理全局 DoH；任何代理链都必须
+    // fail closed，容器/NAT/反向代理部署需显式配置访问口令。
+    for (const forwardedFor of ['198.51.100.77', 'not-an-ip', '']) {
+      response = await originalFetch(`http://127.0.0.1:${port}/api/doh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': forwardedFor },
+        body: JSON.stringify({ enabled: true, provider: 'google' }),
+      });
+      assert.strictEqual(response.status, 403, forwardedFor);
+      assert.strictEqual(response.headers.get('set-cookie'), null, forwardedFor);
+    }
+    assert.strictEqual(features.getDohState().enabled, false, '远端请求不得改变全局 DoH 状态');
+
+    const evilHostRaw = await rawRequest(port,
+      'GET /api/logs HTTP/1.1\r\nHost: evil.example\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n');
+    assert.match(evilHostRaw, /^HTTP\/1\.1 403 /, '非回环 Host 必须拒绝，防止 DNS rebinding');
+    for (const host of [`localhost:${port}`, `[::1]:${port}`]) {
+      const loopbackHostRaw = await rawRequest(port,
+        `GET /api/logs HTTP/1.1\r\nHost: ${host}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n`);
+      assert.match(loopbackHostRaw, /^HTTP\/1\.1 200 /, `规范回环 Host 应允许：${host}`);
+    }
+    const blockedOperationHeaders = [
+      { Origin: 'http://evil.example', 'Content-Type': 'application/json' },
+      { 'Sec-Fetch-Site': 'cross-site', 'Content-Type': 'application/json' },
+      { Forwarded: 'for=198.51.100.4', 'Content-Type': 'application/json' },
+      { 'X-Real-IP': '198.51.100.5', 'Content-Type': 'application/json' },
+      { 'CF-Connecting-IP': '198.51.100.6', 'Content-Type': 'application/json' },
+      { 'X-Forwarded-Host': '127.0.0.1', 'Content-Type': 'application/json' },
+      { 'X-Forwarded-Proto': 'http', 'Content-Type': 'application/json' },
+      { 'X-Forwarded-Port': '3210', 'Content-Type': 'application/json' },
+      { Via: '1.1 proxy.example', 'Content-Type': 'application/json' },
+    ];
+    for (const headers of blockedOperationHeaders) {
+      response = await originalFetch(`http://127.0.0.1:${port}/api/logs`, { headers });
+      assert.strictEqual(response.status, 403, JSON.stringify(headers));
+      assert.strictEqual(response.headers.get('set-cookie'), null, JSON.stringify(headers));
+    }
+    response = await originalFetch(`http://127.0.0.1:${port}/api/doh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: '{}',
+    });
+    assert.strictEqual(response.status, 415, '本机 JSON 运维写操作必须拒绝 simple text/plain');
+    response = await originalFetch(`http://127.0.0.1:${port}/api/doh`, {
+      headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '198.51.100.8' },
+    });
+    assert.strictEqual(response.status, 200, '普通网络页仍应能读取脱敏 DoH 摘要');
+    const restrictedDoh = await response.json();
+    assert.strictEqual(restrictedDoh.restricted, true);
+    assert.strictEqual(restrictedDoh.customName, '');
+    assert.strictEqual(restrictedDoh.customUrl, '');
+    assert.ok(!JSON.stringify(restrictedDoh).includes('PRIVATE_DOH_NAME_91ad'));
+    assert.ok(!JSON.stringify(restrictedDoh).includes('dns.example'));
+    response = await originalFetch(`http://127.0.0.1:${port}/api/doh/test`, {
+      headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '198.51.100.8' },
+    });
+    assert.strictEqual(response.status, 403, 'DoH 测试同样属于运维边界');
+
+    // 未知服务端异常需要保留本机诊断信息，但 500 响应不得回显内部错误详情。
+    const originalGetDohState = features.getDohState;
+    const originalConsoleError = console.error;
+    const sensitiveMarker = 'INTERNAL_ONLY_ERROR_DETAIL_7f3e';
+    let diagnosticOutput = '';
+    features.getDohState = () => { throw new Error(sensitiveMarker); };
+    console.error = (...args) => { diagnosticOutput += args.map(String).join(' '); };
+    try {
+      response = await originalFetch(`http://127.0.0.1:${port}/api/doh`, {
+        headers: { 'Content-Type': 'application/json', Cookie: sidCookie },
+      });
+    } finally {
+      features.getDohState = originalGetDohState;
+      console.error = originalConsoleError;
+    }
+    assert.strictEqual(response.status, 500);
+    const internalErrorBody = await response.text();
+    assert.deepStrictEqual(JSON.parse(internalErrorBody), { error: '服务器内部错误' });
+    assert.ok(!internalErrorBody.includes(sensitiveMarker));
+    assert.ok(diagnosticOutput.includes(sensitiveMarker), '服务端日志应保留内部异常诊断');
+
+    // ApiError 也可能包装上游/内部原文；5xx 默认不可公开，只有显式 expose 才允许回显。
+    const apiErrorMarker = 'UPSTREAM_API_ERROR_DETAIL_4b9c';
+    diagnosticOutput = '';
+    features.getDohState = () => { throw new ApiError(apiErrorMarker, 502); };
+    console.error = (...args) => { diagnosticOutput += args.map(String).join(' '); };
+    try {
+      response = await originalFetch(`http://127.0.0.1:${port}/api/doh`, {
+        headers: { 'Content-Type': 'application/json', Cookie: sidCookie },
+      });
+    } finally {
+      features.getDohState = originalGetDohState;
+      console.error = originalConsoleError;
+    }
+    assert.strictEqual(response.status, 502);
+    const apiErrorBody = await response.text();
+    assert.deepStrictEqual(JSON.parse(apiErrorBody), { error: '服务器内部错误' });
+    assert.ok(!apiErrorBody.includes(apiErrorMarker));
+    assert.ok(diagnosticOutput.includes(apiErrorMarker), '未公开 ApiError 仍应写入服务端诊断');
+
+    const invalidStatusMarker = 'INVALID_UPSTREAM_STATUS_2d11';
+    features.getDohState = () => { throw new ApiError(invalidStatusMarker, '400.5'); };
+    console.error = () => {};
+    try {
+      response = await originalFetch(`http://127.0.0.1:${port}/api/doh`, {
+        headers: { 'Content-Type': 'application/json', Cookie: sidCookie },
+      });
+    } finally {
+      features.getDohState = originalGetDohState;
+      console.error = originalConsoleError;
+    }
+    assert.strictEqual(response.status, 502, '畸形上游 code 必须规范化，不能传给 writeHead');
+    assert.deepStrictEqual(await response.json(), { error: '服务器内部错误' });
+    response = await originalFetch(`http://127.0.0.1:${port}/healthz`);
+    assert.strictEqual(response.status, 200, '畸形错误码后服务必须仍存活');
 
     const raw = await rawRequest(port, 'GET http://[::1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
     assert.match(raw, /^HTTP\/1\.1 400 /);
@@ -321,8 +600,9 @@ class MockServerResponse extends EventEmitter {
     }
     response = await authAttempt('192.0.2.200, 203.0.113.10', 'wrong');
     assert.strictEqual(response.status, 429, '伪造 XFF 左侧链不得绕过同一客户限流');
-    response = await authAttempt('203.0.113.11', '');
-    assert.strictEqual(response.status, 200, '反代后的不同客户不应共享限流桶');
+    response = await authAttempt('203.0.113.11', 'wrong');
+    assert.strictEqual(response.status, 401, '反代后的不同客户不应共享限流桶');
+    assert.strictEqual(response.headers.get('set-cookie'), null, '未配置口令时不得签发空口令令牌');
 
     // 超限请求体应返回可读 413，而不是在写响应前 reset socket。
     response = await originalFetch(`http://127.0.0.1:${port}/api/auth`, {
@@ -439,12 +719,55 @@ class MockServerResponse extends EventEmitter {
     global.fetch = originalFetch;
     features.dohLookup = originalDohLookup;
 
+    // 图片代理有自己的局部 catch；内部/上游 ApiError 5xx 同样不得绕过中央脱敏策略。
+    const imagePrivateMarker = 'PRIVATE_IMAGE_FAILURE_82ce';
+    let imageDiagnostics = '';
+    const imageConsoleError = console.error;
+    global.fetch = async () => { throw new ApiError(imagePrivateMarker, 502); };
+    features.dohLookup = publicDns;
+    console.error = (...args) => { imageDiagnostics += args.map(String).join(' '); };
+    try {
+      response = await originalFetch(`http://127.0.0.1:${port}/api/img?u=${encodeURIComponent(`${settings.imageHosts()[0]}/private.png`)}`);
+      assert.strictEqual(response.status, 502);
+      const directImageError = await response.text();
+      assert.deepStrictEqual(JSON.parse(directImageError), { error: '图片获取失败' });
+      assert.ok(!directImageError.includes(imagePrivateMarker));
+
+      response = await originalFetch(`http://127.0.0.1:${port}/api/img?path=${encodeURIComponent('/media/private.png')}`);
+      assert.strictEqual(response.status, 502);
+      const pathImageError = await response.text();
+      assert.deepStrictEqual(JSON.parse(pathImageError), { error: '图片获取失败' });
+      assert.ok(!pathImageError.includes(imagePrivateMarker));
+    } finally {
+      console.error = imageConsoleError;
+      global.fetch = originalFetch;
+      features.dohLookup = originalDohLookup;
+    }
+    assert.ok(imageDiagnostics.includes(imagePrivateMarker), '图片内部错误仍应保留服务端诊断');
+
+    // 日志接口属于实例级运维能力：远端客户不可读、不可清空；本机默认可用。
+    features.addLog('info', 'OPERATIONAL_BOUNDARY_MARKER');
+    for (const method of ['GET', 'DELETE']) {
+      response = await originalFetch(`http://127.0.0.1:${port}/api/logs`, {
+        method,
+        headers: { 'X-Forwarded-For': '198.51.100.88' },
+      });
+      assert.strictEqual(response.status, 403, `remote logs ${method}`);
+      assert.strictEqual(response.headers.get('set-cookie'), null, `remote logs ${method}`);
+    }
+    response = await originalFetch(`http://127.0.0.1:${port}/api/logs`, {
+      headers: { Cookie: sidCookie },
+    });
+    assert.strictEqual(response.status, 200);
+    assert.ok((await response.json()).logs.some((x) => x.message === 'OPERATIONAL_BOUNDARY_MARKER'));
+
     // API 请求会进入有界内存日志；DELETE 清空旧日志，但自身审计记录仍应保留。
     response = await originalFetch(`http://127.0.0.1:${port}/api/logs`, {
       method: 'DELETE', headers: { Cookie: sidCookie },
     });
     assert.strictEqual(response.status, 200);
-    response = await originalFetch(`http://127.0.0.1:${port}/api/config`, {
+    const querySecret = 'QUERY_SECRET_43fd9b';
+    response = await originalFetch(`http://127.0.0.1:${port}/api/config?token=${querySecret}&q=private`, {
       headers: { Cookie: sidCookie },
     });
     assert.strictEqual(response.status, 200);
@@ -456,6 +779,7 @@ class MockServerResponse extends EventEmitter {
     let logResult = await response.json();
     assert.ok(logResult.logs.length <= 2);
     assert.ok(logResult.logs.some((x) => /GET \/api\/config -> 200/.test(x.message)));
+    assert.ok(!JSON.stringify(logResult.logs).includes(querySecret), '访问日志不得记录原始查询串');
     response = await originalFetch(`http://127.0.0.1:${port}/api/logs`, {
       method: 'DELETE', headers: { Cookie: sidCookie },
     });
@@ -469,6 +793,44 @@ class MockServerResponse extends EventEmitter {
     assert.ok(!logResult.logs.some((x) => /GET \/api\/config -> 200/.test(x.message)));
 
     await closeServer();
+
+    // 配置 ACCESS_PASSWORD 后，运维接口必须先通过口令；通过口令的远端
+    // 管理员仍可正常读取日志和修改 DoH，不被“仅本机”默认策略误伤。
+    await withProtectedServer(async (protectedPort) => {
+      const protectedBase = `http://127.0.0.1:${protectedPort}`;
+      const remoteHeaders = { 'X-Forwarded-For': '198.51.100.99' };
+      let protectedResponse = await originalFetch(`${protectedBase}/api/logs`, {
+        headers: remoteHeaders,
+      });
+      assert.strictEqual(protectedResponse.status, 401);
+      protectedResponse = await originalFetch(`${protectedBase}/api/doh`, {
+        method: 'POST',
+        headers: { ...remoteHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: true, provider: 'google' }),
+      });
+      assert.strictEqual(protectedResponse.status, 401);
+
+      protectedResponse = await originalFetch(`${protectedBase}/api/auth`, {
+        method: 'POST',
+        headers: { ...remoteHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: 'protected-test-password' }),
+      });
+      assert.strictEqual(protectedResponse.status, 200);
+      const authCookie = (protectedResponse.headers.get('set-cookie') || '').split(';', 1)[0];
+      assert.match(authCookie, /^jmw_auth=[a-f0-9]{64}$/);
+
+      protectedResponse = await originalFetch(`${protectedBase}/api/logs`, {
+        headers: { ...remoteHeaders, Cookie: authCookie },
+      });
+      assert.strictEqual(protectedResponse.status, 200);
+      protectedResponse = await originalFetch(`${protectedBase}/api/doh`, {
+        method: 'POST',
+        headers: { ...remoteHeaders, Cookie: authCookie, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: true, provider: 'google' }),
+      });
+      assert.strictEqual(protectedResponse.status, 200);
+      assert.strictEqual((await protectedResponse.json()).enabled, true);
+    });
 
     // GET 可 failover；非幂等 POST 收到 5xx 不重放；GET 解密失败可 failover。
     let calls = [];
@@ -484,6 +846,60 @@ class MockServerResponse extends EventEmitter {
     });
     assert.strictEqual(calls.length, 2);
     assert.strictEqual(result.data.marker, 'get-ok');
+
+    // 退役分流常只剩 Web/停放路由并对 API 返回 404/410；幂等 GET
+    // 必须换线，非幂等 POST 不得因此重放。
+    for (const retiredStatus of [404, 410]) {
+      calls = [];
+      global.fetch = async (url, opts) => {
+        calls.push(url);
+        return calls.length === 1
+          ? new Response('retired', { status: retiredStatus })
+          : encryptedResponse(opts.headers.token, { marker: `retired-${retiredStatus}-ok` });
+      };
+      result = await upstreamRequest({
+        path: '/promote', hosts: ['https://retired.example', 'https://live.example'],
+        jar: { cookies: {} }, cookieHosts: [], dnsLookup: publicDns,
+      });
+      assert.strictEqual(calls.length, 2);
+      assert.strictEqual(result.data.marker, `retired-${retiredStatus}-ok`);
+    }
+
+    calls = [];
+    global.fetch = async (url) => { calls.push(url); return new Response('retired', { status: 404 }); };
+    await assert.rejects(
+      () => upstreamRequest({
+        path: '/promote', hosts: ['https://one.example', 'https://two.example'],
+        jar: { cookies: {} }, cookieHosts: [], dnsLookup: publicDns,
+      }),
+      (error) => error.code === 502 && /线路不支持/.test(error.message)
+    );
+    assert.strictEqual(calls.length, 2);
+
+    // 资源型 GET 的真实 404 必须保留，不得因全局 failover 被误报成 502。
+    calls = [];
+    global.fetch = async (url) => { calls.push(url); return new Response('missing', { status: 404 }); };
+    await assert.rejects(
+      () => upstreamRequest({
+        path: '/album', query: { id: 'missing' },
+        hosts: ['https://one.example', 'https://two.example'],
+        jar: { cookies: {} }, cookieHosts: [], dnsLookup: publicDns,
+      }),
+      (error) => error.code === 404
+    );
+    assert.strictEqual(calls.length, 1);
+
+    calls = [];
+    global.fetch = async (url) => { calls.push(url); return new Response('retired', { status: 404 }); };
+    await assert.rejects(
+      () => upstreamRequest({
+        method: 'POST', path: '/login', form: [],
+        hosts: ['https://one.example', 'https://two.example'],
+        jar: { cookies: {} }, cookieHosts: [], dnsLookup: publicDns,
+      }),
+      (error) => error.code === 404
+    );
+    assert.strictEqual(calls.length, 1);
 
     calls = [];
     global.fetch = async (url) => { calls.push(url); return new Response('fail', { status: 500 }); };

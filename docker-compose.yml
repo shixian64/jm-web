@@ -1,10 +1,18 @@
 services:
   jm-web:
-    build: .
+    build:
+      context: .
+      args:
+        # 默认锁定 Node/Alpine 补丁版本；生产 CI 可覆盖为已核验的同标签 digest。
+        NODE_IMAGE: "${JMW_NODE_IMAGE:-node:22.23.2-alpine3.24}"
     container_name: jm-web
     init: true
+    user: "1000:1000"
     restart: unless-stopped
     stop_grace_period: 10s
+    cpus: "${JMW_CPU_LIMIT:-1.0}"
+    mem_limit: "${JMW_MEMORY_LIMIT:-512m}"
+    pids_limit: "${JMW_PIDS_LIMIT:-256}"
     read_only: true
     security_opt:
       - no-new-privileges:true
@@ -12,6 +20,11 @@ services:
       - ALL
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m
+    logging:
+      driver: json-file
+      options:
+        max-size: "${JMW_LOG_MAX_SIZE:-10m}"
+        max-file: "${JMW_LOG_MAX_FILE:-3}"
     ports:
       - target: ${PORT:-3210}
         published: "${JMW_PUBLISH_PORT:-3210}"
@@ -46,3 +59,6 @@ services:
       - type: bind
         source: "${JMW_HOST_DATA_DIR:-./data}"
         target: /app/data
+        bind:
+          # 禁止 Docker 以 root 静默创建宿主机目录，避免非 root 应用启动后才报权限错误。
+          create_host_path: false

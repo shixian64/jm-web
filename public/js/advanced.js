@@ -84,12 +84,43 @@ async function jsonRequest(path, options = {}) {
   });
   let data = null;
   try { data = await response.json(); } catch (_) {}
-  if (!response.ok) throw new Error(data?.error || `请求失败（${response.status}）`);
+  if (!response.ok) {
+    const error = new Error(data?.error || `请求失败（${response.status}）`);
+    error.status = response.status;
+    error.needAuth = data?.needAuth === true;
+    throw error;
+  }
   return data;
+}
+
+function isViewInactive(ctx) {
+  return !!(ctx && (ctx.signal?.aborted || (typeof ctx.isActive === 'function' && !ctx.isActive())));
+}
+
+function operationalErrorMessage(error, fallback = '运维操作失败') {
+  if (Number(error?.status) === 401) return '需要先通过站点访问口令验证。';
+  if (Number(error?.status) === 403) return '当前连接没有站点管理员权限；容器或反向代理部署请配置 ACCESS_PASSWORD。';
+  if (isAbort(error)) return '';
+  return error?.message || fallback;
+}
+
+function safeUpdateUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== 'github.com'
+        || url.username || url.password || url.pathname === '/') return '';
+    return url.href;
+  } catch (_) {
+    return '';
+  }
 }
 
 function pageTitle(title, subtitle = '') {
   return h('div', { class: 'list-head' }, h('h2', null, title), subtitle ? h('p', { class: 'hint' }, subtitle) : null);
+}
+
+function groupTitle(title) {
+  return h('div', { class: 'setting-item setting-section-title' }, h('div', { class: 'lab' }, title));
 }
 
 function menuLink(label, href, description = '') {
@@ -115,20 +146,23 @@ export function advancedHubView(root) {
     recommendSource.disabled = !recommendToggle.checked;
   };
   recommendSource.onchange = () => updateSetting({ recommendSource: recommendSource.value === 'network' ? 'network' : 'builtin' });
-  const page = h('div', { class: 'page settings-page', style: 'max-width:720px' },
+  const page = h('div', { class: 'page settings-page advanced-hub-page', style: 'max-width:720px' },
     pageTitle('完整功能中心', 'Web 等价实现集中在这里；设备专属能力会使用浏览器标准 API。'),
     h('div', { class: 'setting-group' },
+      groupTitle('内容与智能'),
       menuLink('缓存与离线下载', '#/downloads', '后台任务、离线阅读、导出与缓存清理'),
       menuLink('AI 对话', '#/ai', '多会话、人格、流式回答、联网搜索'),
       menuLink('人格面具', '#/personas', '设置 AI 的名称、职业、性格与输出格式'),
     ),
     h('div', { class: 'setting-group' },
+      groupTitle('个性化与隐私'),
       menuLink('标签排除', '#/blocked-tags', '搜索排除模板与首页内容过滤'),
       menuLink('调色板与布局', '#/palette', '预设/自定义颜色与各页面网格列数'),
       menuLink('应用锁与隐私', '#/security', 'PIN、图案、设备生物识别及隐私模式'),
       menuLink('数据备份与恢复', '#/backup', 'JSON 或 AES-GCM 加密备份'),
     ),
     h('div', { class: 'setting-group' },
+      groupTitle('连接与维护'),
       menuLink('网络与 DoH', '#/network', 'DNS over HTTPS、线路测速与数据源状态'),
       menuLink('缓存维护', '#/cache', '空间统计、完整性检查和清理'),
       menuLink('提取漫画编码', '#/extract', '从剪贴板或文本中识别 JM 编号'),
@@ -136,7 +170,7 @@ export function advancedHubView(root) {
       menuLink('更新与关于', '#/about', '版本、健康状态与更新检查'),
     ),
     h('div', { class: 'setting-group' },
-      h('div', { class: 'setting-item setting-section-title' }, h('div', { class: 'lab' }, '自动化与入口')),
+      groupTitle('自动化与入口'),
       h('div', { class: 'setting-item' }, toggleRow('自动签到', 'autoSignInEnabled', '已登录时启动后检查当天状态并自动签到。')),
       h('div', { class: 'setting-item' }, toggleRow('剪贴板编号检测', 'clipboardAutoDetectEnabled', '页面获得焦点时识别 JM 编号；浏览器会按权限策略询问。')),
       h('div', { class: 'setting-item' }, toggleRow('在“我的”显示 AI 入口', 'showAiEntry')),
@@ -170,7 +204,7 @@ function tagEditor(title, key, description) {
   };
   input.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); add(); } });
   wrap.append(h('div', { class: 'lab' }, title), h('div', { class: 'hint' }, description),
-    h('div', { style: 'display:flex;gap:8px;margin:10px 0' }, input, h('button', { class: 'btn', onclick: add }, '添加')), chips);
+    h('div', { class: 'setting-inline-form' }, input, h('button', { class: 'btn', onclick: add }, '添加')), chips);
   render();
   return wrap;
 }
@@ -419,7 +453,7 @@ function patternPad(onDone) {
     if (selected.includes(i)) return;
     selected.push(i); event.currentTarget.classList.add('on'); refresh();
   } }, String(i + 1)));
-  return h('div', null, grid, label, h('div', { style: 'display:flex;gap:8px;margin-top:10px' },
+  return h('div', null, grid, label, h('div', { class: 'setting-actions' },
     h('button', { class: 'btn', onclick: () => { selected.length = 0; grid.querySelectorAll('.on').forEach((x) => x.classList.remove('on')); refresh(); } }, '重置'),
     h('button', { class: 'btn primary', onclick: () => selected.length >= 4 ? onDone(selected.join('')) : toast('至少连接 4 个点') }, '确认图案')));
 }
@@ -747,8 +781,10 @@ export function backupView(root) {
     h('div', { class: 'setting-group' }, h('div', { class: 'setting-item' },
       h('div', { class: 'lab' }, '恢复备份'),
       h('div', { class: 'hint' }, '备份不包含图片正文；可根据原有整本/选章记录重新建立下载队列。'), file,
-      h('label', { class: 'setting-row compact', style: 'margin-top:10px' }, rebuildQueue,
-        h('span', null, '恢复离线目录后自动重建下载任务')),
+      h('label', { class: 'setting-row toggle-row restore-option' },
+        h('div', null, h('div', { class: 'lab' }, '自动重建下载任务'),
+          h('div', { class: 'hint' }, '恢复离线目录后，按原有整本或选章记录重新加入队列。')),
+        rebuildQueue),
       h('button', { class: 'btn', style: 'margin-top:10px', onclick: async (event) => {
         const button = event.currentTarget;
         try {
@@ -824,7 +860,9 @@ export function personasView(root) {
   };
   const render = () => {
     const list = getPersonas();
-    listWrap.replaceChildren(h('div', { class: 'setting-item' }, h('div', { class: 'lab' }, '已保存人格')),
+    listWrap.replaceChildren(groupTitle('已保存人格'),
+      ...(!list.length ? [h('div', { class: 'setting-empty' },
+        h('strong', null, '还没有自定义人格'), h('span', null, '创建后可在 AI 对话中随时切换。'))] : []),
       ...list.map((item) => h('div', { class: 'setting-item setting-row' },
         h('div', null, h('div', { class: 'lab' }, item.name), h('div', { class: 'hint' }, `${item.occupation || '未设置职业'} · ${item.personality || '默认性格'}`)),
         h('div', { class: 'persona-actions' },
@@ -847,7 +885,9 @@ export function personasView(root) {
   };
   cancelButton.onclick = resetForm;
   formWrap.append(h('div', { class: 'setting-item' }, formTitle,
-    ...Object.entries(fields).map(([key, input]) => h('label', { class: 'field' }, key === 'name' ? '名称' : ({ occupation: '职业', age: '年龄', personality: '性格', format: '输出格式', prompt: '自定义提示' }[key]), input)),
+    h('div', { class: 'persona-form-grid' }, ...Object.entries(fields).map(([key, input]) => h('label', {
+      class: `field ${['format', 'prompt'].includes(key) ? 'persona-field-wide' : ''}`.trim(),
+    }, key === 'name' ? '名称' : ({ occupation: '职业', age: '年龄', personality: '性格', format: '输出格式', prompt: '自定义提示' }[key]), input))),
     h('div', { class: 'persona-actions' }, saveButton, cancelButton)));
   render(); page.append(listWrap, formWrap); root.append(page);
 }
@@ -1248,7 +1288,7 @@ export async function aiView(root, _m, _q, ctx) {
     persist(); renderAll(); await generate();
   };
   const renderMessages = () => {
-    conversation.replaceChildren(...current.messages.map((message, index) => messageNode(message, {
+    const messages = current.messages.map((message, index) => messageNode(message, {
       edit: message.role === 'user' && !controller ? () => editUserMessage(index) : null,
       copy: async () => { try { await navigator.clipboard?.writeText(message.content || ''); toast('已复制'); } catch (_) { toast('复制失败'); } },
       retry: message.role === 'assistant' && index === current.messages.length - 1 && !controller ? () => regenerate() : null,
@@ -1256,7 +1296,14 @@ export async function aiView(root, _m, _q, ctx) {
       activeBranch: Number(message.activeBranchIndex) || 0,
       previousBranch: message.role === 'user' && !controller && Number(message.activeBranchIndex) > 0 ? () => switchBranch(index, Number(message.activeBranchIndex) - 1) : null,
       nextBranch: message.role === 'user' && !controller && Number(message.activeBranchIndex) < (message.branches?.length || 0) - 1 ? () => switchBranch(index, Number(message.activeBranchIndex) + 1) : null,
-    })));
+    }));
+    conversation.replaceChildren(...(messages.length ? messages : [h('div', { class: 'ai-empty-state' },
+      h('span', { class: 'ai-empty-kicker' }, cfg.enabled ? 'NEW CONVERSATION' : 'SETUP REQUIRED'),
+      h('h2', null, cfg.enabled ? '从一个问题开始' : 'AI 服务尚未配置'),
+      h('p', null, cfg.enabled
+        ? '可以讨论漫画、整理阅读线索，或在开启联网搜索后查询最新资料。'
+        : '请在服务器配置 AI_API_KEY；完成后刷新本页即可开始对话。'),
+    )]));
     conversation.scrollTop = conversation.scrollHeight;
   };
   const generate = async (style = '') => {
@@ -1309,10 +1356,12 @@ export async function aiView(root, _m, _q, ctx) {
     renderSidebar(); renderMessages();
   };
   page.append(sidebar, h('section', { class: 'ai-main' },
-    h('div', { class: 'ai-toolbar' }, personaSel, h('label', null, think, ' 深度思考'), h('label', null, web, ' 联网搜索'),
+    h('div', { class: 'ai-toolbar' }, personaSel,
+      h('label', { class: 'ai-toolbar-toggle' }, think, h('span', null, '深度思考')),
+      h('label', { class: 'ai-toolbar-toggle' }, web, h('span', null, '联网搜索')),
       h('button', { class: 'btn ghost', onclick: () => regenerate('回答更详细，并给出分点依据。') }, '更详细'),
       h('button', { class: 'btn ghost', onclick: () => regenerate('回答更精简，只保留结论。') }, '更精简'), searchSettingsPanel),
-    conversation, h('div', { class: 'ai-composer' }, input, h('div', { style: 'display:flex;gap:8px' }, send, stop))));
+    conversation, h('div', { class: 'ai-composer' }, input, h('div', { class: 'ai-composer-actions' }, send, stop))));
   renderAll();
   return () => controller?.abort();
 }
@@ -1321,9 +1370,21 @@ export async function aiView(root, _m, _q, ctx) {
 
 export async function networkView(root, _m, _q, ctx) {
   const page = h('div', { class: 'page settings-page', style: 'max-width:720px' }, pageTitle('网络与 DoH'), loadingBox()); root.append(page);
-  try {
-    const [data, config] = await Promise.all([jsonRequest('/doh', { signal: ctx?.signal }), api.config(ctx?.signal)]);
-    const select = h('select', { class: 'input' }, (data.providers || []).map((x) => h('option', { value: x.id, selected: data.current === x.id }, x.name)));
+  const [dohResult, configResult] = await Promise.allSettled([
+    jsonRequest('/doh', { signal: ctx?.signal }),
+    api.config(ctx?.signal),
+  ]);
+  if (isViewInactive(ctx)) return;
+
+  const sections = [];
+  if (dohResult.status === 'fulfilled' && dohResult.value && typeof dohResult.value === 'object'
+      && dohResult.value.restricted !== true) {
+    const data = dohResult.value;
+    const providers = Array.isArray(data.providers)
+      ? data.providers.filter((item) => item && typeof item.id === 'string') : [];
+    const select = h('select', { class: 'input', disabled: !providers.length }, providers.map((item) => h('option', {
+      value: item.id, selected: data.current === item.id,
+    }, item.name || item.id)));
     const status = h('div', { class: 'hint' }, data.enabled ? `已启用 ${data.current}` : '当前使用系统 DNS');
     const customName = h('input', { class: 'input', value: data.customName || '', placeholder: '自定义服务名称（可选）' });
     const customUrl = h('input', { class: 'input', type: 'url', value: data.customUrl || '', placeholder: 'https://example.com/dns-query' });
@@ -1339,37 +1400,123 @@ export async function networkView(root, _m, _q, ctx) {
       preferIpv6: preferIpv6.checked,
       ...extra,
     });
-    const saveDoh = async (extra = {}) => jsonRequest('/doh', { method: 'POST', body: JSON.stringify(dohPayload(extra)) });
-    page.replaceChildren(pageTitle('网络与 DoH'), h('div', { class: 'setting-group' },
+    const saveDoh = (extra = {}) => jsonRequest('/doh', {
+      method: 'POST', body: JSON.stringify(dohPayload(extra)), signal: ctx?.signal,
+    });
+    const actionButtons = [];
+    const setBusy = (busy) => actionButtons.forEach((button) => { if (button.isConnected) button.disabled = busy; });
+    const runDohAction = async (button, action, success) => {
+      setBusy(true);
+      try {
+        const result = await action();
+        if (!isViewInactive(ctx)) success(result);
+      } catch (error) {
+        if (!isViewInactive(ctx) && !isAbort(error)) toast(operationalErrorMessage(error, 'DoH 设置失败'));
+      } finally {
+        if (!isViewInactive(ctx) && button.isConnected) setBusy(false);
+      }
+    };
+    const enableButton = h('button', { class: 'btn primary' }, '保存并启用');
+    const disableButton = h('button', { class: 'btn' }, '关闭');
+    const testButton = h('button', { class: 'btn' }, '保存并测速');
+    actionButtons.push(enableButton, disableButton, testButton);
+    enableButton.onclick = () => runDohAction(enableButton, () => saveDoh({ enabled: true }), () => {
+      status.textContent = `已启用 ${select.value}`;
+      toast('DoH 设置已保存');
+    });
+    disableButton.onclick = () => runDohAction(disableButton, () => saveDoh({ enabled: false }), () => {
+      status.textContent = '当前使用系统 DNS';
+      toast('DoH 已关闭，配置已保留');
+    });
+    testButton.onclick = () => runDohAction(testButton, async () => {
+      await saveDoh();
+      const out = await jsonRequest(`/doh/test?provider=${encodeURIComponent(select.value)}`, { signal: ctx?.signal });
+      const addresses = Array.isArray(out?.addresses) ? out.addresses.map(String).filter(Boolean) : [];
+      if (!addresses.length) throw new Error('测速未返回有效地址');
+      return { addresses, ms: Number(out.ms) || 0 };
+    }, (result) => toast(`解析成功：${result.addresses.join(', ')} · ${result.ms}ms`));
+    sections.push(h('div', { class: 'setting-group' },
       h('div', { class: 'setting-item setting-row' }, h('div', null, h('div', { class: 'lab' }, 'DNS over HTTPS'), status), select),
       h('div', { class: 'setting-item' }, customFields),
-      h('label', { class: 'setting-item setting-row' }, h('div', null, h('div', { class: 'lab' }, '服务启动时自动恢复'), h('div', { class: 'hint' }, '关闭时本次仍可手动启用；重启 Node 服务后不会自动开启。')), autoStart),
-      h('label', { class: 'setting-item setting-row' }, h('div', null, h('div', { class: 'lab' }, '优先尝试 IPv6'), h('div', { class: 'hint' }, '开启后先查询 AAAA，再回退 A；没有可用 IPv6 路由时建议关闭。')), preferIpv6),
-      h('div', { class: 'setting-item' }, h('div', { style: 'display:flex;gap:8px' },
-        h('button', { class: 'btn primary', onclick: async () => { await saveDoh({ enabled: true }); status.textContent = `已启用 ${select.value}`; toast('DoH 设置已保存'); } }, '保存并启用'),
-        h('button', { class: 'btn', onclick: async () => { await saveDoh({ enabled: false }); status.textContent = '当前使用系统 DNS'; toast('DoH 已关闭，配置已保留'); } }, '关闭'),
-        h('button', { class: 'btn', onclick: async (event) => { const btn = event.currentTarget; btn.disabled = true; try { await saveDoh(); const out = await jsonRequest(`/doh/test?provider=${encodeURIComponent(select.value)}`); toast(`解析成功：${out.addresses.join(', ')} · ${out.ms}ms`); } catch (error) { toast(error.message); } finally { btn.disabled = false; } } }, '保存并测速')),
-        h('div', { class: 'hint' }, data.certificatePolicy || 'DoH TLS 使用 Node.js 运行时证书库。浏览器无法切换 Android 的“设备 CA”策略。')),
+      h('label', { class: 'setting-item setting-row toggle-row' }, h('div', null, h('div', { class: 'lab' }, '服务启动时自动恢复'), h('div', { class: 'hint' }, '关闭时本次仍可手动启用；重启 Node 服务后不会自动开启。')), autoStart),
+      h('label', { class: 'setting-item setting-row toggle-row' }, h('div', null, h('div', { class: 'lab' }, '优先尝试 IPv6'), h('div', { class: 'hint' }, '开启后先查询 AAAA，再回退 A；没有可用 IPv6 路由时建议关闭。')), preferIpv6),
+      h('div', { class: 'setting-item' }, h('div', { class: 'setting-actions' }, ...actionButtons),
+        h('div', { class: 'hint' }, data.certificatePolicy || 'DoH TLS 使用 Node.js 运行时证书库。浏览器无法切换 Android 的“设备 CA”策略。'))));
+  } else {
+    const restricted = dohResult.status === 'fulfilled' && dohResult.value?.restricted === true;
+    const error = dohResult.status === 'rejected' ? dohResult.reason : new Error('DoH 设置响应格式异常');
+    sections.push(h('div', { class: 'setting-group' },
+      groupTitle('DNS over HTTPS'),
+      h('div', { class: 'setting-item' },
+        h('div', { class: 'lab' }, restricted ? 'DoH 设置仅限站点管理员' : 'DoH 运维设置不可用'),
+        h('div', { class: 'hint' }, restricted
+          ? '当前页面仅显示普通数据源配置。容器或反向代理部署请配置 ACCESS_PASSWORD 后再管理 DoH。'
+          : operationalErrorMessage(error, '无法读取 DoH 设置')))));
+  }
+
+  if (configResult.status === 'fulfilled' && configResult.value && typeof configResult.value === 'object') {
+    const config = configResult.value;
+    sections.push(h('div', { class: 'setting-group' },
       h('div', { class: 'setting-item' }, h('div', { class: 'lab' }, '数据源'),
         h('div', { class: 'hint' }, '这里会实际改变服务端请求的上游池：内置直连使用随版本维护的域名；网络单线路使用 JM_API_BASE 或当前线路；混合模式会先请求网络线路，再回退内置域名。账号会话随当前源保持。'),
         h('select', { class: 'input', onchange: (event) => { updateSetting({ dataSource: event.target.value }); toast('数据源已切换，后续请求立即生效'); } },
           h('option', { value: 'builtin', selected: setting.dataSource === 'builtin' }, `内置直连（${config.dataSources?.builtin?.hosts || 0} 条线路）`),
           h('option', { value: 'network', selected: setting.dataSource === 'network' }, config.dataSources?.network?.configured ? '网络 API（JM_API_BASE）' : '网络 API（当前单线路）'),
           h('option', { value: 'mixed', selected: setting.dataSource === 'mixed' }, `混合故障切换（${config.dataSources?.mixed?.hosts || 0} 条线路）`)),
-        h('div', { class: 'hint' }, 'Web 无法在浏览器进程中嵌入 Android 的 Java 客户端；“内置直连”由同协议的 Node 适配器完成，包含签名、AES 解密、Cookie 与域名故障切换。')),
-    ));
-  } catch (error) { page.replaceChildren(pageTitle('网络与 DoH'), errorBox(error.message)); }
+        h('div', { class: 'hint' }, 'Web 无法在浏览器进程中嵌入 Android 的 Java 客户端；“内置直连”由同协议的 Node 适配器完成，包含签名、AES 解密、Cookie 与域名故障切换。'))));
+  } else {
+    const error = configResult.status === 'rejected' ? configResult.reason : new Error('数据源响应格式异常');
+    sections.push(h('div', { class: 'setting-group' }, groupTitle('数据源'),
+      h('div', { class: 'setting-item' }, h('div', { class: 'hint' }, error?.message || '无法读取数据源配置'))));
+  }
+  page.replaceChildren(pageTitle('网络与 DoH'), ...sections);
 }
 
 export async function logsView(root, _m, query, ctx) {
   const page = h('div', { class: 'page', style: 'max-width:980px' }, pageTitle('运行日志'), loadingBox()); root.append(page);
   try {
     const data = await jsonRequest(`/logs?limit=${Math.max(20, Math.min(500, Number(query.get('limit')) || 200))}`, { signal: ctx?.signal });
-    const pre = h('pre', { class: 'log-viewer' }, (data.logs || []).map((x) => `${x.time} [${x.level}] ${x.message}`).join('\n'));
-    page.replaceChildren(pageTitle('运行日志'), h('div', { style: 'display:flex;gap:8px;margin-bottom:10px' },
-      h('button', { class: 'btn', onclick: () => navigator.clipboard?.writeText(pre.textContent).then(() => toast('日志已复制')) }, '复制'),
-      h('button', { class: 'btn', onclick: async () => { await jsonRequest('/logs', { method: 'DELETE' }); pre.textContent = ''; } }, '清空')), pre);
-  } catch (error) { page.replaceChildren(pageTitle('运行日志'), errorBox(error.message)); }
+    if (isViewInactive(ctx)) return;
+    const logs = Array.isArray(data?.logs) ? data.logs : [];
+    const pre = h('pre', { class: 'log-viewer' }, logs
+      .filter((item) => item && typeof item === 'object')
+      .map((item) => `${String(item.time || '')} [${String(item.level || 'info')}] ${String(item.message || '')}`)
+      .join('\n'));
+    const copyButton = h('button', { class: 'btn' }, '复制');
+    const clearButton = h('button', { class: 'btn' }, '清空');
+    copyButton.onclick = async () => {
+      copyButton.disabled = true;
+      try {
+        if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') throw new Error('当前浏览器不支持剪贴板写入');
+        await navigator.clipboard.writeText(pre.textContent || '');
+        if (!isViewInactive(ctx)) toast('日志已复制');
+      } catch (error) {
+        if (!isViewInactive(ctx)) toast(error?.message || '复制失败，请手动选择日志');
+      } finally {
+        if (!isViewInactive(ctx) && copyButton.isConnected) copyButton.disabled = false;
+      }
+    };
+    clearButton.onclick = async () => {
+      clearButton.disabled = true;
+      try {
+        await jsonRequest('/logs', { method: 'DELETE', signal: ctx?.signal });
+        if (!isViewInactive(ctx)) {
+          pre.textContent = '';
+          toast('运行日志已清空');
+        }
+      } catch (error) {
+        if (!isViewInactive(ctx) && !isAbort(error)) toast(operationalErrorMessage(error, '清空日志失败'));
+      } finally {
+        if (!isViewInactive(ctx) && clearButton.isConnected) clearButton.disabled = false;
+      }
+    };
+    page.replaceChildren(pageTitle('运行日志'), h('div', { class: 'setting-actions log-actions' },
+      copyButton, clearButton), pre);
+  } catch (error) {
+    if (!isViewInactive(ctx) && !isAbort(error)) {
+      page.replaceChildren(pageTitle('运行日志'), errorBox(operationalErrorMessage(error, '无法读取运行日志')));
+    }
+  }
 }
 
 export function extractCodeView(root) {
@@ -1381,7 +1528,7 @@ export function extractCodeView(root) {
     result.replaceChildren(...ids.map((id) => h('a', { class: 'setting-item advanced-link', href: `#/album/${id}` }, `JM${id}`, h('span', { class: 'arr' }, '打开 ›'))));
     if (!ids.length) result.append(h('div', { class: 'empty' }, '没有识别到漫画编号'));
   };
-  page.append(input, h('div', { style: 'display:flex;gap:8px;margin:10px 0' },
+  page.append(input, h('div', { class: 'setting-actions extract-actions' },
     h('button', { class: 'btn primary', onclick: extract }, '提取'),
     h('button', { class: 'btn', onclick: async () => { try { input.value = await navigator.clipboard.readText(); extract(); } catch (_) { toast('无法读取剪贴板，请手动粘贴'); } } }, '读取剪贴板')),
   result); root.append(page);
@@ -1410,13 +1557,38 @@ export async function cacheView(root) {
 export async function aboutView(root, _m, _q, ctx) {
   const page = h('div', { class: 'page settings-page', style: 'max-width:720px' }, pageTitle('更新与关于'), loadingBox()); root.append(page);
   try {
-    const [health, update] = await Promise.all([fetch('/healthz', { signal: ctx?.signal }).then((x) => x.json()), jsonRequest('/update', { signal: ctx?.signal })]);
+    const healthRequest = async () => {
+      const response = await fetch('/healthz', { signal: ctx?.signal });
+      if (!response.ok) {
+        const error = new Error(`健康检查失败（${response.status}）`);
+        error.status = response.status;
+        throw error;
+      }
+      let value;
+      try { value = await response.json(); } catch (_) { throw new Error('健康检查返回了无法识别的数据'); }
+      if (!value || typeof value !== 'object' || typeof value.ok !== 'boolean') {
+        throw new Error('健康检查响应格式异常');
+      }
+      return value;
+    };
+    const [health, update] = await Promise.all([healthRequest(), jsonRequest('/update', { signal: ctx?.signal })]);
+    if (isViewInactive(ctx)) return;
+    if (!update || typeof update !== 'object' || Array.isArray(update)) throw new Error('更新检查响应格式异常');
+    const currentVersion = typeof update.currentVersion === 'string' ? update.currentVersion : '1.0.0';
+    const latestVersion = typeof update.latestVersion === 'string' ? update.latestVersion : currentVersion;
+    const updateMessage = typeof update.message === 'string' ? update.message : '';
+    const updateAvailable = update.available === true;
+    const updateUrl = updateAvailable ? safeUpdateUrl(update.url) : '';
     page.replaceChildren(pageTitle('更新与关于'), h('div', { class: 'setting-group' },
-      h('div', { class: 'setting-item' }, h('div', { class: 'lab' }, `JM Web ${update.currentVersion || '1.0.0'}`), h('div', { class: 'hint' }, health.ok ? '服务运行正常' : '服务状态异常')),
-      h('div', { class: 'setting-item' }, h('div', { class: 'lab' }, update.available ? `发现新版本 ${update.latestVersion}` : '当前已是最新版本'), h('div', { class: 'hint' }, update.message || '')),
-      update.url ? h('a', { class: 'setting-item advanced-link', href: update.url, target: '_blank', rel: 'noopener noreferrer' }, '查看更新', h('span', { class: 'arr' }, '↗')) : null,
+      h('div', { class: 'setting-item' }, h('div', { class: 'lab' }, `JM Web ${currentVersion}`), h('div', { class: 'hint' }, health.ok ? '服务运行正常' : '服务状态异常')),
+      h('div', { class: 'setting-item' }, h('div', { class: 'lab' }, updateAvailable ? `发现新版本 ${latestVersion}` : '当前已是最新版本'), h('div', { class: 'hint' }, updateMessage)),
+      updateUrl ? h('a', { class: 'setting-item advanced-link', href: updateUrl, target: '_blank', rel: 'noopener noreferrer' }, '查看更新', h('span', { class: 'arr' }, '↗')) : null,
       h('div', { class: 'setting-item' }, h('div', { class: 'hint' }, '参照 jmcomic-next 与 jm-mobile 的公开协议和用户体验，以响应式 Web/PWA 方式重新实现。'))));
-  } catch (error) { page.replaceChildren(pageTitle('更新与关于'), errorBox(error.message)); }
+  } catch (error) {
+    if (!isViewInactive(ctx) && !isAbort(error)) {
+      page.replaceChildren(pageTitle('更新与关于'), errorBox(error?.message || '无法读取版本与健康状态'));
+    }
+  }
 }
 
 /* ------------------------------ 启动任务 ------------------------------ */

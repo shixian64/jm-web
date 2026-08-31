@@ -28,12 +28,12 @@
 
 ### 方式一：直接运行（推荐）
 
-服务器需有 Node.js **20.0.0 或更高**版本（零运行时依赖，无需 `npm install`）。生产环境建议使用仍在安全维护期内的 LTS 版本；项目 Docker 镜像当前使用 Node.js 22：
+服务器需有 Node.js **20.0.0 或更高**版本（零运行时依赖，无需 `npm install`）。生产环境建议使用仍在安全维护期内的 LTS 版本；项目 Docker 构建基线固定为 `node:22.23.2-alpine3.24`，升级需经过显式评审与回归：
 
 ```bash
 git clone <本项目目录> jm-web   # 或直接上传 jm-web 文件夹
 cd jm-web
-node server.js                 # 默认监听 0.0.0.0:3210
+node server.js                 # 默认仅监听 127.0.0.1:3210
 ```
 
 启用访问口令或修改端口时，按当前 Shell 设置环境变量：
@@ -51,9 +51,9 @@ $env:PORT = '3210'
 node .\server.js
 ```
 
-`HOST=127.0.0.1` 适合同机反向代理；需要直接接受其他机器连接时再使用 `0.0.0.0`，并同时启用访问口令与 HTTPS。`PORT` 必须是 `1`–`65535` 的十进制整数。
+直接运行默认使用 `HOST=127.0.0.1`。需要经同机反向代理或直接接受其他机器连接时再使用 `0.0.0.0`，并同时启用访问口令与 HTTPS。`PORT` 必须是 `1`–`65535` 的十进制整数。
 
-从其他机器迁移代码时不要一并分发现有 `data/`：其中包含服务器密钥、设置和登录会话。新部署可让程序自动创建该目录；只有明确进行同一实例的数据迁移时才应停服后单独、安全地复制它。`data/` 和本地 `.env` 均已从 Git 与 Docker 构建上下文排除。
+从其他机器迁移代码时不要一并分发现有 `data/`：其中包含服务器密钥、设置和登录会话。直接运行时程序可自动创建该目录；Compose 部署需按下文先创建并授权。只有明确进行同一实例的数据迁移时才应停服后单独、安全地复制它。`data/` 和本地 `.env` 均已从 Git 与 Docker 构建上下文排除。
 
 生产环境建议用 systemd / pm2 守护：
 
@@ -68,47 +68,64 @@ pm2 start server.js --name jm-web
 ```bash
 cd jm-web
 cp .env.example .env           # Linux / macOS
+# 仅原生 Linux Docker 需要把 bind mount 授权给镜像内的非 root 用户。
+mkdir -p data
+sudo chown -R 1000:1000 data
+chmod 700 data
 ```
 
 ```powershell
 cd jm-web
 Copy-Item .env.example .env    # Windows PowerShell
+New-Item -ItemType Directory -Force data | Out-Null
 ```
 
-编辑 `.env`，公网/局域网暴露前至少设置高强度 `ACCESS_PASSWORD`，然后执行：
+编辑 `.env` 并设置高强度 `ACCESS_PASSWORD`，然后执行：
 
 ```bash
-docker compose --env-file .env config  # 先检查展开后的配置
+docker compose --env-file .env config --quiet  # 仅校验，不把口令/密钥展开到终端或日志
 docker compose up -d
 ```
 
 Compose 默认只将 `127.0.0.1:3210` 发布到宿主机，适合同机 Nginx/Caddy 反向代理，不会绕过 HTTPS 直接暴露后端。需要从其他机器直连时，在 `.env` 中设置 `JMW_PUBLISH_HOST=0.0.0.0`；宿主机端口由 `JMW_PUBLISH_PORT` 控制，容器内端口由 `PORT` 控制，两者可不同。这两个端口都必须位于 `1`–`65535`，发布地址必须是宿主机可绑定的 IP。
 
-默认 Compose 配置同时启用只读根文件系统、移除 Linux capabilities、禁止提权，并仅让 `/app/data` 持久化可写；运行数据不会写入镜像。`JMW_HOST_DATA_DIR` 可以改为仓库外的绝对路径，目录及其备份应按敏感凭据管理。
+无口令运维模式只信任**无任何代理头的直接 TCP 回环连接**，并校验回环 `Host`、同源浏览器元数据和 JSON 媒体类型；它刻意不信任 Docker 端口 NAT 或反向代理。因此 Compose/Nginx/Caddy 部署即使仅发布到宿主机回环，也应设置 `ACCESS_PASSWORD`，否则普通浏览功能仍可用，但日志、DoH 修改/测速等运维功能会 fail closed。不要让代理删除来源标识后把远端伪装成本机。
+
+默认 Compose 配置以 uid/gid `1000:1000` 的非 root 用户运行，同时启用只读根文件系统、移除 Linux capabilities、禁止提权，并仅让 `/app/data` 持久化可写；运行数据不会写入镜像。为避免 Docker 用 root 身份静默创建目录，Compose 要求 `JMW_HOST_DATA_DIR` 在启动前已经存在；原生 Linux 上该目录必须可由 `1000:1000` 写入。它可以改为仓库外的绝对路径，目录及其备份应按敏感凭据管理。
+
+单实例默认限制为 `1.0` CPU、`512m` 内存和 `256` 个进程，Docker `json-file` 日志按 `10m × 3` 轮转；可通过 `.env` 中的 `JMW_CPU_LIMIT`、`JMW_MEMORY_LIMIT`、`JMW_PIDS_LIMIT`、`JMW_LOG_MAX_SIZE`、`JMW_LOG_MAX_FILE` 调整。调整前应基于容量测试确定水位，不能直接删除上限。
+
+基础镜像默认固定 Node 与 Alpine 的补丁版本；生产发布还应将多架构 manifest digest 纳入制品清单。先用 `docker buildx imagetools inspect node:22.23.2-alpine3.24` 从可信仓库核验摘要，再把 `.env` 的 `JMW_NODE_IMAGE` 设置为 `node:22.23.2-alpine3.24@sha256:<核验得到的摘要>`。摘要与平台有关且会随版本升级，本仓库不写入未经当前构建环境验证的值。
 
 不使用 Compose 时可用 Docker 命名卷，该写法在 Linux、macOS 和 PowerShell 中一致：
 
 ```bash
 docker build -t jm-web .
 docker volume create jm-web-data
-docker run -d --name jm-web --restart unless-stopped --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m --cap-drop=ALL --security-opt=no-new-privileges=true -p 127.0.0.1:3210:3210 --mount type=volume,source=jm-web-data,target=/app/data --env-file .env -e PORT=3210 -e HOST=0.0.0.0 -e JMW_DATA_DIR=/app/data jm-web
+docker run -d --name jm-web --restart unless-stopped --user 1000:1000 --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m --cap-drop=ALL --security-opt=no-new-privileges=true --cpus=1 --memory=512m --pids-limit=256 --log-opt max-size=10m --log-opt max-file=3 -p 127.0.0.1:3210:3210 --mount type=volume,source=jm-web-data,target=/app/data --env-file .env -e PORT=3210 -e HOST=0.0.0.0 -e JMW_DATA_DIR=/app/data jm-web
 ```
 
 ### 环境变量
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
+| `JMW_NODE_IMAGE` | `node:22.23.2-alpine3.24` | 仅容器构建：固定基础镜像；正式制品建议附加已核验的 manifest digest |
+| `JMW_CPU_LIMIT` | `1.0` | 仅 Compose：容器 CPU 上限 |
+| `JMW_MEMORY_LIMIT` | `512m` | 仅 Compose：容器内存上限 |
+| `JMW_PIDS_LIMIT` | `256` | 仅 Compose：容器进程数上限 |
+| `JMW_LOG_MAX_SIZE` | `10m` | 仅 Compose：单个 Docker `json-file` 日志文件上限 |
+| `JMW_LOG_MAX_FILE` | `3` | 仅 Compose：Docker 日志轮转保留文件数 |
 | `PORT` | `3210` | 监听端口（`1`–`65535`）；Compose 同时用它作为容器端口映射目标 |
-| `HOST` | `0.0.0.0` | 监听地址；Compose 内固定为 `0.0.0.0`，宿主机暴露地址改用 `JMW_PUBLISH_HOST` |
+| `HOST` | `127.0.0.1` | 直接运行的监听地址；Compose 内显式固定为 `0.0.0.0`，宿主机暴露地址改用 `JMW_PUBLISH_HOST` |
 | `JMW_PUBLISH_HOST` | `127.0.0.1` | 仅 Compose：宿主机发布地址；改为 `0.0.0.0` 才会接受外部直连 |
 | `JMW_PUBLISH_PORT` | `3210` | 仅 Compose：宿主机发布端口（`1`–`65535`） |
-| `ACCESS_PASSWORD` | 空 | 设置后打开网页需要输入口令（强烈建议公网部署时设置；口令错误有 5 分钟限流） |
+| `ACCESS_PASSWORD` | 空 | 设置后打开网页需要输入口令（容器/反代部署必须设置；口令错误有 5 分钟限流） |
 | `JM_API_BASE` | 空 | 覆盖 API 域名，逗号分隔多个候选；**设置后锁定**，网页设置页不可再切换 |
 | `JM_UA` | `okhttp/4.9.3` | 请求上游使用的 UA |
 | `JM_TIMEOUT` | `20000` | 上游单域名超时（毫秒） |
 | `JM_TOTAL_TIMEOUT` | `35000` | 上游全部域名轮询总时间预算（毫秒） |
 | `JMW_DATA_DIR` | `./data` | 会话与设置持久化目录；Compose 内固定为 `/app/data` |
-| `JMW_HOST_DATA_DIR` | `./data` | 仅 Compose：挂载到 `/app/data` 的宿主机目录 |
+| `JMW_HOST_DATA_DIR` | `./data` | 仅 Compose：挂载到 `/app/data` 的已存在宿主机目录；原生 Linux 上须可由 `1000:1000` 写入 |
 | `JMW_MAX_IMAGE_BYTES` | `26214400` | 图片代理单文件大小上限（字节，范围 1–100 MiB） |
 | `JMW_MAX_IMAGE_CONCURRENCY` | `24` | 图片代理最大并发数（范围 1–100） |
 | `JMW_MAX_API_RESPONSE_BYTES` | `16777216` | 上游 API 单响应大小上限（字节，范围 1–32 MiB） |
@@ -201,6 +218,7 @@ jm-web/
 ```bash
 npm test   # 解析/MD5 单元测试 + 后端路由、会话、故障切换与图片代理回归测试
 npm run check
+node test/deployment.test.js
 docker compose config --quiet
 docker compose --env-file .env.example config --quiet
 ```

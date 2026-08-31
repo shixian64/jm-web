@@ -1,7 +1,7 @@
 // 应用外壳与路由：顶栏（桌面导航）/ 底部 Tab（手机）/ 各页面挂载
 import { applyTheme, setting } from './store.js';
 import { api } from './api.js';
-import { h, toast } from './ui.js';
+import { h, toast, errorBox } from './ui.js';
 import { icon } from './icons.js';
 import { homeView, searchView, categoryView, categoryListView, promoteListView, weekView, albumView } from './views.js';
 import { mountReader } from './reader.js';
@@ -116,6 +116,18 @@ let currentRouteEntryId = null;
 let currentRouteKey = null;
 let currentRouteIsFullScreen = false;
 let cancelScheduledScroll = null;
+
+// 异步 View 的异常可能来自网络、上游数据或浏览器能力。路由层只向用户呈现
+// 稳定的提示，不把内部堆栈、文件路径或第三方响应原样暴露到页面。
+function routeErrorMessage(error) {
+  const status = Number(error?.status);
+  if (status === 401) return '需要访问口令，请先完成验证。';
+  if (status === 403) return '当前操作需要站点管理员权限。';
+  if (status === 404) return '请求的内容不存在或已下线。';
+  if (status === 429) return '请求过于频繁，请稍后重试。';
+  if (status >= 500 && status <= 599) return '服务暂时不可用，请稍后重试。';
+  return '页面加载失败，请稍后重试。';
+}
 
 // Hash SPA 自己管理滚动位置，避免浏览器原生恢复与异步 View 渲染互相抢写。
 if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
@@ -297,6 +309,11 @@ function render(navigation = {}) {
           }).catch((e) => {
             if (!ctx.isActive() || (e && e.name === 'AbortError')) return;
             console.error('[route] view 失败:', e);
+            // 与同步 View 保持一致：活动路由必须离开骨架/旧内容，给出
+            // 可见且安全的错误态；同时终止该 View 后续可能仍在运行的请求。
+            dispose();
+            if (currentCleanup === dispose) currentCleanup = null;
+            main.replaceChildren(errorBox(routeErrorMessage(e)));
           });
         } else if (typeof result === 'function') {
           viewCleanup = result;
@@ -304,7 +321,9 @@ function render(navigation = {}) {
       } catch (e) {
         dispose();
         if (currentCleanup === dispose) currentCleanup = null;
-        main.replaceChildren(h('div', { class: 'error-box' }, e.message || '页面加载失败'));
+        // 同步 View 也可能把第三方响应/内部错误抛到这里；与异步 View
+        // 使用同一套状态分级文案，避免把堆栈、路径或上游原文渲染给用户。
+        main.replaceChildren(errorBox(routeErrorMessage(e)));
       }
       highlightNav(path);
       if (!fullScreenView) {

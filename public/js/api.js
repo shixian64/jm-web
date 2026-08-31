@@ -75,7 +75,11 @@ export const api = {
 
 /** 封面/头像等静态图地址：API 的 image 字段可能是绝对地址、//xx、/path 或文件名 */
 export function imgSrc(item) {
-  const img = (item && item.image) || '';
+  // 上游字段并非始终稳定：异常对象/数字不能直接调用 startsWith，
+  // 否则任一列表卡片都会在渲染阶段中断。只接受字符串图片字段，
+  // ID 回退也限制为十进制编号，避免把任意对象拼进代理路径。
+  const rawImage = item && typeof item === 'object' ? item.image : '';
+  const img = typeof rawImage === 'string' ? rawImage.trim() : '';
   if (/^https?:\/\//i.test(img)) return '/api/img?u=' + encodeURIComponent(img);
   if (img.startsWith('//')) return '/api/img?u=' + encodeURIComponent('https:' + img);
   if (img.startsWith('/media/')) return '/api/img?path=' + encodeURIComponent(img);
@@ -83,10 +87,12 @@ export function imgSrc(item) {
     return '/api/img?path=' + encodeURIComponent('/media/albums/' + img);
   }
   // 详情接口可能不带 image：使用规范封面路径
-  const id = item && (item.id || item.aid);
+  const rawId = item && typeof item === 'object' ? (item.id ?? item.aid) : '';
+  const id = /^\d{1,12}$/.test(String(rawId ?? '').trim()) ? String(rawId).trim() : '';
   return id ? `/api/img?path=${encodeURIComponent(`/media/albums/${id}_3x4.jpg`)}` : '';
 }
 
 export function chapterImgSrc(url) {
-  return '/api/img?u=' + encodeURIComponent(url);
+  const value = typeof url === 'string' ? url.trim() : '';
+  return value ? '/api/img?u=' + encodeURIComponent(value) : '';
 }

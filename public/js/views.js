@@ -136,25 +136,13 @@ export function homeView(root, ctx) {
 
       const firstBlock = blocks[0];
       const firstIsSwiper = !!(firstBlock && firstBlock.content.length > 2 && firstBlock.type !== 'record');
-      // 首屏先给内容，再给工具入口；减少传统后台式的按钮墙。
+      // 首屏优先展示内容。
       if (firstIsSwiper) {
         content.append(
           sectionHeading(displayBlockTitle(firstBlock.title, '连载更新'), () => gotoBlockFilter(firstBlock), '精选更新'),
           buildSwiper(firstBlock.content, cleanups, firstBlock.title),
         );
       }
-
-      content.append(
-        sectionHeading('探索', null, '快捷入口'),
-        h('div', { class: 'quick-actions', 'aria-label': '快捷入口' },
-          entry('search', '搜索', '#/search'),
-          entry('layout-grid', '分类', '#/category'),
-          entry('calendar-days', '每周必看', '#/week'),
-          entry('star', '收藏', '#/favorites'),
-          entry('history', '阅读历史', '#/watch-history'),
-          entry('smartphone', '本地记录', '#/local-history'),
-        ),
-      );
 
       if (setting.preferenceRecommendEnabled) {
         const preferenceHost = h('section', { class: 'preference-recommend', 'aria-live': 'polite' },
@@ -219,10 +207,6 @@ export function homeView(root, ctx) {
 
   // 离开首页时清理轮播定时器，避免在已脱离 DOM 的节点上空转
   return dispose;
-}
-
-function entry(ic, label, href) {
-  return h('a', { href }, h('span', { class: 'ic' }, icon(ic, 20)), h('span', { class: 'entry-label' }, label));
 }
 
 function gotoBlockFilter(block) {
@@ -809,25 +793,43 @@ export async function albumView(root, id, ctx) {
   try {
     const res = await api.album(id, ctx && ctx.signal);
     if (isInactive(ctx)) return;
-    data = res.data;
+    data = res && res.data;
   } catch (e) {
     if (isInactive(ctx) || isAbort(e)) return;
     page.replaceChildren(errorBox(e.message));
     return;
   }
 
-  // 上游 author 可能为数组或字符串
-  const authors = Array.isArray(data.author) ? data.author : (data.author ? [String(data.author)] : []);
-  const category = String(data.category_sub?.title || data.category?.title || data.category || '').trim();
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    page.replaceChildren(errorBox('详情数据格式异常，请稍后重试'));
+    return;
+  }
 
-  const coverSrc = imgSrc({ id, image: data.image });
+  // 上游 author 可能为数组或字符串
+  const safeText = (value, fallback = '') => (typeof value === 'string' || typeof value === 'number'
+    ? String(value).trim() : fallback);
+  const authors = (Array.isArray(data.author) ? data.author : [data.author]).map((item) => safeText(item)).filter(Boolean);
+  const category = safeText(data.category_sub?.title || data.category?.title
+    || (typeof data.category === 'string' ? data.category : ''));
+  const albumName = safeText(data.name) || `漫画 ${id}`;
+  const description = safeText(data.description);
+  const tags = [...(Array.isArray(data.tags) ? data.tags : []),
+    ...(Array.isArray(data.actors) ? data.actors : []),
+    ...(Array.isArray(data.works) ? data.works : [])].map((item) => safeText(item)).filter(Boolean);
+  const series = (Array.isArray(data.series) ? data.series : [])
+    .filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+    .slice().sort((a, b) => Number(a.sort) - Number(b.sort));
+  const relatedList = (Array.isArray(data.related_list) ? data.related_list : [])
+    .filter((item) => item && typeof item === 'object' && !Array.isArray(item));
+
+  const coverSrc = imgSrc({ id, image: typeof data.image === 'string' ? data.image : '' });
   const hero = h('div', { class: 'album-hero' },
     h('div', { class: 'bg', style: { backgroundImage: `url("${coverSrc}")` } }),
     h('div', { class: 'wrap' },
-      h('div', { class: 'cover' }, h('img', { src: coverSrc, alt: data.name || '封面' })),
+      h('div', { class: 'cover' }, h('img', { src: coverSrc, alt: albumName || '封面' })),
       h('div', { class: 'info' },
         h('div', { class: 'hero-kicker' }, category || '漫画详情'),
-        h('h1', null, data.name || `漫画 ${id}`),
+        h('h1', null, albumName),
         authors.length ? h('div', { class: 'meta' }, '作者：', authors.join(' / ')) : null,
         h('div', { class: 'meta', style: 'display:flex;align-items:center;gap:8px;flex-wrap:wrap' },
           h('span', null, `JM${id}`),
@@ -865,8 +867,7 @@ export async function albumView(root, id, ctx) {
   const readBtn = h('button', {
     class: 'btn primary',
     onclick: () => {
-      const chapters = data.series || [];
-      const first = chapters.length ? chapters.reduce((a, b) => (Number(a.sort) <= Number(b.sort) ? a : b)) : null;
+      const first = series.length ? series[0] : null;
       const photoId = /^\d+$/.test(String(first && first.id || '')) ? first.id : id;
       location.hash = `#/read/${photoId}?aid=${id}`;
     },
@@ -905,8 +906,8 @@ export async function albumView(root, id, ctx) {
   body.append(h('div', { class: 'action-bar' }, readBtn, downloadBtn, favBtn, likeBtn));
 
   // 简介
-  if (data.description) {
-    const desc = h('div', { class: 'desc clamp' }, data.description);
+  if (description) {
+    const desc = h('div', { class: 'desc clamp' }, description);
     let expanded = false;
     const toggle = h('div', {
       class: 'desc-toggle', role: 'button', tabindex: '0',
@@ -921,7 +922,6 @@ export async function albumView(root, id, ctx) {
   }
 
   // 标签
-  const tags = [...(data.tags || []), ...(data.actors || []), ...(data.works || [])];
   if (tags.length) {
     const tagLine = h('div', { class: 'tag-line' });
     tags.forEach((t) => tagLine.append(h('a', {
@@ -932,8 +932,8 @@ export async function albumView(root, id, ctx) {
   }
 
   // 章节
-  const series = (data.series || []).slice().sort((a, b) => Number(a.sort) - Number(b.sort));
-  if (series.length > 1 || (data.series_id && data.series_id !== '0')) {
+  const seriesId = safeText(data.series_id);
+  if (series.length > 1 || (seriesId && seriesId !== '0')) {
     const selectable = series.filter((chapter) => /^\d+$/.test(String((chapter && chapter.id) || '')));
     const selected = new Set();
     const selectionText = h('span', { class: 'hint chapter-selection-count', 'aria-live': 'polite' }, '未选择章节');
@@ -998,10 +998,10 @@ export async function albumView(root, id, ctx) {
   }
 
   // 相关推荐
-  if (data.related_list && data.related_list.length) {
+  if (relatedList.length) {
     body.append(h('div', { class: 'section-title', style: 'margin-top:16px' }, '相关推荐'));
     const strip = h('div', { class: 'hscroll' });
-    data.related_list.forEach((it) => strip.append(comicCard(it)));
+    relatedList.forEach((it) => strip.append(comicCard(it)));
     body.append(strip);
   }
 

@@ -238,7 +238,11 @@ export function signinView(root, ctx) {
 
     let data;
     try {
-      data = (await api.daily(me.uid, controller.signal)).data;
+      const response = await api.daily(me.uid, controller.signal);
+      if (!response || !response.data || typeof response.data !== 'object' || Array.isArray(response.data)) {
+        throw new Error('签到数据格式异常');
+      }
+      data = response.data;
       if (destroyed || isInactive(ctx) || controller.signal.aborted || seq !== refreshSeq) return;
     } catch (e) {
       if (destroyed || isInactive(ctx) || controller.signal.aborted || isAbort(e) || seq !== refreshSeq) return;
@@ -248,7 +252,8 @@ export function signinView(root, ctx) {
       if (loadController === controller) loadController = null;
     }
 
-    const flat = (data.record || []).flat();
+    const flat = (Array.isArray(data.record) ? data.record : []).flat()
+      .filter((item) => item && typeof item === 'object' && !Array.isArray(item));
     const todayIdx = Number(data.currentProgress) || 0;
     const isTodaySigned = flat[new Date().getDate() - 1]?.signed === true;
     const grid = h('div', { class: 'sign-grid' });
@@ -770,8 +775,9 @@ export function myCommentsView(root, params, ctx) {
     try {
       const res = await api.userComments(uid, nextPage, controller.signal);
       if (destroyed || seq !== generation || isInactive(ctx) || controller.signal.aborted) return;
-      const d = res.data || {};
-      const list = d.list || [];
+      const d = res && res.data && typeof res.data === 'object' && !Array.isArray(res.data) ? res.data : {};
+      const list = (Array.isArray(d.list) ? d.list : [])
+        .filter((item) => item && typeof item === 'object' && !Array.isArray(item));
       if (nextPage === 1 && !list.length) {
         listWrap.replaceChildren(h('div', { class: 'empty' }, h('div', { class: 'big' }, icon('message-square', 40)), '还没有发表过评论'));
         sentinel.replaceChildren();

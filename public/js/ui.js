@@ -49,16 +49,16 @@ function asActivatable(el, onclick) {
 
 /** 封面卡片（3:4 封面 + 两行标题） */
 export function comicCard(item) {
-  item = item || {};
+  item = item && typeof item === 'object' ? item : {};
+  const text = (value) => (typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '');
+  const name = text(item.name) || '未知';
   const rawId = item.id ?? item.aid ?? item.AID;
   const id = rawId == null ? '' : String(rawId);
   const canOpen = /^\d+$/.test(id);
   const open = () => { location.hash = `#/album/${id}`; };
-  const category = String(
-    item.category_sub?.title || item.category?.title || item.category || '',
-  ).trim();
+  const category = text(item.category_sub?.title || item.category?.title || item.category);
   const image = h('img', {
-    loading: 'lazy', decoding: 'async', src: imgSrcOf(item), alt: item.name || '封面',
+    loading: 'lazy', decoding: 'async', src: imgSrcOf(item), alt: name,
     onerror: (e) => {
       e.currentTarget.classList.add('is-broken');
       e.currentTarget.parentElement?.classList.add('is-broken');
@@ -71,15 +71,15 @@ export function comicCard(item) {
   const card = h('div', {
     class: 'comic-card',
     ...(category ? { 'data-kind': category } : {}),
-    ...(canOpen ? { onclick: open, 'aria-label': `查看${item.name || '漫画'}详情` } : { 'aria-disabled': 'true' }),
+    ...(canOpen ? { onclick: open, 'aria-label': `查看${name === '未知' ? '漫画' : name}详情` } : { 'aria-disabled': 'true' }),
   });
   if (canOpen) asActivatable(card, open);
   card.append(
     cover,
     h('div', { class: 'card-copy' },
-      h('div', { class: 'name' }, item.name || '未知'),
+      h('div', { class: 'name' }, name),
       h('div', { class: 'card-meta' },
-        item.author ? String(item.author).split(/[、,，\/]/)[0] || '' : (category || 'JM Web'),
+        text(item.author) ? text(item.author).split(/[、,，\/]/)[0] || '' : (category || 'JM Web'),
       ),
     ),
   );
