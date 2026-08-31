@@ -259,6 +259,17 @@ function isAbort(error) {
       }
     });
 
+    await run('多地址连接尝试窗口', async () => {
+      await withFakeResponse({ status: 200, body: 'ok' }, async ({ req }) => {
+        const response = await httpsFetch('https://attempt-window.test/', {},
+          async () => [{ address: '127.0.0.1', family: 4 }]);
+        assert.strictEqual(await response.text(), 'ok');
+        assert.strictEqual(req.options.autoSelectFamily, true);
+        assert.strictEqual(req.options.autoSelectFamilyAttemptTimeout, 1000,
+          '高延迟双栈网络不得继续使用 Node 默认约 250ms 的单地址窗口');
+      });
+    });
+
     await run('违规无限 205 不得后台排空', async () => {
       const response = await httpsFetch(url('/slow-205'), {}, fallbackLookup);
       assert.strictEqual(await response.text(), '');

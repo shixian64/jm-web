@@ -925,6 +925,101 @@ class MockServerResponse extends EventEmitter {
     assert.strictEqual(calls.length, 2);
     assert.strictEqual(result.data.marker, 'post-connect-failover-ok');
 
+    // Node 的 internalConnectMultiple 把多地址连接失败包装成 AggregateError；
+    // 全部子错误均发生在 connect 阶段时，请求正文尚未送达，POST 可安全换线。
+    calls = [];
+    const connectAggregate = new AggregateError([
+      Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT', syscall: 'connect' }),
+      Object.assign(new Error('connect ENETUNREACH'), { code: 'ENETUNREACH', syscall: 'connect' }),
+    ], '');
+    connectAggregate.code = 'ETIMEDOUT';
+    global.fetch = async (url, opts) => {
+      calls.push(url);
+      if (calls.length === 1) throw connectAggregate;
+      return encryptedResponse(opts.headers.token, { marker: 'post-aggregate-connect-failover-ok' });
+    };
+    result = await upstreamRequest({
+      method: 'POST', path: '/login', form: [],
+      hosts: ['https://one.example', 'https://two.example'],
+      jar: { cookiesByOrigin: {} }, cookieHosts: [], dnsLookup: publicDns,
+    });
+    assert.strictEqual(calls.length, 2);
+    assert.strictEqual(result.data.marker, 'post-aggregate-connect-failover-ok');
+
+    calls = [];
+    const wrappedConnectAggregate = new TypeError('fetch failed', { cause: connectAggregate });
+    global.fetch = async (url, opts) => {
+      calls.push(url);
+      if (calls.length === 1) throw wrappedConnectAggregate;
+      return encryptedResponse(opts.headers.token, { marker: 'post-wrapped-aggregate-failover-ok' });
+    };
+    result = await upstreamRequest({
+      method: 'POST', path: '/login', form: [],
+      hosts: ['https://one.example', 'https://two.example'],
+      jar: { cookiesByOrigin: {} }, cookieHosts: [], dnsLookup: publicDns,
+    });
+    assert.strictEqual(calls.length, 2);
+    assert.strictEqual(result.data.marker, 'post-wrapped-aggregate-failover-ok');
+
+    // 聚合错误中只要有一个尝试已越过 connect 阶段，就不能证明 POST 未送达。
+    calls = [];
+    const ambiguousAggregate = new AggregateError([
+      Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT', syscall: 'connect' }),
+      Object.assign(new Error('read ETIMEDOUT'), { code: 'ETIMEDOUT', syscall: 'read' }),
+    ], 'mixed connection state');
+    // 顶层即使伪装成旧逻辑认可的安全 code，也必须以完整子错误集合为准。
+    ambiguousAggregate.code = 'ENETUNREACH';
+    global.fetch = async (url) => { calls.push(url); throw ambiguousAggregate; };
+    await assert.rejects(
+      () => upstreamRequest({
+        method: 'POST', path: '/login', form: [],
+        hosts: ['https://one.example', 'https://two.example'],
+        jar: { cookiesByOrigin: {} }, cookieHosts: [], dnsLookup: publicDns,
+      }),
+      (error) => error.code === 504 && error.cause === ambiguousAggregate
+    );
+    assert.strictEqual(calls.length, 1);
+
+    let deepAmbiguous = ambiguousAggregate;
+    for (let depth = 0; depth < 5; depth++) deepAmbiguous = new Error(`wrapper ${depth}`, { cause: deepAmbiguous });
+    deepAmbiguous.code = 'ENETUNREACH';
+    for (const wrappedAmbiguous of [
+      Object.assign(new TypeError('outer safe code', { cause: ambiguousAggregate }), { code: 'ENETUNREACH' }),
+      new Error('second wrapper', {
+        cause: Object.assign(new TypeError('outer safe code', { cause: ambiguousAggregate }), { code: 'ENETUNREACH' }),
+      }),
+      deepAmbiguous,
+    ]) {
+      calls = [];
+      global.fetch = async (url) => { calls.push(url); throw wrappedAmbiguous; };
+      await assert.rejects(
+        () => upstreamRequest({
+          method: 'POST', path: '/login', form: [],
+          hosts: ['https://one.example', 'https://two.example'],
+          jar: { cookiesByOrigin: {} }, cookieHosts: [], dnsLookup: publicDns,
+        }),
+        (error) => error.code === 504 && error.cause === wrappedAmbiguous
+      );
+      assert.strictEqual(calls.length, 1);
+    }
+
+    for (const invalidErrors of [[], [null]]) {
+      calls = [];
+      const invalidAggregate = new AggregateError(invalidErrors, 'invalid aggregate');
+      invalidAggregate.code = 'ENETUNREACH';
+      global.fetch = async (url) => { calls.push(url); throw invalidAggregate; };
+      await assert.rejects(
+        () => upstreamRequest({
+          method: 'POST', path: '/login', form: [],
+          hosts: ['https://one.example', 'https://two.example'],
+          jar: { cookiesByOrigin: {} }, cookieHosts: [], dnsLookup: publicDns,
+        }),
+        (error) => error.code === 504 && error.cause === invalidAggregate &&
+          !Object.keys(error).includes('cause')
+      );
+      assert.strictEqual(calls.length, 1);
+    }
+
     calls = [];
     global.fetch = async (url, opts) => {
       calls.push(url);
