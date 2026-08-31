@@ -49,6 +49,7 @@ html[data-theme="dark"] {
 }
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body, #app, #main { max-width: 100%; overflow-x: clip; }
 html, body { margin: 0; padding: 0; }
 body {
   background: var(--bg);
@@ -277,6 +278,12 @@ body.no-tab #main { padding-bottom: 24px; }
 /* 横向滚动条目（首页区块） */
 .hscroll { display: flex; gap: 12px; overflow-x: auto; padding: 2px 2px 8px; scrollbar-width: none; }
 .hscroll::-webkit-scrollbar { display: none; }
+.chips, .hscroll {
+  max-width: 100%;
+  min-width: 0;
+  overscroll-behavior-x: contain;
+  overscroll-behavior-inline: contain;
+}
 .hscroll .comic-card { width: 108px; flex: none; }
 @media (min-width: 900px) { .hscroll .comic-card { width: 140px; } }
 
@@ -1385,7 +1392,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .comic-card:focus-visible { outline: none; }
 .comic-card:focus-visible .cover { outline: 2px solid var(--primary); outline-offset: 3px; }
 .hscroll {
-  gap: 16px;
+  --hscroll-gap: 16px;
+  gap: var(--hscroll-gap);
   padding: 2px 2px 10px;
   margin-inline: -2px;
 }
@@ -1425,15 +1433,15 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .hscroll .comic-card { width: 166px; flex-basis: 166px; }
 }
 
-/* 未设置对应变量时声明无效，继续使用上面的响应式列数。 */
-.home-page .grid { grid-template-columns: repeat(var(--home-grid-columns), minmax(0, 1fr)); }
-.home-page .hscroll .comic-card {
-  width: calc((100% - (var(--home-grid-columns) - 1) * 12px) / var(--home-grid-columns));
-  flex-basis: calc((100% - (var(--home-grid-columns) - 1) * 12px) / var(--home-grid-columns));
+/* 只有用户明确设置固定列数时才覆盖响应式规则；避免未定义 var 让属性回到初始值。 */
+.fixed-home-grid .home-page .grid { grid-template-columns: repeat(var(--home-grid-columns), minmax(0, 1fr)); }
+.fixed-home-grid .home-page .hscroll .comic-card {
+  width: calc((100% - (var(--home-grid-columns) - 1) * var(--hscroll-gap)) / var(--home-grid-columns));
+  flex-basis: calc((100% - (var(--home-grid-columns) - 1) * var(--hscroll-gap)) / var(--home-grid-columns));
 }
-.collect-page .grid { grid-template-columns: repeat(var(--collect-grid-columns), minmax(0, 1fr)); }
-.history-page .grid { grid-template-columns: repeat(var(--history-grid-columns), minmax(0, 1fr)); }
-.search-page .grid { grid-template-columns: repeat(var(--search-grid-columns), minmax(0, 1fr)); }
+.fixed-collect-grid .collect-page .grid { grid-template-columns: repeat(var(--collect-grid-columns), minmax(0, 1fr)); }
+.fixed-history-grid .history-page .grid { grid-template-columns: repeat(var(--history-grid-columns), minmax(0, 1fr)); }
+.fixed-search-grid .search-page .grid { grid-template-columns: repeat(var(--search-grid-columns), minmax(0, 1fr)); }
 
 /* ---------- 控件与筛选 ---------- */
 .card {
@@ -1805,7 +1813,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .swiper .slide h2 { font-size: 19px; }
   .grid { gap: 22px 11px; }
   .comic-card .name { font-size: 13px; }
-  .hscroll { gap: 12px; }
+  .hscroll { --hscroll-gap: 12px; }
   .hscroll .comic-card { width: 118px; flex-basis: 118px; }
   .continue-strip .continue-card { width: min(225px, 82vw); flex-basis: min(225px, 82vw); }
 }

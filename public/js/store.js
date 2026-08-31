@@ -125,17 +125,21 @@ export function applyTheme() {
     if (colors && /^#[0-9a-f]{6}$/i.test(colors[key] || '')) document.documentElement.style.setProperty(css, colors[key]);
     else document.documentElement.style.removeProperty(css);
   }
-  for (const [key, css] of Object.entries({
-    homeGridColumns: '--home-grid-columns', collectGridColumns: '--collect-grid-columns',
-    downloadGridColumns: '--download-grid-columns', historyGridColumns: '--history-grid-columns',
-    searchGridColumns: '--search-grid-columns',
-  })) {
-    const value = Math.max(0, Math.min(6, Number(setting[key]) || 0));
-    if (value) document.documentElement.style.setProperty(css, String(value));
+  const gridLayouts = {
+    homeGridColumns: ['--home-grid-columns', 'fixed-home-grid'],
+    collectGridColumns: ['--collect-grid-columns', 'fixed-collect-grid'],
+    downloadGridColumns: ['--download-grid-columns', 'fixed-download-grid'],
+    historyGridColumns: ['--history-grid-columns', 'fixed-history-grid'],
+    searchGridColumns: ['--search-grid-columns', 'fixed-search-grid'],
+  };
+  for (const [key, [css, className]] of Object.entries(gridLayouts)) {
+    const value = Number(setting[key]);
+    const enabled = Number.isInteger(value) && value >= 1 && value <= 6;
+    if (enabled) document.documentElement.style.setProperty(css, String(value));
     else document.documentElement.style.removeProperty(css);
+    document.documentElement.classList.toggle(className, enabled);
   }
   document.documentElement.classList.toggle('privacy-mode', !!setting.privacyMode);
-  document.documentElement.classList.toggle('fixed-download-grid', Number(setting.downloadGridColumns) > 0);
   document.title = setting.privacyMode ? '阅读空间' : 'JM Web';
   const meta = document.querySelector('meta[name="theme-color"]');
   if (!meta) return;
