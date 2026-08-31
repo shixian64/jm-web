@@ -2,13 +2,47 @@ services:
   jm-web:
     build: .
     container_name: jm-web
+    init: true
     restart: unless-stopped
+    stop_grace_period: 10s
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
     ports:
-      - "3210:3210"
+      - target: ${PORT:-3210}
+        published: "${JMW_PUBLISH_PORT:-3210}"
+        host_ip: "${JMW_PUBLISH_HOST:-127.0.0.1}"
+        protocol: tcp
     environment:
-      # 访问口令（建议设置，避免站点被陌生人访问）
-      - ACCESS_PASSWORD=${ACCESS_PASSWORD:-}
-      # API 域名覆盖（可选，逗号分隔多个候选）
-      - JM_API_BASE=${JM_API_BASE:-}
+      # 容器内必须监听所有接口；宿主机暴露范围由 JMW_PUBLISH_HOST 单独控制。
+      PORT: "${PORT:-3210}"
+      HOST: "0.0.0.0"
+      ACCESS_PASSWORD: "${ACCESS_PASSWORD:-}"
+      JM_API_BASE: "${JM_API_BASE:-}"
+      JM_UA: "${JM_UA:-okhttp/4.9.3}"
+      JM_TIMEOUT: "${JM_TIMEOUT:-20000}"
+      JM_TOTAL_TIMEOUT: "${JM_TOTAL_TIMEOUT:-35000}"
+      JMW_DATA_DIR: "/app/data"
+      JMW_MAX_IMAGE_BYTES: "${JMW_MAX_IMAGE_BYTES:-26214400}"
+      JMW_MAX_IMAGE_CONCURRENCY: "${JMW_MAX_IMAGE_CONCURRENCY:-24}"
+      JMW_MAX_API_RESPONSE_BYTES: "${JMW_MAX_API_RESPONSE_BYTES:-16777216}"
+      JMW_MAX_AI_STREAM_BYTES: "${JMW_MAX_AI_STREAM_BYTES:-16777216}"
+      JMW_MAX_AI_CONCURRENCY: "${JMW_MAX_AI_CONCURRENCY:-4}"
+      JMW_MAX_SEARCH_CONCURRENCY: "${JMW_MAX_SEARCH_CONCURRENCY:-8}"
+      JMW_TRUST_PROXY: "${JMW_TRUST_PROXY:-}"
+      AI_API_KEY: "${AI_API_KEY:-}"
+      AI_BASE_URL: "${AI_BASE_URL:-https://api.openai.com/v1}"
+      AI_MODEL: "${AI_MODEL:-gpt-5-mini}"
+      AI_TIMEOUT: "${AI_TIMEOUT:-120000}"
+      TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
+      SEARXNG_BASE_URL: "${SEARXNG_BASE_URL:-}"
+      SEARCH_TIMEOUT: "${SEARCH_TIMEOUT:-35000}"
+      JMW_UPDATE_REPO: "${JMW_UPDATE_REPO:-}"
     volumes:
-      - ./data:/app/data
+      - type: bind
+        source: "${JMW_HOST_DATA_DIR:-./data}"
+        target: /app/data

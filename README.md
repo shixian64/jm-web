@@ -8,33 +8,51 @@
 
 ## 功能
 
-- **首页推荐**：轮播图 + 多区块推荐 + 继续阅读（本地记录）
-- **搜索**：关键词 / 作者 / 标签 / 漫画 ID，四种排序，搜索历史，无限滚动
-- **分类浏览**：主分类 + 子分类 + 热门标签
-- **每周必看**：按期数和类型浏览
-- **漫画详情**：封面、标签、简介、章节列表、相关推荐、点赞 / 收藏
-- **阅读器**：
-  - 连续滚动 / 单页翻页两种模式（可随时切换）
-  - 图片自动解扰还原（与客户端一致的分片重排算法，Canvas 前端解码，不占服务器带宽 CPU）
-  - 前后多页预加载、阅读进度条、翻页手势（手机滑动 / 点击分区、电脑键盘 ← →）
-  - 章节间跳转、恢复上次阅读位置
-- **用户系统**：登录、自动登录、签到日历、收藏列表、云端阅读历史、我的评论、发表评论
-- **本地数据**：阅读记录、搜索历史保存在浏览器本地，无需登录也可用
-- **多线路**：API 域名 / 图片分流线路可切换，接口请求失败自动故障切换到其他域名
+- **发现内容**：首页轮播及多区块推荐、个性化继续阅读、主/子分类、总/月/周/日排行、热门标签、每周必看。
+- **搜索**：关键词、作者、标签或 JM 编号；四种排序、无限滚动、搜索历史、`-标签` 排除语法和可复用排除模板。
+- **漫画详情与社交**：封面、标签、简介、章节、相关漫画、复制 JM 号、点赞、收藏；评论、嵌套回复、点赞和发表评论。
+- **账号数据**：登录/自动登录、签到日历、收藏列表及浏览器本地收藏夹（新建、改名、删除、批量移动）、云端阅读历史、评论历史。
+- **完整阅读器**：连续滚动、正序/RTL 单页、点击翻页四种模式；前后预解码、章节跳转、进度恢复、页码、亮度、Wake Lock、1–4x 缩放、工具栏自动隐藏、点击区域、内存优化和解码并发设置。
+- **图片还原**：使用与安卓客户端相同的扰乱规则在浏览器 Canvas 解码；下载时保存解扰后的图片。
+- **下载与离线**：IndexedDB 离线资料库、可暂停/继续/重试的持久下载队列、断点补页、完整性检查、存储统计/清理和离线阅读。
+- **导出与 PWA**：整本/单章 ZIP、浏览器打印为 PDF、Service Worker、Web App Manifest 和可安装 PWA 外壳。
+- **外观与过滤**：浅色/深色/跟随系统、五套调色板与自定义四色、各页面网格列数、全局/首页标签过滤。
+- **隐私与迁移**：PIN/口令、图案锁、WebAuthn 设备验证、任一/全部验证规则、失焦伪装；JSON 或 PBKDF2 + AES-GCM 加密备份恢复。
+- **AI 与工具**：可选 OpenAI-compatible 流式对话、多会话、人格、停止/编辑/重试/详细/精简、Tavily 联网搜索；漫画编号提取及剪贴板检测。
+- **运维**：API/图片多线路故障切换、可选 DoH 预解析与测速、运行日志、缓存维护、健康检查和 GitHub Release 更新检查。
+
+> Web 与 Android 平台能力不同：Android WorkManager 对应为浏览器内持久下载队列（关闭页面后暂停、下次进入续传）；Android 系统 PDF 写入对应为浏览器打印“另存为 PDF”；桌面图标伪装对应为失焦隐私遮罩。浏览器本地收藏夹与历史删除是当前浏览器会话视图，不会改动不支持这些操作的上游账号数据。
 
 ## 部署
 
 ### 方式一：直接运行（推荐）
 
-服务器需有 Node.js **18.14.1 或更高**版本（无需 npm install，零依赖；18.14 以下缺少 `getSetCookie()`，登录态无法保持）：
+服务器需有 Node.js **20.0.0 或更高**版本（零运行时依赖，无需 `npm install`）。生产环境建议使用仍在安全维护期内的 LTS 版本；项目 Docker 镜像当前使用 Node.js 22：
 
 ```bash
 git clone <本项目目录> jm-web   # 或直接上传 jm-web 文件夹
 cd jm-web
-PORT=3210 node server.js
+node server.js                 # 默认监听 0.0.0.0:3210
 ```
 
-从其他机器迁移代码时不要一并分发现有 `data/`：其中包含服务器密钥、设置和登录会话。新部署可让程序自动创建该目录；只有明确进行同一实例的数据迁移时才应单独、安全地复制它。
+启用访问口令或修改端口时，按当前 Shell 设置环境变量：
+
+```bash
+# Linux / macOS
+ACCESS_PASSWORD='请替换为独立的长随机口令' HOST=127.0.0.1 PORT=3210 node server.js
+```
+
+```powershell
+# Windows PowerShell
+$env:ACCESS_PASSWORD = '请替换为独立的长随机口令'
+$env:HOST = '127.0.0.1'
+$env:PORT = '3210'
+node .\server.js
+```
+
+`HOST=127.0.0.1` 适合同机反向代理；需要直接接受其他机器连接时再使用 `0.0.0.0`，并同时启用访问口令与 HTTPS。`PORT` 必须是 `1`–`65535` 的十进制整数。
+
+从其他机器迁移代码时不要一并分发现有 `data/`：其中包含服务器密钥、设置和登录会话。新部署可让程序自动创建该目录；只有明确进行同一实例的数据迁移时才应停服后单独、安全地复制它。`data/` 和本地 `.env` 均已从 Git 与 Docker 构建上下文排除。
 
 生产环境建议用 systemd / pm2 守护：
 
@@ -44,30 +62,69 @@ pm2 start server.js --name jm-web
 
 ### 方式二：Docker
 
+推荐使用 Compose 和本地 `.env`：
+
 ```bash
 cd jm-web
-ACCESS_PASSWORD=你的访问口令 docker compose up -d
-# 或不使用 compose：
+cp .env.example .env           # Linux / macOS
+```
+
+```powershell
+cd jm-web
+Copy-Item .env.example .env    # Windows PowerShell
+```
+
+编辑 `.env`，公网/局域网暴露前至少设置高强度 `ACCESS_PASSWORD`，然后执行：
+
+```bash
+docker compose --env-file .env config  # 先检查展开后的配置
+docker compose up -d
+```
+
+Compose 默认只将 `127.0.0.1:3210` 发布到宿主机，适合同机 Nginx/Caddy 反向代理，不会绕过 HTTPS 直接暴露后端。需要从其他机器直连时，在 `.env` 中设置 `JMW_PUBLISH_HOST=0.0.0.0`；宿主机端口由 `JMW_PUBLISH_PORT` 控制，容器内端口由 `PORT` 控制，两者可不同。这两个端口都必须位于 `1`–`65535`，发布地址必须是宿主机可绑定的 IP。
+
+默认 Compose 配置同时启用只读根文件系统、移除 Linux capabilities、禁止提权，并仅让 `/app/data` 持久化可写；运行数据不会写入镜像。`JMW_HOST_DATA_DIR` 可以改为仓库外的绝对路径，目录及其备份应按敏感凭据管理。
+
+不使用 Compose 时可用 Docker 命名卷，该写法在 Linux、macOS 和 PowerShell 中一致：
+
+```bash
 docker build -t jm-web .
-docker run -d --name jm-web -p 3210:3210 -v ./data:/app/data -e ACCESS_PASSWORD=你的口令 jm-web
+docker volume create jm-web-data
+docker run -d --name jm-web --restart unless-stopped --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m --cap-drop=ALL --security-opt=no-new-privileges=true -p 127.0.0.1:3210:3210 --mount type=volume,source=jm-web-data,target=/app/data --env-file .env -e PORT=3210 -e HOST=0.0.0.0 -e JMW_DATA_DIR=/app/data jm-web
 ```
 
 ### 环境变量
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `PORT` | `3210` | 监听端口 |
-| `HOST` | `0.0.0.0` | 监听地址 |
+| `PORT` | `3210` | 监听端口（`1`–`65535`）；Compose 同时用它作为容器端口映射目标 |
+| `HOST` | `0.0.0.0` | 监听地址；Compose 内固定为 `0.0.0.0`，宿主机暴露地址改用 `JMW_PUBLISH_HOST` |
+| `JMW_PUBLISH_HOST` | `127.0.0.1` | 仅 Compose：宿主机发布地址；改为 `0.0.0.0` 才会接受外部直连 |
+| `JMW_PUBLISH_PORT` | `3210` | 仅 Compose：宿主机发布端口（`1`–`65535`） |
 | `ACCESS_PASSWORD` | 空 | 设置后打开网页需要输入口令（强烈建议公网部署时设置；口令错误有 5 分钟限流） |
 | `JM_API_BASE` | 空 | 覆盖 API 域名，逗号分隔多个候选；**设置后锁定**，网页设置页不可再切换 |
 | `JM_UA` | `okhttp/4.9.3` | 请求上游使用的 UA |
 | `JM_TIMEOUT` | `20000` | 上游单域名超时（毫秒） |
 | `JM_TOTAL_TIMEOUT` | `35000` | 上游全部域名轮询总时间预算（毫秒） |
-| `JMW_DATA_DIR` | `./data` | 会话与设置持久化目录 |
+| `JMW_DATA_DIR` | `./data` | 会话与设置持久化目录；Compose 内固定为 `/app/data` |
+| `JMW_HOST_DATA_DIR` | `./data` | 仅 Compose：挂载到 `/app/data` 的宿主机目录 |
 | `JMW_MAX_IMAGE_BYTES` | `26214400` | 图片代理单文件大小上限（字节，范围 1–100 MiB） |
 | `JMW_MAX_IMAGE_CONCURRENCY` | `24` | 图片代理最大并发数（范围 1–100） |
+| `JMW_MAX_API_RESPONSE_BYTES` | `16777216` | 上游 API 单响应大小上限（字节，范围 1–32 MiB） |
+| `JMW_MAX_AI_STREAM_BYTES` | `16777216` | 单次 AI 流式响应大小上限（字节，范围 1–64 MiB） |
+| `JMW_MAX_AI_CONCURRENCY` | `4` | AI 流式请求并发上限（范围 1–20） |
+| `JMW_MAX_SEARCH_CONCURRENCY` | `8` | 联网搜索请求并发上限（范围 1–40） |
+| `JMW_TRUST_PROXY` | 空（回环默认可信） | 额外可信反向代理的精确 IP/CIDR，逗号分隔；仅用于安全解析 `X-Forwarded-For` |
+| `AI_API_KEY` | 空 | 可选：OpenAI-compatible AI Key；留空时禁用 AI 发送，不会下发浏览器 |
+| `AI_BASE_URL` | `https://api.openai.com/v1` | AI 服务基址，必须为 HTTPS；后端追加 `/chat/completions` |
+| `AI_MODEL` | `gpt-5-mini` | AI 请求使用的模型名 |
+| `AI_TIMEOUT` | `120000` | 单次 AI 流式请求超时（正整数毫秒，最大 10 分钟） |
+| `TAVILY_API_KEY` | 空 | 可选：启用 Tavily 搜索提供商；Key 仅保存在服务器 |
+| `SEARXNG_BASE_URL` | 空 | 可选：自建 SearXNG 的 HTTPS 基址，不含 `/search`；必须通过后端公网地址安全检查 |
+| `SEARCH_TIMEOUT` | `35000` | 联网搜索总时间预算（正整数毫秒，最大 60000） |
+| `JMW_UPDATE_REPO` | 空 | 可选：用于更新检查的 GitHub `owner/repo` |
 
-容器及反向代理可使用 `GET /healthz` 做健康检查。该接口不需要访问口令、不会创建会话，也不会请求上游服务。
+容器及反向代理可使用 `GET`/`HEAD /healthz` 做健康检查。该接口不需要访问口令、不会创建会话，也不会请求上游服务；镜像已内置健康检查。启动后可用 `docker compose ps` 查看状态，或执行 `curl -fsS http://127.0.0.1:3210/healthz` 验证。
 
 ### 反向代理（可选）
 
@@ -80,24 +137,35 @@ server {
     location / {
         proxy_pass http://127.0.0.1:3210;
         proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_read_timeout 120s;
     }
 }
 ```
 
+`X-Forwarded-For` 只会在 TCP 对端是可信代理时生效，避免访客伪造 IP 绕过限流。同机直接运行且 Nginx 连接 `127.0.0.1`/`::1` 时无需配置；如果代理经 Docker 网桥或独立容器访问，应在 `.env` 的 `JMW_TRUST_PROXY` 中填入其**实际、可控的** IP 或固定网段 CIDR，然后重建容器。例如：
+
+```dotenv
+JMW_TRUST_PROXY=172.18.0.5,172.19.0.0/24
+```
+
+不要填写 `1`、`true` 或 `*`，也不要信任不受你控制的广泛网段。使用可信代理时，后端端口应继续绑定在回环/内部网络，不要同时绕过代理公开。
+
 ## 使用说明
 
-1. 浏览器打开 `http://服务器IP:3210`（或你配置的域名）。
+1. 浏览器打开你配置的 HTTPS 域名；直接运行或已将 Compose 的 `JMW_PUBLISH_HOST` 改为 `0.0.0.0` 时，也可访问 `http://服务器IP:3210`。
 2. 搜索、阅读无需登录；如需**收藏 / 评论 / 签到**，在「我的」页面用 JM 官网账号登录
    （登录凭据仅保存在你自己的服务器 `data/sessions/` 中）。
-3. 设置页可切换：主题（浅色/深色/跟随系统）、阅读模式、翻页适配、预加载数量、图片分流线路。
+3. 设置页可切换：主题（浅色/深色/跟随系统）、阅读模式、翻页适配、预加载数量、图片分流线路；更多能力位于「完整功能中心」。
    「API 域名」只能在服务器内置候选中切换，且仅对**当前浏览器**生效；若服务器设置了 `JM_API_BASE`，该项由管理员锁定。
 
 ## 技术实现
 
 | 层 | 说明 |
 | --- | --- |
-| 后端 | 零依赖 Node.js（≥18），`server.js` + `lib/` |
+| 后端 | 零依赖 Node.js（≥20），`server.js` + `lib/` |
 | API 协议 | 与 jm-mobile 一致：`token` / `tokenparam` 请求头签名，响应 `data` 字段 AES-256-ECB 解密 |
 | 会话 | 每个浏览器一个 Cookie Jar（AVS 等），持久化到 `data/sessions/`，重启不丢登录态；空会话 7 天、登录会话 90 天自动清理 |
 | 图片 | 服务端按 HTTPS 域名白名单逐跳代理安全栅格图片，并限制大小/并发；解扰由浏览器 Canvas 完成 |
@@ -119,8 +187,9 @@ jm-web/
 │   ├── css/app.css
 │   └── js/              app.js 路由外壳 / views.js 页面 / reader.js 阅读器
 │                        user.js 用户页 / descramble.js 图片解扰 / md5.js
-├── data/                运行时生成（会话、设置，已被 .gitignore 排除）
+├── data/                运行时生成（会话、设置，已被 Git/Docker 构建上下文排除）
 ├── test/                单元/后端回归测试与静态检查（npm test / npm run check）
+├── .env.example         Docker Compose 环境变量安全示例
 ├── Dockerfile / docker-compose.yml
 ├── LICENSE
 └── README.md
@@ -131,6 +200,8 @@ jm-web/
 ```bash
 npm test   # 解析/MD5 单元测试 + 后端路由、会话、故障切换与图片代理回归测试
 npm run check
+docker compose config --quiet
+docker compose --env-file .env.example config --quiet
 ```
 
 ## License

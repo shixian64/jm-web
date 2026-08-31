@@ -1,7 +1,9 @@
 // photo.js / md5 客户端算法 单元测试（node test/photo.test.js）
 const assert = require('assert');
-const { parsePhotoHtml, extractObject, lenientParse } = require('../lib/photo');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const { parsePhotoHtml, extractObject, lenientParse } = require('../lib/photo');
 
 // 1) 常规格式
 const html1 = "<html><script>const result = { images: ['00001.webp', '00002.webp', '00003.gif'] };\nconst config = { jmid: '340972', imghost: 'https://cdn-msp.example.com', cache: '?v=1' };\nvar aid = 340972; var scramble_id = 220980; var speed = '';</script></html>";
@@ -42,7 +44,7 @@ assert.strictEqual(r5.speed, '1');
 console.log('case5 OK');
 
 // 6) 前端 md5 与 Node crypto 一致（含多字节字符）
-const md5Src = require('fs').readFileSync('../jm-web/public/js/md5.js', 'utf8');
+const md5Src = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'md5.js'), 'utf8');
 const md5Module = new Function(md5Src.replace('export function md5', 'function md5') + '; return md5;')();
 for (const s of ['34097200001', 'hello', '', '中文测试123', 'a'.repeat(1000)]) {
   assert.strictEqual(md5Module(s), crypto.createHash('md5').update(s, 'utf8').digest('hex'), 'md5 mismatch for ' + JSON.stringify(s));

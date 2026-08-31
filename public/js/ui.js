@@ -54,17 +54,34 @@ export function comicCard(item) {
   const id = rawId == null ? '' : String(rawId);
   const canOpen = /^\d+$/.test(id);
   const open = () => { location.hash = `#/album/${id}`; };
+  const category = String(
+    item.category_sub?.title || item.category?.title || item.category || '',
+  ).trim();
+  const image = h('img', {
+    loading: 'lazy', decoding: 'async', src: imgSrcOf(item), alt: item.name || '封面',
+    onerror: (e) => {
+      e.currentTarget.classList.add('is-broken');
+      e.currentTarget.parentElement?.classList.add('is-broken');
+      e.currentTarget.removeAttribute('src');
+    },
+  });
+  const cover = h('div', { class: 'cover' }, image);
+  if (category) cover.append(h('span', { class: 'card-badge' }, category));
+  if (canOpen) cover.append(h('span', { class: 'cover-action', 'aria-hidden': 'true' }, icon('arrow-up-right', 15)));
   const card = h('div', {
     class: 'comic-card',
+    ...(category ? { 'data-kind': category } : {}),
     ...(canOpen ? { onclick: open, 'aria-label': `查看${item.name || '漫画'}详情` } : { 'aria-disabled': 'true' }),
   });
   if (canOpen) asActivatable(card, open);
   card.append(
-    h('div', { class: 'cover' },
-      h('img', { loading: 'lazy', src: imgSrcOf(item), alt: item.name || '封面' }),
+    cover,
+    h('div', { class: 'card-copy' },
+      h('div', { class: 'name' }, item.name || '未知'),
+      h('div', { class: 'card-meta' },
+        item.author ? String(item.author).split(/[、,，\/]/)[0] || '' : (category || 'JM Web'),
+      ),
     ),
-    h('div', { class: 'name' }, item.name || '未知'),
-    item.author ? h('div', { class: 'author' }, String(item.author).split(/[、,，\/]/)[0] || '') : null,
   );
   return card;
 }
@@ -103,6 +120,7 @@ export function infiniteList(loader) {
         grid.replaceChildren(h('div', { class: 'empty', style: { gridColumn: '1/-1' } },
           h('div', { class: 'big' }, icon('inbox', 40)), '这里什么都没有'));
       }
+      if (items.length) grid.querySelector(':scope > .empty')?.remove();
       grid.append(...items);
       if (!hasMore) {
         finished = true;
@@ -150,8 +168,17 @@ export function infiniteList(loader) {
     controller = null;
   }
 
+  async function loadAll(maxPages = 200) {
+    let attempts = 0;
+    while (!destroyed && !finished && !failed && attempts < maxPages) {
+      if (loading) await new Promise((resolve) => setTimeout(resolve, 40));
+      else { attempts++; await loadMore(); }
+    }
+    return { page, finished, failed };
+  }
+
   retryObserve();
-  return { root, destroy };
+  return { root, destroy, loadAll };
 }
 
 /** 简单分页（分类/每周必看） */

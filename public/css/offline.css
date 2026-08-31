@@ -1,0 +1,472 @@
+/* 独立离线阅读器。由 offline.js 首次挂载时按需加载。 */
+
+body.offline-reading {
+  overflow: hidden;
+}
+
+.offline-reader {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  grid-template-rows: 52px minmax(0, 1fr);
+  background: #0c0e13;
+  color: #f3f4f7;
+}
+
+.offline-reader-bar {
+  z-index: 2;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto 56px;
+  align-items: center;
+  gap: 8px;
+  padding: max(4px, env(safe-area-inset-top)) 8px 4px;
+  background: rgba(17, 19, 25, .94);
+  border-bottom: 1px solid rgba(255, 255, 255, .09);
+  backdrop-filter: blur(16px);
+}
+
+.offline-reader-title {
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.offline-reader-counter {
+  color: #aeb3bf;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+
+.offline-reader-btn {
+  min-width: 40px;
+  min-height: 40px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.offline-reader-btn:hover,
+.offline-reader-btn:focus-visible {
+  background: rgba(255, 255, 255, .1);
+  outline: 2px solid transparent;
+}
+
+.offline-reader-pages {
+  position: relative;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.offline-reader-slot {
+  position: relative;
+  width: min(100%, 1100px);
+  min-height: min(70vh, 900px);
+  margin: 0 auto;
+  background: #101218;
+}
+
+.offline-reader-slot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin: 0 auto;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.offline-reader-pages.paged {
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+
+.offline-reader-pages.paged .offline-reader-slot {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  place-items: center;
+  background: #08090d;
+}
+
+.offline-reader-pages.paged .offline-reader-slot img {
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.offline-reader-loading,
+.offline-reader-error,
+.offline-reader-fatal {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  border: 0;
+  background: transparent;
+  color: #8e94a3;
+  text-align: center;
+}
+
+.offline-reader-error {
+  width: 100%;
+  color: #ff9cab;
+  cursor: pointer;
+}
+
+.offline-reader-fatal {
+  position: relative;
+  min-height: 70vh;
+  color: #ff9cab;
+}
+
+.offline-page-nav {
+  position: fixed;
+  z-index: 3;
+  top: 50%;
+  width: 46px;
+  height: 70px;
+  transform: translateY(-50%);
+  border: 1px solid rgba(255, 255, 255, .14);
+  border-radius: 12px;
+  background: rgba(17, 19, 25, .72);
+  color: #fff;
+  font-size: 34px;
+  cursor: pointer;
+  backdrop-filter: blur(10px);
+}
+
+.offline-page-nav:disabled {
+  opacity: .25;
+  cursor: default;
+}
+
+.offline-prev {
+  left: 10px;
+}
+
+.offline-next {
+  right: 10px;
+}
+
+@media (max-width: 700px) {
+  .offline-reader {
+    grid-template-rows: calc(48px + env(safe-area-inset-top)) minmax(0, 1fr);
+  }
+
+  .offline-reader-bar {
+    padding-top: env(safe-area-inset-top);
+  }
+
+  .offline-reader-slot {
+    min-height: 55vh;
+  }
+
+  .offline-page-nav {
+    top: auto;
+    bottom: calc(14px + env(safe-area-inset-bottom));
+    width: 56px;
+    height: 48px;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .offline-reader-pages {
+    scroll-behavior: auto;
+  }
+}
+
+/* 下载中心 */
+
+.download-center {
+  width: min(100% - 24px, 980px);
+  margin: 0 auto;
+  padding: 20px 0 90px;
+  color: var(--text, #252831);
+}
+
+.download-center-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 24px;
+}
+
+.download-center-head > div:first-child {
+  min-width: 0;
+  margin-right: auto;
+}
+
+.download-center h1,
+.download-center h2,
+.download-center p {
+  margin: 0;
+}
+
+.download-center h1 {
+  font-size: clamp(24px, 5vw, 34px);
+}
+
+.download-center h2 {
+  margin: 22px 0 10px;
+  font-size: 17px;
+}
+
+.download-center p,
+.download-storage,
+.download-meta,
+.download-message,
+.offline-chapter-row small {
+  color: var(--muted, #747986);
+  font-size: 12px;
+}
+
+.download-storage {
+  white-space: nowrap;
+}
+
+.download-task,
+.offline-album {
+  margin-bottom: 10px;
+  padding: 14px;
+  border: 1px solid var(--border, #e4e6eb);
+  border-radius: 14px;
+  background: var(--card, #fff);
+  box-shadow: 0 5px 20px rgba(17, 24, 39, .04);
+}
+
+.download-task-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.download-task progress {
+  width: 100%;
+  height: 7px;
+  margin: 12px 0 6px;
+  accent-color: #e5588a;
+}
+
+.download-status {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(100, 105, 119, .12);
+  font-size: 11px;
+}
+
+.download-status.downloading,
+.download-status.fetching {
+  background: rgba(229, 88, 138, .14);
+  color: #c63d70;
+}
+
+.download-status.completed {
+  background: rgba(21, 139, 86, .13);
+  color: #147b50;
+}
+
+.download-status.failed {
+  background: rgba(204, 48, 74, .12);
+  color: #bc2943;
+}
+
+.download-message {
+  min-height: 18px;
+  margin-top: 3px;
+}
+
+.download-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.download-actions.compact {
+  justify-content: flex-end;
+  margin-top: 0;
+}
+
+.download-action {
+  min-height: 32px;
+  padding: 5px 11px;
+  border: 1px solid var(--border, #dfe2e8);
+  border-radius: 9px;
+  background: var(--card, #fff);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.download-action:hover,
+.download-action:focus-visible {
+  border-color: #e5588a;
+}
+
+.download-action:disabled {
+  opacity: .55;
+  cursor: wait;
+}
+
+.download-action.primary {
+  border-color: #e5588a;
+  background: #e5588a;
+  color: #fff;
+}
+
+.download-action.danger {
+  color: #bd2945;
+}
+
+.download-empty {
+  padding: 28px;
+  border: 1px dashed var(--border, #dfe2e8);
+  border-radius: 14px;
+  color: var(--muted, #747986);
+  text-align: center;
+}
+
+.offline-album {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr);
+  gap: 14px;
+}
+
+.offline-album-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.fixed-download-grid .offline-album-grid {
+  grid-template-columns: repeat(var(--download-grid-columns), minmax(0, 1fr));
+}
+
+.fixed-download-grid .offline-album {
+  display: block;
+  min-width: 0;
+}
+
+.fixed-download-grid .offline-cover {
+  width: 100%;
+  max-height: 260px;
+  margin-bottom: 10px;
+}
+
+.fixed-download-grid .offline-chapter-row {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.fixed-download-grid .offline-chapter-row .download-actions {
+  justify-content: flex-start;
+}
+
+.offline-cover {
+  width: 84px;
+  aspect-ratio: 3 / 4;
+  border-radius: 9px;
+  background: #eceef2;
+  object-fit: cover;
+}
+
+.offline-cover.placeholder {
+  display: grid;
+  place-items: center;
+  color: #a8acb5;
+  font-weight: 700;
+}
+
+.offline-album-body {
+  min-width: 0;
+}
+
+.offline-chapter-list {
+  max-height: 310px;
+  margin-top: 9px;
+  overflow: auto;
+  border-block: 1px solid var(--border, #e7e8ec);
+}
+
+.offline-chapter-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 2px;
+  border-bottom: 1px solid var(--border, #eff0f3);
+}
+
+.offline-chapter-row:last-child {
+  border-bottom: 0;
+}
+
+.download-integrity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border, #e7e8ec);
+  border-radius: 12px;
+  background: var(--surface, #fff);
+  font-size: 13px;
+}
+
+.download-integrity.healthy,
+.download-integrity.checking {
+  color: var(--text-2, #626773);
+}
+
+.download-integrity.broken {
+  color: var(--danger, #c93f55);
+  border-color: color-mix(in srgb, var(--danger, #c93f55) 35%, transparent);
+}
+
+.download-integrity .download-action {
+  margin-left: auto;
+}
+
+@media (max-width: 650px) {
+  .download-center-head {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .download-storage {
+    width: 100%;
+  }
+
+  .offline-album {
+    grid-template-columns: 62px minmax(0, 1fr);
+    padding: 10px;
+  }
+
+  .offline-cover {
+    width: 62px;
+  }
+
+  .offline-chapter-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .offline-chapter-row .download-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+  }
+}

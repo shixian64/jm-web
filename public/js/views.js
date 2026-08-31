@@ -1,8 +1,14 @@
 // 浏览类页面：首页 / 搜索 / 分类 / 每周必看 / 漫画详情
 import { api, imgSrc } from './api.js';
 import { h, toast, comicCard, infiniteList, errorBox, loadingBox } from './ui.js';
-import { getLocalHistory, getSearchHistory, addSearchHistory, clearSearchHistory } from './store.js';
+import { setting, getLocalHistory, getSearchHistory, addSearchHistory, clearSearchHistory } from './store.js';
 import { icon } from './icons.js';
+import {
+  buildSearchQuery, deserializeExcludedTags, filterComics, isComicBlocked,
+  normalizeTags, parseSearchSyntax, searchContentWithoutExcludedTags, serializeExcludedTags,
+} from './content-filter.js';
+import { chooseFolder, copyText, folderEntries } from './content-actions.js';
+import { getPreferenceRecommendations } from './recommend.js';
 
 function isAbort(e) { return !!(e && e.name === 'AbortError'); }
 function isInactive(ctx) {
@@ -12,6 +18,28 @@ function isInactive(ctx) {
 /* ============================== 首页 ============================== */
 
 const promoteFallback = new Map();
+
+function displayBlockTitle(value, fallback = '推荐内容') {
+  const title = String(value || '')
+    .replace(/右滑看更多|滑看更多|看更多/g, '')
+    .replace(/[→]+/g, '')
+    .trim();
+  return title || fallback;
+}
+
+function sectionHeading(title, more, eyebrow = '') {
+  const copy = h('div', { class: 'section-title-copy' },
+    eyebrow ? h('span', { class: 'eyebrow' }, eyebrow) : null,
+    h('h2', null, title),
+  );
+  const action = typeof more === 'function'
+    ? h('button', {
+      class: 'more', type: 'button',
+      onclick: more,
+    }, '查看全部', icon('arrow-right', 15))
+    : null;
+  return h('div', { class: 'section-title' }, copy, action);
+}
 
 export function homeView(root, ctx) {
   const cleanups = [];
@@ -26,23 +54,39 @@ export function homeView(root, ctx) {
     loadSeq++;
     clearEffects();
   };
-  const page = h('div', { class: 'page' });
+  const page = h('div', { class: 'page home-page' });
 
   const buildContinueStrip = () => {
-    const strip = h('div', { class: 'hscroll' });
+    const strip = h('div', { class: 'hscroll continue-strip' });
     for (const it of getLocalHistory().slice(0, 6)) {
       const photoId = it.photoId || it.aid;
       if (!/^\d+$/.test(String(photoId || '')) || !/^\d+$/.test(String(it.aid || ''))) continue;
+      const pageNo = Math.max(0, Number(it.page) || 0);
+      const total = Math.max(0, Number(it.total) || 0);
+      const progress = total ? Math.min(100, Math.round(((pageNo + 1) / total) * 100)) : 0;
+      const continueHref = it.offline
+        ? `#/offline/${it.aid}/${photoId}`
+        : `#/read/${photoId}?aid=${it.aid}`;
       strip.append(h('div', {
-        class: 'comic-card',
+        class: 'comic-card continue-card',
         role: 'button',
         tabindex: '0',
         'aria-label': `继续阅读${it.name || '漫画'}`,
-        onclick: () => { location.hash = `#/read/${photoId}?aid=${it.aid}`; },
-        onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); location.hash = `#/read/${photoId}?aid=${it.aid}`; } },
+        onclick: () => { location.hash = continueHref; },
+        onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); location.hash = continueHref; } },
       },
-        h('div', { class: 'cover' }, h('img', { loading: 'lazy', src: it.cover || `/api/img?path=${encodeURIComponent(`/media/albums/${it.aid}_3x4.jpg`)}` })),
-        h('div', { class: 'name' }, it.name || `漫画 ${it.aid}`),
+        h('div', { class: 'cover' },
+          h('img', {
+            loading: 'lazy', decoding: 'async', alt: it.name || '漫画封面',
+            src: it.cover || `/api/img?path=${encodeURIComponent(`/media/albums/${it.aid}_3x4.jpg`)}`,
+          }),
+          h('span', { class: 'cover-action', 'aria-hidden': 'true' }, icon('play', 14)),
+        ),
+        h('div', { class: 'card-copy' },
+          h('div', { class: 'name' }, it.name || `漫画 ${it.aid}`),
+          h('div', { class: 'card-meta' }, total ? `第 ${pageNo + 1} / ${total} 页` : '继续阅读'),
+          total ? h('div', { class: 'continue-progress' }, h('i', { style: `width:${progress}%` })) : null,
+        ),
       ));
     }
     return strip;
@@ -51,7 +95,7 @@ export function homeView(root, ctx) {
   const showLoading = () => {
     page.replaceChildren();
     if (getLocalHistory().length) {
-      page.append(h('div', { class: 'section-title' }, '继续阅读'), buildContinueStrip());
+      page.append(sectionHeading('继续阅读', null, '最近打开'), buildContinueStrip());
     }
     page.append(loadingBox());
   };
@@ -63,37 +107,90 @@ export function homeView(root, ctx) {
     try {
       const res = await api.home(ctx && ctx.signal);
       if (destroyed || isInactive(ctx) || seq !== loadSeq) return;
-      const blocks = (res.data || []).filter((b) => b.content && b.content.length);
+      const homeBlockedTags = normalizeTags([
+        ...(setting.blockedTagList || []),
+        ...(setting.homeExcludedTags || []),
+      ]);
+      const blocks = (res.data || [])
+        .map((b) => ({ ...b, content: filterComics(b.content || [], homeBlockedTags) }))
+        .filter((b) => b.content.length);
       page.replaceChildren();
 
       if (getLocalHistory().length) {
-        page.append(h('div', { class: 'section-title' }, '继续阅读'), buildContinueStrip());
+        page.append(sectionHeading('继续阅读', null, '最近打开'), buildContinueStrip());
       }
 
-      // 快捷入口
-      page.append(h('div', { class: 'entries' },
-        entry('search', '搜索', '#/search'),
-        entry('layout-grid', '分类', '#/category'),
-        entry('calendar-days', '每周必看', '#/week'),
-        entry('star', '收藏', '#/favorites'),
-        entry('history', '阅读历史', '#/watch-history'),
-        entry('smartphone', '本地记录', '#/local-history'),
-      ));
+      const firstBlock = blocks[0];
+      const firstIsSwiper = !!(firstBlock && firstBlock.content.length > 2 && firstBlock.type !== 'record');
+      // 首屏先给内容，再给工具入口；减少传统后台式的按钮墙。
+      if (firstIsSwiper) {
+        page.append(
+          sectionHeading(displayBlockTitle(firstBlock.title, '连载更新'), () => gotoBlockFilter(firstBlock), '精选更新'),
+          buildSwiper(firstBlock.content, cleanups, firstBlock.title),
+        );
+      }
+
+      page.append(
+        sectionHeading('探索', null, '快捷入口'),
+        h('div', { class: 'quick-actions', 'aria-label': '快捷入口' },
+          entry('search', '搜索', '#/search'),
+          entry('layout-grid', '分类', '#/category'),
+          entry('calendar-days', '每周必看', '#/week'),
+          entry('star', '收藏', '#/favorites'),
+          entry('history', '阅读历史', '#/watch-history'),
+          entry('smartphone', '本地记录', '#/local-history'),
+        ),
+      );
+
+      if (setting.preferenceRecommendEnabled) {
+        const preferenceHost = h('section', { class: 'preference-recommend', 'aria-live': 'polite' },
+          h('div', { class: 'loading-more' }, h('div', { class: 'spinner-sm' }), '正在根据收藏生成推荐…'));
+        page.append(preferenceHost);
+        const existingIds = new Set(blocks.flatMap((block) => block.content || [])
+          .map((item) => String(item?.id ?? item?.aid ?? item?.AID ?? '')).filter(Boolean));
+        void getPreferenceRecommendations({
+          source: setting.recommendSource === 'network' ? 'network' : 'builtin',
+          maxResults: 20,
+          signal: ctx?.signal,
+        }).then((recommendation) => {
+          if (destroyed || isInactive(ctx) || seq !== loadSeq) return;
+          const recommended = filterComics(recommendation.items || [], homeBlockedTags)
+            .filter((item) => {
+              const id = String(item?.id ?? item?.aid ?? item?.AID ?? '');
+              if (!id || existingIds.has(id)) return false;
+              existingIds.add(id); return true;
+            });
+          if (!recommended.length) {
+            preferenceHost.replaceChildren(h('div', { class: 'hint', style: 'padding:8px 2px' },
+              '暂时没有可用的偏好推荐；收藏更多带标签的漫画后会自动更新。'));
+            return;
+          }
+          const strip = h('div', { class: 'hscroll' });
+          recommended.forEach((item) => strip.append(comicCard(item)));
+          preferenceHost.replaceChildren(...[
+            sectionHeading('猜你喜欢', () => {
+              const tag = recommendation.tags?.[0];
+              location.hash = tag ? `#/search?q=${encodeURIComponent('+' + tag)}&o=mr` : '#/favorites';
+            }, recommendation.source === 'network' ? '账号网络推荐' : '基于收藏标签'),
+            recommendation.tags?.length
+              ? h('div', { class: 'hint', style: 'margin:-5px 2px 8px' }, `偏好：${recommendation.tags.slice(0, 5).join(' · ')}`)
+              : null,
+            strip,
+          ].filter(Boolean));
+        }).catch((error) => {
+          if (destroyed || isInactive(ctx) || isAbort(error) || seq !== loadSeq) return;
+          preferenceHost.replaceChildren(h('div', { class: 'hint', style: 'padding:8px 2px' },
+            error?.status === 401 ? '登录后可根据收藏生成偏好推荐。' : `偏好推荐暂不可用：${error.message}`));
+        });
+      }
 
       blocks.forEach((block, bi) => {
         const isSwiper = bi === 0 && block.content.length > 2 && block.type !== 'record';
-        if (isSwiper) {
-          page.append(h('div', { class: 'section-title' }, block.title || '推荐'));
-          page.append(buildSwiper(block.content, cleanups));
-        } else {
-          page.append(h('div', { class: 'section-title' },
-            block.title || '推荐',
-            h('a', { class: 'more', role: 'button', tabindex: '0', onclick: () => gotoBlockFilter(block), onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); gotoBlockFilter(block); } } }, '更多 ›'),
-          ));
-          const strip = h('div', { class: 'hscroll' });
-          block.content.forEach((it) => strip.append(comicCard(it)));
-          page.append(strip);
-        }
+        if (isSwiper) return;
+        page.append(sectionHeading(displayBlockTitle(block.title), () => gotoBlockFilter(block), bi === 0 ? '最新内容' : '为你推荐'));
+        const strip = h('div', { class: 'hscroll' });
+        block.content.forEach((it) => strip.append(comicCard(it)));
+        page.append(strip);
       });
     } catch (e) {
       if (destroyed || isInactive(ctx) || isAbort(e) || seq !== loadSeq) return;
@@ -110,7 +207,7 @@ export function homeView(root, ctx) {
 }
 
 function entry(ic, label, href) {
-  return h('a', { href }, h('span', { class: 'ic' }, icon(ic, 22)), label);
+  return h('a', { href }, h('span', { class: 'ic' }, icon(ic, 20)), h('span', { class: 'entry-label' }, label));
 }
 
 function gotoBlockFilter(block) {
@@ -138,34 +235,75 @@ function gotoBlockFilter(block) {
   location.hash = `#/search?q=${encodeURIComponent(block.slug || block.title || '')}&o=mr`;
 }
 
-function buildSwiper(items, cleanups = []) {
-  const swiper = h('div', { class: 'swiper' });
+function buildSwiper(items, cleanups = [], contextTitle = '') {
+  const swiper = h('div', { class: 'swiper', 'aria-label': '精选内容轮播' });
   const slides = items.slice(0, 6).map((it, i) => {
     const id = String((it && (it.id ?? it.aid)) || '');
     const canOpen = /^\d+$/.test(id);
     const open = () => { if (canOpen) location.hash = `#/album/${id}`; };
+    const category = String(it?.category_sub?.title || it?.category?.title || '').trim();
+    const author = String(it?.author || '').trim();
+    const title = String(it?.name || '精选漫画');
     const s = h('div', {
       class: 'slide' + (i === 0 ? ' on' : ''),
       style: { backgroundImage: `url("${imgSrc(it)}")` },
+      'aria-roledescription': 'slide',
+      'aria-hidden': i === 0 ? 'false' : 'true',
+      'aria-label': `${i + 1} / ${Math.min(items.length, 6)}：${title}`,
       ...(canOpen ? {
-        role: 'button', tabindex: '0', 'aria-label': `查看${it.name || '漫画'}详情`,
+        role: 'button', tabindex: i === 0 ? '0' : '-1', 'aria-label': `查看${it.name || '漫画'}详情`,
         onclick: open,
         onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } },
       } : { 'aria-disabled': 'true' }),
-    }, h('div', { class: 'label' }, (it && it.name) || ''));
+    },
+      h('div', { class: 'slide-content' },
+        h('span', { class: 'slide-kicker' }, category || contextTitle || '精选'),
+        h('h2', null, title),
+        author ? h('p', null, '作者 · ', author) : null,
+        h('span', { class: 'slide-cta' }, '查看详情', icon('arrow-right', 14)),
+      ),
+    );
     return s;
   });
   const dots = h('div', { class: 'dots' }, slides.map((_, i) => h('i', { class: i === 0 ? 'on' : '' })));
-  swiper.append(...slides, dots);
+  const prev = h('button', { class: 'swiper-arrow prev', type: 'button', 'aria-label': '上一张精选内容' }, icon('arrow-left', 17));
+  const next = h('button', { class: 'swiper-arrow next', type: 'button', 'aria-label': '下一张精选内容' }, icon('arrow-right', 17));
+  const controls = h('div', { class: 'swiper-controls' }, prev, dots, next);
+  swiper.append(...slides, controls);
   let cur = 0;
-  const timer = setInterval(() => {
-    slides[cur].classList.remove('on');
-    dots.children[cur].classList.remove('on');
-    cur = (cur + 1) % slides.length;
-    slides[cur].classList.add('on');
-    dots.children[cur].classList.add('on');
-  }, 4000);
-  cleanups.push(() => clearInterval(timer));
+  const show = (nextIndex) => {
+    const next = (nextIndex + slides.length) % slides.length;
+    slides.forEach((slide, i) => {
+      const active = i === next;
+      slide.classList.toggle('on', active);
+      slide.setAttribute('aria-hidden', String(!active));
+      if (slide.getAttribute('role') === 'button') slide.tabIndex = active ? 0 : -1;
+      dots.children[i].classList.toggle('on', active);
+    });
+    cur = next;
+  };
+  prev.addEventListener('click', (e) => { e.stopPropagation(); show(cur - 1); });
+  next.addEventListener('click', (e) => { e.stopPropagation(); show(cur + 1); });
+  dots.querySelectorAll('i').forEach((dot, i) => dot.addEventListener('click', (e) => { e.stopPropagation(); show(i); }));
+  let timer = setInterval(() => show(cur + 1), 5000);
+  const pause = () => { clearInterval(timer); timer = null; };
+  const resume = () => {
+    if (!timer && !swiper.matches(':hover') && !swiper.contains(document.activeElement)) {
+      timer = setInterval(() => show(cur + 1), 5000);
+    }
+  };
+  swiper.addEventListener('mouseenter', pause);
+  swiper.addEventListener('mouseleave', resume);
+  swiper.addEventListener('focusin', pause);
+  const resumeAfterFocus = (e) => { if (!swiper.contains(e.relatedTarget)) resume(); };
+  swiper.addEventListener('focusout', resumeAfterFocus);
+  cleanups.push(() => {
+    clearInterval(timer);
+    swiper.removeEventListener('mouseenter', pause);
+    swiper.removeEventListener('mouseleave', resume);
+    swiper.removeEventListener('focusin', pause);
+    swiper.removeEventListener('focusout', resumeAfterFocus);
+  });
   return swiper;
 }
 
@@ -175,14 +313,37 @@ const ORDERS = [
   ['mr', '最新'], ['mv', '最多收藏'], ['mp', '最多图片'], ['tf', '最多爱心'],
 ];
 
+const CATEGORY_ORDERS = [
+  ['', '最新'], ['tf', '最多爱心'], ['mv', '总排行'],
+  ['mv_m', '月排行'], ['mv_w', '周排行'], ['mv_t', '日排行'],
+];
+
 export function searchView(root, params) {
-  const q = params.get('q') || '';
+  const rawQuery = params.get('q') || '';
+  const parsedQuery = parseSearchSyntax(rawQuery);
+  const q = searchContentWithoutExcludedTags(rawQuery);
   const o = params.get('o') || 'mr';
-  const page = h('div', { class: 'page' });
+  let excludedTags = normalizeTags([
+    ...parsedQuery.excludes,
+    ...deserializeExcludedTags(params.get('exclude')),
+  ]);
+  const page = h('div', { class: 'page search-page' });
+
+  const navigateSearch = (value, nextExcluded = excludedTags, order = o) => {
+    const parsed = parseSearchSyntax(value);
+    const visible = searchContentWithoutExcludedTags(value);
+    const excluded = normalizeTags([...nextExcluded, ...parsed.excludes]);
+    if (!visible) return;
+    location.hash = searchHref(visible, order, excluded);
+  };
 
   if (!q) {
     const renderLanding = () => {
-      page.replaceChildren(buildSearchBar('', (v) => { if (v) location.hash = `#/search?q=${encodeURIComponent(v)}&o=mr`; }));
+      page.replaceChildren(buildSearchBar('', (v) => navigateSearch(v, excludedTags, 'mr')));
+      page.append(buildSearchExclusionEditor(excludedTags, (tags) => {
+        excludedTags = tags;
+        renderLanding();
+      }));
       const hist = getSearchHistory();
       if (!hist.length) return;
       const clear = () => { clearSearchHistory(); renderLanding(); };
@@ -190,7 +351,7 @@ export function searchView(root, params) {
         '搜索历史',
         h('button', { class: 'more', type: 'button', style: 'border:0;background:none;padding:0;cursor:pointer', onclick: clear }, '清空')));
       const tags = h('div', { class: 'history-tags' });
-      hist.forEach((t) => tags.append(h('a', { class: 'chip', href: `#/search?q=${encodeURIComponent(t)}&o=mr` }, t)));
+      hist.forEach((t) => tags.append(h('a', { class: 'chip', href: searchHref(t, 'mr', excludedTags) }, t)));
       page.append(tags);
     };
     root.append(page);
@@ -199,25 +360,43 @@ export function searchView(root, params) {
   }
 
   addSearchHistory(q);
-  page.append(buildSearchBar(q, (v) => { location.hash = `#/search?q=${encodeURIComponent(v)}&o=${o}`; }));
+  page.append(buildSearchBar(q, (v) => navigateSearch(v)));
+  page.append(buildSearchExclusionEditor(excludedTags, (tags) => {
+    location.hash = searchHref(q, o, tags);
+  }));
   const chips = h('div', { class: 'chips' },
     ORDERS.map(([val, label]) =>
-      h('a', { class: 'chip' + (val === o ? ' active' : ''), href: `#/search?q=${encodeURIComponent(q)}&o=${val}` }, label)));
+      h('a', { class: 'chip' + (val === o ? ' active' : ''), href: searchHref(q, val, excludedTags) }, label)));
   page.append(chips);
-  page.append(h('div', { class: 'result-count' }, `“${q}” 的搜索结果`));
+  page.append(h('div', { class: 'result-count' },
+    `“${q}” 的搜索结果`,
+    excludedTags.length ? ` · 已排除 ${excludedTags.length} 个标签` : ''));
   root.append(page);
 
+  const allExcludedTags = normalizeTags([...(setting.blockedTagList || []), ...excludedTags]);
+
   const list = infiniteList(async (p, signal) => {
-    const res = await api.search(q, o, p, signal);
+    const res = await api.search(buildSearchQuery(q, allExcludedTags), o, p, signal);
     const data = res.data || {};
     if (data.redirect_aid && p === 1) {
-      // 搜索数字 ID 时上游直接指向漫画
-      location.hash = `#/album/${data.redirect_aid}`;
+      // 数字 ID 也要尊重排除标签；详情请求失败时保持原有直达行为。
+      let blocked = false;
+      if (allExcludedTags.length) {
+        try {
+          const detail = await api.album(data.redirect_aid, signal);
+          blocked = isComicBlocked(detail.data || {}, allExcludedTags);
+        } catch (e) {
+          if (isAbort(e)) throw e;
+        }
+      }
+      if (blocked) toast('该漫画命中排除标签，已隐藏');
+      else location.hash = `#/album/${data.redirect_aid}`;
       return { items: [], hasMore: false };
     }
+    const source = data.content || [];
     return {
-      items: (data.content || []).map(comicCard),
-      hasMore: (data.content || []).length >= 20,
+      items: filterComics(source, allExcludedTags).map(comicCard),
+      hasMore: source.length >= 20,
     };
   });
   page.append(list.root);
@@ -225,17 +404,71 @@ export function searchView(root, params) {
 }
 
 function buildSearchBar(value, onSubmit) {
-  const input = h('input', { class: 'input', placeholder: '搜索漫画 / 作者 / 标签 / ID', value });
+  const input = h('input', { class: 'input', placeholder: '搜索漫画 / 作者 / 标签 / ID，可用 -标签 排除', value });
   const form = h('form', { class: 'search-form', onsubmit: (e) => { e.preventDefault(); onSubmit(input.value.trim()); } },
     input,
     h('button', { class: 'btn primary', type: 'submit' }, '搜索'));
   return h('div', { class: 'search-bar' }, form);
 }
 
+function searchHref(q, order, excludedTags) {
+  const encodedExcluded = serializeExcludedTags(excludedTags);
+  return `#/search?q=${encodeURIComponent(q)}&o=${encodeURIComponent(order || 'mr')}`
+    + (encodedExcluded ? `&exclude=${encodeURIComponent(encodedExcluded)}` : '');
+}
+
+function buildSearchExclusionEditor(excludedTags, onChange) {
+  const tags = normalizeTags(excludedTags);
+  const wrap = h('div', { class: 'card', style: 'padding:12px 14px;margin:8px 0 12px' });
+  const head = h('div', { style: 'display:flex;align-items:center;gap:8px;flex-wrap:wrap' },
+    h('strong', { style: 'font-size:13px;flex:1' }, '排除标签'),
+    h('button', {
+      class: 'btn', type: 'button', style: 'min-height:32px;padding:5px 10px',
+      onclick: () => {
+        const value = window.prompt('输入要排除的标签');
+        if (value != null && value.trim()) onChange(normalizeTags([...tags, value]));
+      },
+    }, '＋ 添加'),
+    tags.length ? h('button', {
+      class: 'btn', type: 'button', style: 'min-height:32px;padding:5px 10px',
+      onclick: () => onChange([]),
+    }, '清空') : null,
+  );
+  wrap.append(head);
+  if (tags.length) {
+    const selected = h('div', { class: 'chips', style: 'margin-top:9px;flex-wrap:wrap' });
+    tags.forEach((tag) => selected.append(h('button', {
+      class: 'chip active', type: 'button', title: `移除 ${tag}`,
+      onclick: () => onChange(tags.filter((item) => item.toLocaleLowerCase() !== tag.toLocaleLowerCase())),
+    }, `${tag} ×`)));
+    wrap.append(selected);
+  }
+  const templates = (setting.blockedTagTemplateList || [])
+    .map((template, index) => ({
+      name: String(template?.name || `排除模板 ${index + 1}`),
+      tags: normalizeTags(template?.tagList || template?.tags || []),
+    }))
+    .filter((template) => template.tags.length);
+  if (templates.length) {
+    const row = h('div', { class: 'chips', style: 'margin-top:8px' },
+      h('span', { style: 'font-size:12px;color:var(--text-2);padding:7px 2px' }, '模板'));
+    templates.forEach((template) => row.append(h('button', {
+      class: 'chip', type: 'button', title: template.tags.join('、'),
+      onclick: () => onChange(normalizeTags([...tags, ...template.tags])),
+    }, template.name)));
+    wrap.append(row);
+  }
+  const globalBlocked = normalizeTags(setting.blockedTagList || []);
+  if (globalBlocked.length) wrap.append(h('div', {
+    style: 'font-size:11.5px;color:var(--text-2);margin-top:7px',
+  }, `另有 ${globalBlocked.length} 个全局屏蔽标签始终生效`));
+  return wrap;
+}
+
 /* ============================== 分类 ============================== */
 
 export async function categoryView(root, ctx) {
-  const page = h('div', { class: 'page' });
+  const page = h('div', { class: 'page category-page' });
   page.append(loadingBox());
   root.append(page);
   try {
@@ -245,25 +478,55 @@ export async function categoryView(root, ctx) {
     page.replaceChildren();
 
     page.append(h('div', { class: 'list-head' }, h('h2', null, '分类浏览')));
+    page.append(sectionHeading('排行榜', null, '按热度浏览'));
+    page.append(h('div', { class: 'chips', style: 'flex-wrap:wrap' },
+      CATEGORY_ORDERS.map(([order, label]) => h('a', {
+        class: 'chip', href: `#/category/list?c=&o=${encodeURIComponent(order)}&title=${encodeURIComponent(label)}`,
+      }, label))));
 
     const cats = data.categories || [];
     if (cats.length) {
-      page.append(h('div', { class: 'section-title' }, '主分类'));
-      const chips = h('div', { class: 'chips' });
-      cats.forEach((c) => {
-        if (c.type === 'slug' || String(c.id) === '0') {
-          chips.append(h('a', { class: 'chip', href: `#/category/list?c=${encodeURIComponent(c.slug)}&o=mr` }, c.name));
-        } else {
-          chips.append(h('a', { class: 'chip', href: `#/search?q=${encodeURIComponent(c.name)}&o=mr` }, c.name));
-        }
+      page.append(sectionHeading('主分类', null, '按类型浏览'));
+      const categoryGrid = h('div', { class: 'category-grid' });
+      const categoryIcons = ['layout-grid', 'book-open', 'star', 'calendar-days', 'smartphone', 'search'];
+      cats.forEach((c, index) => {
+        const href = c.type === 'slug' || String(c.id) === '0'
+          ? `#/category/list?c=${encodeURIComponent(c.slug)}&o=`
+          : `#/search?q=${encodeURIComponent(c.name)}&o=mr`;
+        categoryGrid.append(h('a', { class: 'category-tile', href },
+          h('span', { class: 'category-icon' }, icon(categoryIcons[index % categoryIcons.length], 19)),
+          h('span', { class: 'category-name' }, c.name),
+          c.total_albums ? h('span', { style: 'font-size:11px;color:var(--text-2)' }, c.total_albums) : null,
+          h('span', { class: 'category-arrow', 'aria-hidden': 'true' }, icon('arrow-up-right', 14)),
+        ));
       });
-      page.append(chips);
+      page.append(categoryGrid);
+
+      // 上游把子分类挂在主分类对象下，组合 slug 以“主_子”请求筛选接口。
+      cats.forEach((category) => {
+        const children = category.sub_categories || category.subCategories || [];
+        if (!children.length || !(category.type === 'slug' || String(category.id) === '0')) return;
+        const row = h('div', { class: 'chips', style: 'flex-wrap:wrap;margin-bottom:10px' });
+        row.append(h('a', {
+          class: 'chip',
+          href: `#/category/list?c=${encodeURIComponent(category.slug || '')}&o=&title=${encodeURIComponent(category.name || '分类')}`,
+        }, '全部'));
+        children.forEach((child) => {
+          const childSlug = String(child.slug || '').trim();
+          const combined = [category.slug, childSlug].filter(Boolean).join('_');
+          row.append(h('a', {
+            class: 'chip',
+            href: `#/category/list?c=${encodeURIComponent(combined)}&o=&title=${encodeURIComponent(`${category.name || ''} · ${child.name || childSlug}`)}`,
+          }, child.name || childSlug));
+        });
+        page.append(sectionHeading(category.name || '子分类', null, '细分类型'), row);
+      });
     }
 
     const tagList = (data.blocks || []).flatMap((b) => b.content || []);
     if (tagList.length) {
-      page.append(h('div', { class: 'section-title' }, '热门标签'));
-      const chips = h('div', { class: 'chips', style: 'flex-wrap:wrap' });
+      page.append(sectionHeading('热门标签', null, '快速筛选'));
+      const chips = h('div', { class: 'chips tag-cloud', style: 'flex-wrap:wrap' });
       tagList.forEach((t) => chips.append(h('a', { class: 'chip', href: `#/search?q=${encodeURIComponent(t)}&o=mr` }, t)));
       page.append(chips);
     }
@@ -275,13 +538,13 @@ export async function categoryView(root, ctx) {
 
 export function categoryListView(root, params) {
   const c = params.get('c') || '';
-  const o = params.get('o') || 'mr';
+  const o = params.has('o') ? (params.get('o') || '') : '';
   const title = params.get('title') || '';
-  const page = h('div', { class: 'page' });
+  const page = h('div', { class: 'page search-page' });
 
   if (title) page.append(h('div', { class: 'list-head' }, h('h2', null, title)));
   const chips = h('div', { class: 'chips' },
-    ORDERS.map(([val, label]) =>
+    CATEGORY_ORDERS.map(([val, label]) =>
       h('a', { class: 'chip' + (val === o ? ' active' : ''), href: `#/category/list?c=${encodeURIComponent(c)}&o=${val}${title ? `&title=${encodeURIComponent(title)}` : ''}` }, label)));
   page.append(chips);
   root.append(page);
@@ -289,9 +552,10 @@ export function categoryListView(root, params) {
   const list = infiniteList(async (p, signal) => {
     const res = await api.categoryFilter(c, o, p, signal);
     const data = res.data || {};
+    const source = data.content || [];
     return {
-      items: (data.content || []).map(comicCard),
-      hasMore: (data.content || []).length >= 20,
+      items: filterComics(source, setting.blockedTagList || []).map(comicCard),
+      hasMore: source.length >= 20,
     };
   });
   page.append(list.root);
@@ -486,6 +750,7 @@ export async function albumView(root, id, ctx) {
 
   // 上游 author 可能为数组或字符串
   const authors = Array.isArray(data.author) ? data.author : (data.author ? [String(data.author)] : []);
+  const category = String(data.category_sub?.title || data.category?.title || data.category || '').trim();
 
   const coverSrc = imgSrc({ id, image: data.image });
   const hero = h('div', { class: 'album-hero' },
@@ -493,8 +758,18 @@ export async function albumView(root, id, ctx) {
     h('div', { class: 'wrap' },
       h('div', { class: 'cover' }, h('img', { src: coverSrc, alt: data.name || '封面' })),
       h('div', { class: 'info' },
+        h('div', { class: 'hero-kicker' }, category || '漫画详情'),
         h('h1', null, data.name || `漫画 ${id}`),
         authors.length ? h('div', { class: 'meta' }, '作者：', authors.join(' / ')) : null,
+        h('div', { class: 'meta', style: 'display:flex;align-items:center;gap:8px;flex-wrap:wrap' },
+          h('span', null, `JM${id}`),
+          h('button', {
+            class: 'chip', type: 'button', title: '复制 JM 号',
+            onclick: async () => {
+              try { await copyText(`JM${id}`); toast(`已复制 JM${id}`); }
+              catch (e) { toast(e.message); }
+            },
+          }, '复制 JM 号')),
         h('div', { class: 'stats' },
           h('span', null, icon('eye', 14), fmt(data.total_views), ' 阅读'),
           h('span', null, icon('heart', 14), fmt(data.likes), ' 爱心'),
@@ -528,6 +803,27 @@ export async function albumView(root, id, ctx) {
       location.hash = `#/read/${photoId}?aid=${id}`;
     },
   }, icon('play', 15), '开始阅读');
+  const downloadBtn = h('button', {
+    class: 'btn',
+    onclick: async () => {
+      if (downloadBtn.disabled) return;
+      downloadBtn.disabled = true;
+      downloadBtn.textContent = '正在创建缓存任务…';
+      try {
+        const { queueAlbumDownload } = await import('./downloads.js');
+        await queueAlbumDownload(id, { album: data, shunt: setting.shunt, concurrency: 3 });
+        toast('已加入离线下载队列');
+        location.hash = '#/downloads';
+      } catch (error) {
+        toast(error.message || '创建下载任务失败');
+      } finally {
+        if (downloadBtn.isConnected) {
+          downloadBtn.disabled = false;
+          downloadBtn.replaceChildren(icon('inbox', 16), '离线缓存');
+        }
+      }
+    },
+  }, icon('inbox', 16), '离线缓存');
 
   // 本地历史：继续阅读
   const localRec = getLocalHistory().find((it) => String(it.aid) === String(id));
@@ -538,7 +834,7 @@ export async function albumView(root, id, ctx) {
     }, icon('history', 16), `继续阅读：${localRec.name || ''} 第 ${Number(localRec.page || 0) + 1} 页`));
   }
 
-  body.append(h('div', { class: 'action-bar' }, readBtn, favBtn, likeBtn));
+  body.append(h('div', { class: 'action-bar' }, readBtn, downloadBtn, favBtn, likeBtn));
 
   // 简介
   if (data.description) {
@@ -570,13 +866,65 @@ export async function albumView(root, id, ctx) {
   // 章节
   const series = (data.series || []).slice().sort((a, b) => Number(a.sort) - Number(b.sort));
   if (series.length > 1 || (data.series_id && data.series_id !== '0')) {
-    body.append(h('div', { class: 'section-title', style: 'margin-top:16px' }, `章节 (${series.length})`));
+    const selectable = series.filter((chapter) => /^\d+$/.test(String((chapter && chapter.id) || '')));
+    const selected = new Set();
+    const selectionText = h('span', { class: 'hint chapter-selection-count', 'aria-live': 'polite' }, '未选择章节');
+    const queueSelected = h('button', { class: 'btn', disabled: true }, icon('inbox', 15), '下载所选');
+    const checkboxes = [];
+    const refreshSelection = () => {
+      selectionText.textContent = selected.size ? `已选择 ${selected.size} / ${selectable.length} 章` : '未选择章节';
+      queueSelected.disabled = selected.size === 0;
+    };
+    queueSelected.onclick = async () => {
+      if (!selected.size || queueSelected.disabled) return;
+      queueSelected.disabled = true;
+      try {
+        const { queueAlbumDownload } = await import('./downloads.js');
+        await queueAlbumDownload(id, {
+          album: data,
+          chapterIds: [...selected],
+          shunt: setting.shunt,
+          concurrency: 3,
+        });
+        toast(`已将 ${selected.size} 章加入离线下载队列`);
+        location.hash = '#/downloads';
+      } catch (error) {
+        toast(error.message || '创建章节下载任务失败');
+      } finally {
+        if (queueSelected.isConnected) refreshSelection();
+      }
+    };
+    const selectAll = h('button', { class: 'btn ghost', type: 'button', onclick: () => {
+      const allSelected = selected.size === selectable.length;
+      selected.clear();
+      if (!allSelected) selectable.forEach((chapter) => selected.add(String(chapter.id)));
+      checkboxes.forEach((input) => { input.checked = selected.has(input.value); });
+      refreshSelection();
+    } }, '全选 / 取消');
+    body.append(
+      h('div', { class: 'section-title chapter-section-title', style: 'margin-top:16px' },
+        h('span', null, `章节 (${series.length})`),
+        h('div', { class: 'chapter-download-tools' }, selectionText, selectAll, queueSelected)),
+    );
     const chapterList = h('div', { class: 'chapter-list' });
     series.forEach((s, i) => {
       const chapterId = String((s && s.id) || '');
-      chapterList.append(/^\d+$/.test(chapterId)
-        ? h('a', { class: 'chapter-item', href: `#/read/${chapterId}?aid=${id}` }, chapterName(s, i))
-        : h('span', { class: 'chapter-item', 'aria-disabled': 'true' }, chapterName(s, i)));
+      if (!/^\d+$/.test(chapterId)) {
+        chapterList.append(h('span', { class: 'chapter-item', 'aria-disabled': 'true' }, chapterName(s, i)));
+        return;
+      }
+      const checkbox = h('input', {
+        type: 'checkbox', value: chapterId,
+        'aria-label': `选择下载 ${chapterName(s, i)}`,
+        onchange: () => {
+          if (checkbox.checked) selected.add(chapterId); else selected.delete(chapterId);
+          refreshSelection();
+        },
+      });
+      checkboxes.push(checkbox);
+      chapterList.append(h('div', { class: 'chapter-download-row' },
+        h('a', { class: 'chapter-item', href: `#/read/${chapterId}?aid=${id}` }, chapterName(s, i)),
+        h('label', { class: 'chapter-download-check', title: '选择离线下载' }, checkbox, h('span', null, '下载'))));
     });
     body.append(chapterList);
   }
@@ -627,12 +975,34 @@ export async function albumView(root, id, ctx) {
     favBtn.disabled = true;
     favBtn.setAttribute('aria-busy', 'true');
     try {
+      let selectedFolder = ['0', '默认收藏夹'];
+      if (!data.is_favorite) {
+        try {
+          const favoritePage = await api.favorites('mr', 1, 0, ctx && ctx.signal);
+          if (isInactive(ctx)) return;
+          const entries = folderEntries(favoritePage.data?.folder_list);
+          if (entries.length > 1) {
+            const choice = await chooseFolder(entries, '收藏到…');
+            if (!choice || isInactive(ctx)) return;
+            selectedFolder = choice;
+          }
+        } catch (e) {
+          if (isAbort(e)) throw e;
+          // 老后端没有收藏夹元数据时仍可收藏到默认目录。
+        }
+      }
       const res = await api.favorite(id);
       if (isInactive(ctx)) return;
       const d = res.data || {};
       data.is_favorite = d.is_favorite ?? !data.is_favorite;
       renderFavBtn();
-      toast(d.msg || (data.is_favorite ? '收藏成功' : '已取消收藏'));
+      if (data.is_favorite && selectedFolder[0] !== '0') {
+        await api.favoriteFolder('move', selectedFolder[0], '', id);
+        if (isInactive(ctx)) return;
+      }
+      toast(data.is_favorite && selectedFolder[0] !== '0'
+        ? `已收藏到 ${selectedFolder[1]}`
+        : (d.msg || (data.is_favorite ? '收藏成功' : '已取消收藏')));
     } catch (e) {
       if (!isInactive(ctx) && !isAbort(e)) toast(e.message);
     } finally {
@@ -716,7 +1086,9 @@ function buildComments(wrap, aid, ctx) {
         listWrap.replaceChildren(h('div', { class: 'empty' }, h('div', { class: 'big' }, icon('message-square', 40)), '还没有评论'));
         return;
       }
-      listWrap.replaceChildren(...list.map(commentItem));
+      listWrap.replaceChildren(...list.map((comment) => commentItem(comment, {
+        aid, reload: () => load(p), ctx, depth: 0,
+      })));
       const pages = Math.ceil(Number(d.total) / 20);
       if (pages > 1) {
         const { pager } = await import('./ui.js');
@@ -732,7 +1104,8 @@ function buildComments(wrap, aid, ctx) {
   return { reload: () => load(1) };
 }
 
-function commentItem(c) {
+function commentItem(c, options = {}) {
+  const { aid = '', reload = () => {}, ctx, depth = 0 } = options;
   const content = h('div', { class: 'content' + (c.spoiler === '1' || c.spoiler === 1 ? ' spoiler' : '') }, c.content || '');
   if (content.classList.contains('spoiler')) {
     const reveal = () => {
@@ -752,18 +1125,110 @@ function commentItem(c) {
   const avatarSrc = c.photo
     ? (/^https?:/i.test(c.photo) ? `/api/img?u=${encodeURIComponent(c.photo)}` : `/api/img?path=${encodeURIComponent(c.photo.startsWith('/') ? c.photo : '/' + c.photo)}`)
     : '';
-  const el = h('div', { class: 'comment-item' },
-    h('div', { class: 'avatar' }, avatarSrc ? h('img', { loading: 'lazy', src: avatarSrc, alt: '' }) : (c.nickname || c.username || '友').slice(0, 1)),
-    h('div', { class: 'body' },
-      h('div', { class: 'head' },
-        h('span', { class: 'name' }, c.nickname || c.username || '匿名'),
-        h('span', { class: 'time' }, fmtTime(c.addtime)),
-      ),
-      content,
-      h('div', { class: 'foot' }, icon('thumbs-up', 13), c.likes || 0),
+  const cid = String(c.CID ?? c.cid ?? c.id ?? '');
+  let likeCount = Number(c.likes) || 0;
+  let voted = false;
+  const likeBtn = h('button', {
+    type: 'button', class: 'more',
+    style: 'border:0;background:none;color:inherit;padding:2px 4px;display:inline-flex;align-items:center;gap:4px;cursor:pointer',
+    disabled: !cid,
+    onclick: async () => {
+      if (!cid || voted || likeBtn.disabled) return;
+      likeBtn.disabled = true;
+      try {
+        await api.commentVote(cid, 'up');
+        if (isInactive(ctx)) return;
+        voted = true;
+        likeCount += 1;
+        likeBtn.replaceChildren(icon('thumbs-up', 13), String(likeCount));
+        likeBtn.classList.add('active');
+        toast('评论点赞成功');
+      } catch (e) {
+        if (!isInactive(ctx) && !isAbort(e)) toast(e.message);
+        if (!voted) likeBtn.disabled = false;
+      }
+    },
+  }, icon('thumbs-up', 13), String(likeCount));
+  const replyHost = h('div');
+  const replyBtn = h('button', {
+    type: 'button', class: 'more',
+    style: 'border:0;background:none;color:inherit;padding:2px 4px;cursor:pointer',
+    disabled: !cid || !aid,
+    onclick: () => toggleReplyComposer(replyHost, { aid, cid, nickname: c.nickname || c.username, reload, ctx }),
+  }, '回复');
+  const replies = c.replys || c.replies || c.children || [];
+  const body = h('div', { class: 'body' },
+    h('div', { class: 'head' },
+      h('span', { class: 'name' }, c.nickname || c.username || '匿名'),
+      h('span', { class: 'time' }, fmtTime(c.addtime)),
     ),
+    content,
+    h('div', { class: 'foot' }, likeBtn, replyBtn),
+    replyHost,
+  );
+  if (replies.length && depth < 4) {
+    const repliesWrap = h('div', {
+      style: 'margin-top:7px;margin-left:2px;padding-left:10px;border-left:2px solid var(--line)',
+    });
+    replies.forEach((reply) => repliesWrap.append(commentItem(reply, {
+      aid, reload, ctx, depth: depth + 1,
+    })));
+    body.append(repliesWrap);
+  }
+  const el = h('div', {
+    class: 'comment-item',
+    ...(depth ? { style: 'padding-top:10px;padding-bottom:10px' } : {}),
+  },
+    h('div', { class: 'avatar' }, avatarSrc ? h('img', { loading: 'lazy', src: avatarSrc, alt: '' }) : (c.nickname || c.username || '友').slice(0, 1)),
+    body,
   );
   return el;
+}
+
+function toggleReplyComposer(host, { aid, cid, nickname, reload, ctx }) {
+  if (host.childElementCount) {
+    host.replaceChildren();
+    return;
+  }
+  const ta = h('textarea', {
+    class: 'input', rows: 2, maxlength: '1000',
+    placeholder: `回复 ${nickname || '这条评论'}…`,
+  });
+  const spoiler = h('input', { type: 'checkbox' });
+  const submit = h('button', { class: 'btn primary', type: 'submit' }, '发送回复');
+  const form = h('form', {
+    class: 'card', style: 'padding:10px;margin-top:8px',
+    onsubmit: async (e) => {
+      e.preventDefault();
+      const value = ta.value.trim();
+      if (!value) return toast('请输入回复内容');
+      submit.disabled = true;
+      submit.textContent = '发送中…';
+      try {
+        await api.comment(aid, value, spoiler.checked ? '1' : '0', cid);
+        if (isInactive(ctx)) return;
+        toast('回复已发表');
+        host.replaceChildren();
+        reload();
+      } catch (err) {
+        if (!isInactive(ctx) && !isAbort(err)) toast(err.message);
+      } finally {
+        if (!isInactive(ctx)) {
+          submit.disabled = false;
+          submit.textContent = '发送回复';
+        }
+      }
+    },
+  },
+    ta,
+    h('div', { style: 'display:flex;align-items:center;gap:8px;margin-top:8px' },
+      h('label', { style: 'display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text-2);flex:1' }, spoiler, '剧透'),
+      h('button', { class: 'btn', type: 'button', onclick: () => host.replaceChildren() }, '取消'),
+      submit,
+    ),
+  );
+  host.append(form);
+  ta.focus();
 }
 
 export function fmt(n) {
@@ -773,9 +1238,18 @@ export function fmt(n) {
 
 export function fmtTime(t) {
   if (!t) return '';
-  const d = new Date(String(t).replace(/-/g, '/'));
-  if (isNaN(d)) return String(t);
+  const raw = String(t).trim();
+  let d;
+  if (/^-?\d+(?:\.\d+)?$/.test(raw)) {
+    const value = Number(raw);
+    // 上游偶尔返回秒级时间戳；本地阅读记录使用 Date.now() 的毫秒值。
+    d = new Date(Math.abs(value) < 1e12 ? value * 1000 : value);
+  } else {
+    d = new Date(raw.replace(/-/g, '/'));
+  }
+  if (Number.isNaN(d.getTime())) return String(t);
   const diff = (Date.now() - d.getTime()) / 1000;
+  if (diff < 0) return d.toLocaleDateString('zh-CN');
   if (diff < 60) return '刚刚';
   if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
   if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;

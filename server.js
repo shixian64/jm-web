@@ -12,6 +12,7 @@
  *  JM_UA           上游 UA（默认 okhttp/4.9.3）
  *  JM_TIMEOUT      上游单域名超时 ms（默认 20000）
  *  JM_TOTAL_TIMEOUT 上游全部域名总时间预算 ms（默认 35000）
+ *  JMW_TRUST_PROXY 可信反代 IP/CIDR（逗号分隔；环回默认可信）
  *  JMW_DATA_DIR    数据目录（默认 ./data）
  */
 
@@ -19,23 +20,45 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const net = require('net');
 const { URL } = require('url');
 
 const { ApiError, upstreamRequest, assertPublicUrl, API_VERSION } = require('./lib/jm-api');
 const { parsePhotoHtml } = require('./lib/photo');
 const sessions = require('./lib/sessions');
 const settings = require('./lib/settings');
+const features = require('./lib/features');
 
-const PORT = Number(process.env.PORT || 3210);
+const configuredPort = Number(process.env.PORT || 3210);
+const portIsValid = Number.isInteger(configuredPort) && configuredPort >= 1 && configuredPort <= 65535;
+const PORT = portIsValid ? configuredPort : 3210;
+if (process.env.PORT && !portIsValid) {
+  console.warn(`[警告] PORT=${JSON.stringify(process.env.PORT)} 非法，已回退到 3210（允许 1-65535 的整数）`);
+}
 const HOST = process.env.HOST || '0.0.0.0';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const ACCESS_PASSWORD = process.env.ACCESS_PASSWORD || '';
+
+// 逗号分隔的可信反代 IP/CIDR。环回对端默认作为本机反代信任；
+// 其他直连客户即使伪造 X-Forwarded-For 也不会被采信。
+const TRUST_PROXY = process.env.JMW_TRUST_PROXY || '';
+const trustedProxyBlockList = new net.BlockList();
 
 const SAFE_RASTER_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']);
 const MAX_IMAGE_BYTES = Math.min(100 * 1024 * 1024, Math.max(1024 * 1024, Number(process.env.JMW_MAX_IMAGE_BYTES) || 25 * 1024 * 1024));
 const MAX_IMAGE_REDIRECTS = 4;
 const MAX_IMAGE_CONCURRENCY = Math.min(100, Math.max(1, Number(process.env.JMW_MAX_IMAGE_CONCURRENCY) || 24));
+const IMAGE_DRAIN_TIMEOUT = 15000;
+const IMAGE_PATH_TOTAL_TIMEOUT = 30000;
 let activeImageRequests = 0;
+const MAX_AI_CONCURRENCY = Math.min(20, Math.max(1, Number(process.env.JMW_MAX_AI_CONCURRENCY) || 4));
+const MAX_SEARCH_CONCURRENCY = Math.min(40, Math.max(1, Number(process.env.JMW_MAX_SEARCH_CONCURRENCY) || 8));
+const MAX_AI_STREAM_BYTES = Math.min(
+  64 * 1024 * 1024,
+  Math.max(1024 * 1024, Number(process.env.JMW_MAX_AI_STREAM_BYTES) || 16 * 1024 * 1024)
+);
+let activeAiRequests = 0;
+let activeSearchRequests = 0;
 
 const API_METHODS = Object.freeze({
   '/config': ['GET'],
@@ -57,23 +80,31 @@ const API_METHODS = Object.freeze({
   '/comments': ['GET'],
   '/user_comments': ['GET'],
   '/comment': ['POST'],
+  '/comment_vote': ['POST'],
   '/like': ['POST'],
   '/favorite': ['POST'],
+  '/favorite_folder': ['POST'],
   '/favorites': ['GET'],
   '/history': ['GET'],
+  '/history/delete': ['POST'],
   '/chapter': ['GET'],
   '/img': ['GET'],
   '/setting': ['GET'],
+  '/ai/config': ['GET'],
+  '/ai/chat': ['POST'],
+  '/ai/search': ['POST'],
+  '/doh': ['GET', 'POST'],
+  '/doh/test': ['GET'],
+  '/logs': ['GET', 'DELETE'],
+  '/update': ['GET'],
 });
 
 /* ----------------------------- 启动检查 ----------------------------- */
 
-if (typeof fetch !== 'function') {
-  console.error('[启动失败] 需要 Node.js 18 或更高版本（内置 fetch）');
+const nodeMajor = Number(process.versions.node.split('.')[0]);
+if (nodeMajor < 20 || typeof fetch !== 'function') {
+  console.error('[启动失败] 需要 Node.js 20 或更高版本');
   process.exit(1);
-}
-if (typeof Response !== 'undefined' && !new Response().headers.getSetCookie) {
-  console.warn('[警告] 当前 Node 版本不支持 getSetCookie()（需要 18.14.1+），登录态将无法保持');
 }
 if (!ACCESS_PASSWORD) {
   console.warn('[警告] 未设置 ACCESS_PASSWORD：任何访客都可以使用本站，并可在设置中切换自己的 API 线路');
@@ -92,6 +123,7 @@ const MIME = {
   '.mjs': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
@@ -110,6 +142,10 @@ const CSP = [
   "connect-src 'self'",
   "font-src 'self'",
   "worker-src 'self' blob:",
+  "frame-ancestors 'none'",
+  "base-uri 'self'",
+  "object-src 'none'",
+  "form-action 'self'",
 ].join('; ');
 
 /* ----------------------------- 工具函数 ----------------------------- */
@@ -132,17 +168,30 @@ function readBody(req, limit = 1 << 20) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
+    let settled = false;
     req.on('data', (c) => {
+      // 超限后仍保持 flowing 并丢弃后续字节，让 413 响应能正常发出；
+      // 直接 req.destroy() 会先把承载响应的同一 socket 重置。
+      if (settled) return;
       size += c.length;
       if (size > limit) {
+        settled = true;
+        chunks.length = 0;
         reject(new ApiError('请求体过大', 413));
-        req.destroy();
         return;
       }
       chunks.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks));
+    });
+    req.on('error', (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
   });
 }
 
@@ -178,18 +227,100 @@ function rateLimit(key, limit, windowMs) {
   const now = Date.now();
   let b = rateBuckets.get(key);
   if (!b || now > b.resetAt) {
+    if (!b && rateBuckets.size >= 5000) {
+      for (const [k, value] of rateBuckets) if (now > value.resetAt) rateBuckets.delete(k);
+      // 全是活跃桶时拒绝新的唯一 key，避免攻击者用伪造/大量来源撑爆内存。
+      if (rateBuckets.size >= 5000) return false;
+    }
     b = { count: 0, resetAt: now + windowMs };
     rateBuckets.set(key, b);
   }
   b.count++;
-  if (rateBuckets.size > 5000) {
-    for (const [k, v] of rateBuckets) if (now > v.resetAt) rateBuckets.delete(k);
-  }
   return b.count <= limit;
 }
 
+function normalizeIp(value) {
+  let ip = String(value || '').trim();
+  if (!ip) return '';
+  if (ip.startsWith('[') && ip.endsWith(']')) ip = ip.slice(1, -1);
+  // Node 在双栈 socket 上常以 ::ffff:192.0.2.1 表示 IPv4。
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(ip);
+  if (mapped && net.isIP(mapped[1]) === 4) ip = mapped[1];
+  return net.isIP(ip) ? ip.toLowerCase() : '';
+}
+
+function addTrustedProxyRule(rule) {
+  const slash = rule.lastIndexOf('/');
+  const rawIp = slash === -1 ? rule : rule.slice(0, slash);
+  const ip = normalizeIp(rawIp);
+  if (!ip) return false;
+  const family = net.isIP(ip);
+  const type = family === 6 ? 'ipv6' : 'ipv4';
+  try {
+    if (slash === -1) {
+      trustedProxyBlockList.addAddress(ip, type);
+      return true;
+    }
+    const prefixText = rule.slice(slash + 1);
+    if (!/^\d+$/.test(prefixText)) return false;
+    const prefix = Number(prefixText);
+    if (prefix < 0 || prefix > (family === 6 ? 128 : 32)) return false;
+    trustedProxyBlockList.addSubnet(ip, prefix, type);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+for (const rawRule of TRUST_PROXY.split(',')) {
+  const rule = rawRule.trim();
+  if (rule && !addTrustedProxyRule(rule)) {
+    console.warn(`[警告] 已忽略非法 JMW_TRUST_PROXY 规则: ${rule}`);
+  }
+}
+
+function isLoopbackIp(ip) {
+  if (net.isIP(ip) === 4) return ip.split('.')[0] === '127';
+  return ip === '::1';
+}
+
+function isTrustedProxyIp(ip) {
+  const family = net.isIP(ip);
+  if (!family) return false;
+  return isLoopbackIp(ip) || trustedProxyBlockList.check(ip, family === 6 ? 'ipv6' : 'ipv4');
+}
+
 function clientIp(req) {
-  return req.socket.remoteAddress || 'unknown';
+  let current = normalizeIp(req.socket.remoteAddress) || 'unknown';
+  if (!isTrustedProxyIp(current)) return current;
+
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded !== 'string' || !forwarded.trim()) return current;
+  const parts = forwarded.split(',');
+  // 限制链长，且任一 token 不是纯 IP 时整个头都不采信。
+  if (parts.length > 32) return current;
+  const chain = parts.map(normalizeIp);
+  if (chain.some((ip) => !ip)) return current;
+
+  // 从最靠近应用的一跳开始剥离可信代理，第一个非可信 IP 即客户。
+  for (let i = chain.length - 1; i >= 0 && isTrustedProxyIp(current); i--) {
+    current = chain[i];
+  }
+  return current;
+}
+
+function requestIsSecure(req) {
+  if (req.socket && req.socket.encrypted) return true;
+  const peer = normalizeIp(req.socket && req.socket.remoteAddress);
+  if (!peer || !isTrustedProxyIp(peer)) return false;
+  const forwarded = req.headers && req.headers['x-forwarded-proto'];
+  if (typeof forwarded !== 'string') return false;
+  // 反代必须覆盖而不是追加该头；拒绝含逗号的歧义链，避免客户端伪造首项。
+  return forwarded.trim().toLowerCase() === 'https';
+}
+
+function cookieSecurity(req) {
+  return requestIsSecure(req) ? '; Secure' : '';
 }
 
 /* ----------------------------- 会话/鉴权 ----------------------------- */
@@ -201,7 +332,7 @@ function ensureJar(req, res) {
     jar = sessions.createJar();
     res.setHeader(
       'Set-Cookie',
-      `jmw_sid=${jar.sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=7776000`
+      `jmw_sid=${jar.sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=7776000${cookieSecurity(req)}`
     );
   }
   // 旧版可能在会话文件中留下任意 Host；升级后一律清除非受信值。
@@ -209,6 +340,8 @@ function ensureJar(req, res) {
     jar.apiHost = '';
     sessions.scheduleSave(jar);
   }
+  sessions.retainJar(jar);
+  req.jmwJar = jar;
   return jar;
 }
 
@@ -245,6 +378,62 @@ function checkPassword(password) {
 
 /* ----------------------------- 图片代理 ----------------------------- */
 
+function clientDisconnectError() {
+  const error = new Error('客户端已断开');
+  error.code = 'JMW_CLIENT_DISCONNECTED';
+  return error;
+}
+
+function isClientDisconnectError(error) {
+  return !!error && error.code === 'JMW_CLIENT_DISCONNECTED';
+}
+
+function throwIfAborted(signal) {
+  if (!signal || !signal.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : clientDisconnectError();
+}
+
+/** 从请求入口开始监听客户端断开，便于取消 DNS、fetch 和响应体读取。 */
+function bindClientAbort(res) {
+  const controller = new AbortController();
+  const onClose = () => {
+    if (!res.writableEnded && !controller.signal.aborted) {
+      controller.abort(clientDisconnectError());
+    }
+  };
+  res.once('close', onClose);
+  if (res.destroyed) onClose();
+  return {
+    signal: controller.signal,
+    cleanup: () => res.off('close', onClose),
+  };
+}
+
+/** 将客户端取消与单次上游 deadline 合并，信号保持到响应体消费完成。 */
+function linkedTimeoutSignal(timeoutMs, parentSignal) {
+  const controller = new AbortController();
+  const ms = Math.max(1, Math.floor(Number(timeoutMs) || 0));
+  const onParentAbort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort(parentSignal.reason instanceof Error ? parentSignal.reason : clientDisconnectError());
+    }
+  };
+  if (parentSignal) {
+    if (parentSignal.aborted) onParentAbort();
+    else parentSignal.addEventListener('abort', onParentAbort, { once: true });
+  }
+  const timer = setTimeout(() => {
+    if (!controller.signal.aborted) controller.abort(new ApiError('图片获取超时', 504));
+  }, ms);
+  return {
+    signal: controller.signal,
+    cleanup() {
+      clearTimeout(timer);
+      if (parentSignal) parentSignal.removeEventListener('abort', onParentAbort);
+    },
+  };
+}
+
 async function cancelBody(response) {
   try { if (response && response.body) await response.body.cancel(); } catch (_) {}
 }
@@ -268,47 +457,68 @@ function validateImageUrl(url) {
 }
 
 /** 手动跟随重定向，每一跳都重新验证 HTTPS 与精确 origin 白名单。 */
-async function fetchImageResponse(urlStr, timeoutMs, dnsLookup) {
+async function fetchImageResponse(urlStr, timeoutMs, dnsLookup, clientSignal) {
   let current = validateImageUrl(urlStr);
+  // 预检和实际 socket 使用同一个 resolver。outboundFetch 还会再次校验并把
+  // 第二次得到的安全地址集固定给 TLS 连接，以消除校验后的 DNS TOCTOU。
+  const effectiveLookup = dnsLookup || features.dohLookup;
   const deadline = Date.now() + timeoutMs;
   for (let hop = 0; hop <= MAX_IMAGE_REDIRECTS; hop++) {
+    throwIfAborted(clientSignal);
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new ApiError('图片获取超时', 504);
     // 紧邻 fetch 对每一跳的当前 DNS A/AAAA 做非公网拒绝。
-    await assertPublicUrl(current, dnsLookup);
+    await assertPublicUrl(current, effectiveLookup, remaining, clientSignal);
+    throwIfAborted(clientSignal);
     const fetchRemaining = deadline - Date.now();
     if (fetchRemaining <= 0) throw new ApiError('图片获取超时', 504);
-    const response = await fetch(current.href, {
-      headers: { 'User-Agent': 'okhttp/4.9.3', Referer: current.origin + '/' },
-      signal: AbortSignal.timeout(fetchRemaining),
-      redirect: 'manual',
-    });
+    const linked = linkedTimeoutSignal(fetchRemaining, clientSignal);
+    let response;
+    try {
+      response = await features.outboundFetch(current.href, {
+        headers: { 'User-Agent': 'okhttp/4.9.3', Referer: current.origin + '/' },
+        signal: linked.signal,
+        redirect: 'manual',
+        jmwLookup: effectiveLookup,
+      });
+    } catch (e) {
+      linked.cleanup();
+      if (linked.signal.aborted && linked.signal.reason instanceof Error) throw linked.signal.reason;
+      throw e;
+    }
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
       await cancelBody(response);
+      linked.cleanup();
       if (!location) throw new ApiError('图片重定向缺少 Location', 502);
       if (hop >= MAX_IMAGE_REDIRECTS) throw new ApiError('图片重定向次数过多', 502);
       current = validateImageUrl(new URL(location, current));
       continue;
     }
-    return { response, finalUrl: current };
+    return { response, finalUrl: current, signal: linked.signal, cleanup: linked.cleanup };
   }
   throw new ApiError('图片重定向次数过多', 502);
 }
 
-/** 只接收安全栅格图片 MIME，并对解压后实际读取字节数设硬上限。 */
-async function readRasterImage(response) {
+async function rasterResponseInfo(response) {
   const mime = (response.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
   if (!SAFE_RASTER_MIME.has(mime)) {
     await cancelBody(response);
     throw new ApiError(`上游返回了非安全栅格图片类型：${mime || '未知'}`, 415);
   }
   if (!response.body) throw new ApiError('上游图片响应为空', 502);
-  const declared = Number(response.headers.get('content-length'));
+  const lengthHeader = response.headers.get('content-length');
+  const declared = lengthHeader === null ? NaN : Number(lengthHeader);
   if (Number.isFinite(declared) && declared > MAX_IMAGE_BYTES) {
     await cancelBody(response);
     throw new ApiError(`图片超过 ${Math.floor(MAX_IMAGE_BYTES / 1024 / 1024)} MiB 上限`, 413);
   }
+  return { mime };
+}
+
+/** 只接收安全栅格图片 MIME，并对解压后实际读取字节数设硬上限。 */
+async function readRasterImage(response) {
+  const { mime } = await rasterResponseInfo(response);
 
   const reader = response.body.getReader();
   const chunks = [];
@@ -332,32 +542,131 @@ async function readRasterImage(response) {
   return { mime, body: Buffer.concat(chunks, total) };
 }
 
-async function sendUpstreamImage(res, response, cacheDays) {
-  const image = await readRasterImage(response);
-  if (res.destroyed) return;
-  res.writeHead(200, baseHeaders({
-    'Cache-Control': `public, max-age=${cacheDays * 86400}, immutable`,
-    'Content-Type': image.mime,
-    'Content-Length': image.body.length,
-  }));
-  res.end(image.body);
+function waitForDrain(res, signal, timeoutMs = IMAGE_DRAIN_TIMEOUT) {
+  if (res.destroyed) return Promise.reject(new Error('客户端已断开'));
+  if (signal && signal.aborted) {
+    return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error('请求已取消'));
+  }
+  return new Promise((resolve, reject) => {
+    let timer;
+    const cleanup = () => {
+      res.off('drain', onDrain);
+      res.off('close', onClose);
+      res.off('error', onError);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (timer) clearTimeout(timer);
+    };
+    const onDrain = () => { cleanup(); resolve(); };
+    const onClose = () => { cleanup(); reject(new Error('客户端已断开')); };
+    const onError = (error) => { cleanup(); reject(error); };
+    const onAbort = () => {
+      cleanup();
+      reject(signal.reason instanceof Error ? signal.reason : new Error('请求已取消'));
+    };
+    res.once('drain', onDrain);
+    res.once('close', onClose);
+    res.once('error', onError);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    timer = setTimeout(() => {
+      cleanup();
+      reject(new Error('客户端读取图片超时'));
+    }, Math.max(1, Math.floor(Number(timeoutMs) || IMAGE_DRAIN_TIMEOUT)));
+  });
+}
+
+/** 带实际字节上限和 Node 写入背压的流式图片转发。 */
+function imageCacheControl(cacheDays, accessProtected = !!ACCESS_PASSWORD) {
+  // /api/img 在开启访问口令时依赖 Cookie 鉴权。标成 public 会允许 Nginx/CDN
+  // 等共享缓存把认证用户的响应直接返回给未认证访客，绕过回源鉴权。
+  return `${accessProtected ? 'private' : 'public'}, max-age=${cacheDays * 86400}, immutable`;
+}
+
+async function sendUpstreamImage(res, response, cacheDays, requestSignal, drainTimeoutMs = IMAGE_DRAIN_TIMEOUT) {
+  const { mime } = await rasterResponseInfo(response);
+  const reader = response.body.getReader();
+  let total = 0;
+  let clientClosed = res.destroyed || isClientDisconnectError(requestSignal && requestSignal.reason);
+  const onClose = () => {
+    if (res.writableEnded) return;
+    clientClosed = true;
+    reader.cancel().catch(() => {});
+  };
+  const onAbort = () => {
+    if (isClientDisconnectError(requestSignal.reason)) clientClosed = true;
+    reader.cancel().catch(() => {});
+  };
+  res.once('close', onClose);
+  if (requestSignal) requestSignal.addEventListener('abort', onAbort, { once: true });
+
+  try {
+    if (clientClosed) {
+      await reader.cancel();
+      return;
+    }
+    throwIfAborted(requestSignal);
+    // 先读一块：如果上游在任何字节前就失败，仍能返回结构化 502。
+    let part = await reader.read();
+    throwIfAborted(requestSignal);
+    if (clientClosed) return;
+    if (!part.done) {
+      total += part.value.byteLength;
+      if (total > MAX_IMAGE_BYTES) {
+        await reader.cancel();
+        throw new ApiError(`图片超过 ${Math.floor(MAX_IMAGE_BYTES / 1024 / 1024)} MiB 上限`, 413);
+      }
+    }
+
+    res.writeHead(200, baseHeaders({
+      'Cache-Control': imageCacheControl(cacheDays),
+      'Content-Type': mime,
+      // fetch 可能已解压响应体，不能直接转发上游 Content-Length。
+    }));
+
+    while (!part.done) {
+      if (!res.write(Buffer.from(part.value))) await waitForDrain(res, requestSignal, drainTimeoutMs);
+      part = await reader.read();
+      throwIfAborted(requestSignal);
+      if (clientClosed) return;
+      if (!part.done) {
+        total += part.value.byteLength;
+        if (total > MAX_IMAGE_BYTES) {
+          await reader.cancel();
+          throw new ApiError(`图片超过 ${Math.floor(MAX_IMAGE_BYTES / 1024 / 1024)} MiB 上限`, 413);
+        }
+      }
+    }
+    if (!res.destroyed) res.end();
+  } catch (e) {
+    try { await reader.cancel(); } catch (_) {}
+    if (clientClosed) return;
+    if (e instanceof ApiError) throw e;
+    throw new ApiError('读取上游图片失败：' + e.message, 502);
+  } finally {
+    res.off('close', onClose);
+    if (requestSignal) requestSignal.removeEventListener('abort', onAbort);
+  }
 }
 
 function imageErrorStatus(e) {
   return e instanceof ApiError && e.code >= 400 && e.code < 600 ? e.code : 502;
 }
 
-async function proxyImage(res, urlStr, cacheDays = 7) {
+async function proxyImage(res, urlStr, cacheDays = 7, clientSignal) {
+  let fetched;
   try {
-    const { response } = await fetchImageResponse(urlStr, 30000);
+    fetched = await fetchImageResponse(urlStr, 30000, undefined, clientSignal);
+    const { response } = fetched;
     if (!response.ok || !response.body) {
       await cancelBody(response);
       return sendJson(res, 502, { error: `图片获取失败（HTTP ${response.status}）` });
     }
-    await sendUpstreamImage(res, response, cacheDays);
+    await sendUpstreamImage(res, response, cacheDays, fetched.signal);
   } catch (e) {
+    if ((clientSignal && clientSignal.aborted) || isClientDisconnectError(e) || res.destroyed) return;
     if (!res.headersSent) sendJson(res, imageErrorStatus(e), { error: '图片获取失败：' + e.message });
     else res.destroy();
+  } finally {
+    if (fetched) fetched.cleanup();
   }
 }
 
@@ -365,52 +674,113 @@ async function proxyImage(res, urlStr, cacheDays = 7) {
 const imageHostFailedUntil = new Map();
 
 /** path 形式：在图片域名列表中依次尝试（记住成功的域名） */
-async function proxyImagePath(res, p) {
+async function proxyImagePath(res, p, clientSignal) {
   if (!/^\/media\//.test(p)) return sendJson(res, 400, { error: '非法路径' });
   const hosts = settings.imageHosts();
   const now = Date.now();
+  const deadline = now + IMAGE_PATH_TOTAL_TIMEOUT;
   let lastError = '所有图片域名均无法获取该资源';
   let lastStatus = 502;
   for (const host of hosts) {
+    if (clientSignal && clientSignal.aborted) return;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      lastError = '图片获取总时间已超限';
+      lastStatus = 504;
+      break;
+    }
     const failedAt = imageHostFailedUntil.get(host);
     if (failedAt && now < failedAt) continue;
+    let fetched;
     try {
       const target = host.replace(/\/+$/, '') + p;
-      const { response } = await fetchImageResponse(target, 8000);
+      fetched = await fetchImageResponse(target, Math.min(8000, remaining), undefined, clientSignal);
+      const { response } = fetched;
       if (!response.ok || !response.body) {
         lastError = `HTTP ${response.status}`;
         await cancelBody(response);
         continue;
       }
-      await sendUpstreamImage(res, response, 1);
+      await sendUpstreamImage(res, response, 1, fetched.signal);
       imageHostFailedUntil.delete(host);
       settings.setPreferredImageHost(host);
       return;
     } catch (e) {
+      if ((clientSignal && clientSignal.aborted) || isClientDisconnectError(e) || res.destroyed) return;
+      // 流式转发已发出 200 后无法再切换域名或改写 JSON 错误。
+      if (res.headersSent) {
+        if (!res.destroyed) res.destroy();
+        return;
+      }
       lastError = e.message || lastError;
       lastStatus = imageErrorStatus(e);
       // 只对网络层故障做负缓存；MIME/重定向安全拒绝不污染域名健康状态。
       if (!(e instanceof ApiError)) imageHostFailedUntil.set(host, now + 60000);
       /* 尝试下一个域名 */
+    } finally {
+      if (fetched) fetched.cleanup();
     }
   }
+  if ((clientSignal && clientSignal.aborted) || res.destroyed) return;
   if (imageHostFailedUntil.size > 200) imageHostFailedUntil.clear();
   sendJson(res, lastStatus, { error: lastError });
 }
 
 /* ----------------------------- API 路由 ----------------------------- */
 
-async function api(req, res, u) {
+async function proxyEventStream(res, response, signal) {
+  let reader = null;
+  let onClose = null;
+  let closed = false;
+  let total = 0;
+  try {
+    reader = response.body.getReader();
+    onClose = () => {
+      if (!res.writableEnded) {
+        closed = true;
+        reader.cancel().catch(() => {});
+      }
+    };
+    res.once('close', onClose);
+    res.writeHead(200, baseHeaders({
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    }));
+    while (!closed) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_AI_STREAM_BYTES) throw new ApiError('AI 流式响应过大', 502);
+      if (!res.write(Buffer.from(value))) await waitForDrain(res, signal, 30000);
+    }
+    if (!closed && !res.destroyed) res.end();
+  } finally {
+    if (onClose) res.off('close', onClose);
+    try { if (reader) await reader.cancel(); } catch (_) {}
+    // requestAiStream 把 timeout/父 signal 清理器绑定在 response 上；无论
+    // getReader、writeHead、转发还是背压在哪一步失败，都必须在这里释放。
+    features.cleanupResponse(response);
+  }
+}
+
+async function api(req, res, u, requestSignal) {
   const route = u.pathname.replace(/^\/api/, '');
   const q = u.searchParams;
   // /api/auth 在口令验证前调用：避免未通过口令的扫描请求也创建会话文件
-  const jar = route === '/auth' ? { cookies: {}, user: null, apiHost: '' } : ensureJar(req, res);
+  const jar = route === '/auth' ? { cookiesByOrigin: {}, user: null, apiHost: '' } : ensureJar(req, res);
 
+  // 数据源由浏览器设置选择，但只能是固定枚举；实际 origin 始终来自服务端白名单。
+  const dataSource = settings.normalizeDataSource(String(req.headers['x-jmw-data-source'] || 'mixed'));
   // 透传到上游的快捷封装（会话内 API 域名覆盖优先）
   const call = (opts) => upstreamRequest({
-    hosts: settings.apiHosts(jar.apiHost),
-    cookieHosts: settings.trustedApiHosts(),
+    hosts: settings.apiHostsForSource(dataSource, jar.apiHost),
+    cookieHosts: settings.allDataSourceHosts(),
     jar,
+    dnsLookup: features.dohLookup,
+    fetchImpl: features.outboundFetch,
+    signal: requestSignal,
     ...opts,
   });
 
@@ -424,8 +794,20 @@ async function api(req, res, u) {
           ? settings.normalizeHost(jar.apiHost)
           : (settings.isTrustedApiHost(settings.get().apiHost) ? settings.normalizeHost(settings.get().apiHost) : ''),
         apiHostLocked: settings.isApiHostLocked(),
+        dataSource,
+        dataSources: {
+          builtin: { available: settings.apiHostsForSource('builtin', jar.apiHost).length > 0, hosts: settings.apiHostsForSource('builtin', jar.apiHost).length },
+          network: { available: settings.apiHostsForSource('network', jar.apiHost).length > 0, configured: settings.isApiHostLocked() },
+          mixed: { available: settings.apiHostsForSource('mixed', jar.apiHost).length > 0, hosts: settings.apiHostsForSource('mixed', jar.apiHost).length },
+        },
         imageHosts: settings.imageHosts(),
         hasAccessPassword: !!ACCESS_PASSWORD,
+        advanced: {
+          ai: features.aiConfig(),
+          doh: features.getDohState(),
+          localFolders: true,
+          offline: true,
+        },
       });
 
     case '/config/api-host': {
@@ -458,7 +840,7 @@ async function api(req, res, u) {
       if (checkPassword(String(body.password || ''))) {
         res.setHeader(
           'Set-Cookie',
-          `jmw_auth=${authToken()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000`
+          `jmw_auth=${authToken()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${cookieSecurity(req)}`
         );
         return sendJson(res, 200, { ok: true });
       }
@@ -482,7 +864,9 @@ async function api(req, res, u) {
         { name: 'password', value: password },
       ] });
       if (out && out.data) {
-        jar.user = out.data;
+        const safeUser = sessions.sanitizeUser(out.data);
+        if (!safeUser) throw new ApiError('上游返回的用户资料格式异常或过大', 502);
+        jar.user = safeUser;
         sessions.scheduleSave(jar);
       }
       return sendJson(res, 200, out);
@@ -490,7 +874,7 @@ async function api(req, res, u) {
 
     case '/logout':
       sessions.destroyJar(jar.sid);
-      res.setHeader('Set-Cookie', 'jmw_sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+      res.setHeader('Set-Cookie', `jmw_sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${cookieSecurity(req)}`);
       return sendJson(res, 200, { ok: true });
 
     case '/daily':
@@ -570,6 +954,16 @@ async function api(req, res, u) {
       return sendJson(res, 200, await call({ method: 'POST', path: '/comment', form }));
     }
 
+    case '/comment_vote': {
+      const body = await readJsonBody(req);
+      const commentId = String(body.comment_id || '');
+      if (!/^\d+$/.test(commentId)) return sendJson(res, 400, { error: '评论 ID 不合法' });
+      return sendJson(res, 200, await call({ method: 'POST', path: '/comment_vote', form: [
+        { name: 'comment_id', value: commentId },
+        { name: 'vote_type', value: body.vote_type === 'down' ? 'down' : 'up' },
+      ] }));
+    }
+
     case '/like':
       return sendJson(res, 200, await call({ method: 'POST', path: '/like', form: [
         { name: 'id', value: String(q.get('id') || '') },
@@ -580,15 +974,167 @@ async function api(req, res, u) {
         { name: 'aid', value: String(q.get('aid') || '') },
       ] }));
 
-    case '/favorites':
-      return sendJson(res, 200, await call({ path: '/favorite', query: {
+    case '/favorite_folder': {
+      const body = await readJsonBody(req);
+      const type = String(body.type || '');
+      const folderId = String(body.folder_id ?? (type === 'add' ? '0' : ''));
+      const folderName = String(body.folder_name || '').trim().slice(0, 60);
+      const aid = String(body.aid || '');
+      if (!['add', 'edit', 'del', 'move'].includes(type)) {
+        return sendJson(res, 400, { error: '未知收藏夹操作' });
+      }
+      if ((type === 'add' || type === 'edit') && !folderName) {
+        return sendJson(res, 400, { error: '收藏夹名称不能为空' });
+      }
+      if (type !== 'add' && !/^\d{1,20}$/.test(folderId)) {
+        return sendJson(res, 400, { error: '收藏夹 ID 不合法' });
+      }
+      if (type === 'move' && !/^\d{1,12}$/.test(aid)) {
+        return sendJson(res, 400, { error: '漫画 ID 不合法' });
+      }
+      jar.favoriteFolders = Array.isArray(jar.favoriteFolders) ? jar.favoriteFolders : [];
+      jar.favoriteFolderMap = jar.favoriteFolderMap && typeof jar.favoriteFolderMap === 'object' ? jar.favoriteFolderMap : {};
+      const localFolder = jar.favoriteFolders.find((folder) => folder.id === folderId);
+      const localMove = type === 'move' && (
+        !!localFolder || Object.prototype.hasOwnProperty.call(jar.favoriteFolderMap, aid)
+      );
+      const isSessionOperation = (type === 'edit' || type === 'del') ? !!localFolder : localMove;
+      let cloudError = null;
+
+      // 已登录且操作对象不是先前降级创建的本会话收藏夹时，优先写入 JM 账号。
+      // call() 继续使用同一个按 origin 隔离的 cookiesByOrigin jar，绝不跨域复制凭证。
+      if (jar.user && !isSessionOperation) {
+        try {
+          const out = await call({ method: 'POST', path: '/favorite_folder', form: [
+            { name: 'type', value: type },
+            { name: 'folder_id', value: type === 'add' ? '0' : folderId },
+            { name: 'folder_name', value: folderName },
+            { name: 'aid', value: aid },
+          ] });
+          const status = String(out?.data?.status || '').trim().toLowerCase();
+          if (status && !['ok', 'success', 'true', '1'].includes(status)) {
+            throw new ApiError(String(out?.data?.msg || '上游未完成收藏夹操作'), 502);
+          }
+          return sendJson(res, 200, { ...out, ok: true, scope: 'cloud' });
+        } catch (error) {
+          if (requestSignal?.aborted || error?.name === 'AbortError') throw error;
+          cloudError = error;
+        }
+      }
+
+      // 未登录、上游不支持或请求失败时，保留原有会话级实现作为明确降级。
+      if (type === 'add') {
+        if (jar.favoriteFolders.length >= 100) return sendJson(res, 409, { error: '收藏夹数量已达上限（100）' });
+        let id;
+        do {
+          id = `${Date.now()}${String(crypto.randomInt(1_000_000)).padStart(6, '0')}`;
+        } while (jar.favoriteFolders.some((folder) => folder.id === id));
+        jar.favoriteFolders.push({ id, name: folderName });
+      } else if (type === 'edit') {
+        if (!localFolder && !cloudError) return sendJson(res, 404, { error: '收藏夹不存在' });
+        if (!localFolder) {
+          if (jar.favoriteFolders.length >= 100) return sendJson(res, 409, { error: '收藏夹数量已达上限（100）' });
+          jar.favoriteFolders.push({ id: folderId, name: folderName });
+        } else localFolder.name = folderName;
+      } else if (type === 'del') {
+        jar.favoriteFolders = jar.favoriteFolders.filter((x) => x.id !== folderId);
+        for (const [aid, value] of Object.entries(jar.favoriteFolderMap)) if (value === folderId) delete jar.favoriteFolderMap[aid];
+      } else if (type === 'move') {
+        if (folderId !== '0' && !localFolder && !cloudError) return sendJson(res, 404, { error: '收藏夹不存在' });
+        if (folderId !== '0' && !localFolder) {
+          if (jar.favoriteFolders.length >= 100) return sendJson(res, 409, { error: '收藏夹数量已达上限（100）' });
+          jar.favoriteFolders.push({ id: folderId, name: `收藏夹 ${folderId}` });
+        }
+        if (folderId !== '0' && !Object.prototype.hasOwnProperty.call(jar.favoriteFolderMap, aid) &&
+            Object.keys(jar.favoriteFolderMap).length >= 10000) {
+          return sendJson(res, 409, { error: '收藏夹映射数量已达上限' });
+        }
+        if (folderId === '0') delete jar.favoriteFolderMap[aid];
+        else jar.favoriteFolderMap[aid] = folderId;
+      }
+      sessions.scheduleSave(jar);
+      return sendJson(res, 200, {
+        ok: true,
+        scope: 'session',
+        warning: cloudError
+          ? '云端收藏夹操作失败，已仅在本会话应用'
+          : '当前未使用账号云端收藏夹，操作仅在本会话应用',
+        data: { folder_list: [{ id: '0', name: '全部收藏' }, ...jar.favoriteFolders] },
+      });
+    }
+
+    case '/favorites': {
+      const folderId = q.get('folder_id') || '0';
+      const sessionFolders = Array.isArray(jar.favoriteFolders) ? jar.favoriteFolders : [];
+      const isSessionFolder = folderId !== '0' && sessionFolders.some((folder) => folder.id === folderId);
+      const out = await call({ path: '/favorite', query: {
         page: q.get('page') || '1',
         o: q.get('o') || 'mr',
-        folder_id: q.get('folder_id') || '0',
-      } }));
+        // 云端收藏夹直接由上游筛选；仅本会话收藏夹仍取总收藏后在本地分组。
+        folder_id: isSessionFolder ? '0' : folderId,
+      } });
+      if (out && out.data) {
+        const list = Array.isArray(out.data.list) ? out.data.list : [];
+        out.data.source_count = list.length;
+        if (isSessionFolder) out.data.list = list.filter((item) => jar.favoriteFolderMap[String(item.id || item.aid || item.AID || '')] === folderId);
+        // 保留上游真实 folder_list，并附加曾经降级创建的会话收藏夹。
+        const upstreamFolders = out.data.folder_list;
+        if (Array.isArray(upstreamFolders)) {
+          out.data.folder_list = [...upstreamFolders, ...sessionFolders];
+        } else if (upstreamFolders && typeof upstreamFolders === 'object') {
+          out.data.folder_list = { ...upstreamFolders };
+          for (const folder of sessionFolders) out.data.folder_list[folder.id] ??= folder.name;
+        } else {
+          out.data.folder_list = [{ id: '0', name: '全部收藏' }, ...sessionFolders];
+        }
+        out.data.local_folder_map = jar.favoriteFolderMap || {};
+        out.data.session_folder_ids = sessionFolders.map((folder) => folder.id);
+      }
+      out.scope = jar.user ? 'cloud' : 'session';
+      return sendJson(res, 200, out);
+    }
 
-    case '/history':
-      return sendJson(res, 200, await call({ path: '/watch_list', query: { page: q.get('page') || '1' } }));
+    case '/history': {
+      const out = await call({ path: '/watch_list', query: { page: q.get('page') || '1' } });
+      if (out && out.data && Array.isArray(out.data.list)) {
+        out.data.source_count = out.data.list.length;
+        const hidden = new Set(jar.hiddenHistory || []);
+        out.data.list = out.data.list.filter((item) => !hidden.has(String(item.id || item.aid || item.AID || '')));
+      }
+      out.scope = jar.user ? 'cloud' : 'session';
+      return sendJson(res, 200, out);
+    }
+
+    case '/history/delete': {
+      const body = await readJsonBody(req);
+      const id = String(body.id || '');
+      if (!/^\d{1,12}$/.test(id)) return sendJson(res, 400, { error: '历史记录 ID 不合法' });
+      let cloudError = null;
+      if (jar.user) {
+        try {
+          const out = await call({ method: 'POST', path: '/watch_list', form: [
+            { name: 'id', value: id },
+          ] });
+          if (Array.isArray(jar.hiddenHistory) && jar.hiddenHistory.includes(id)) {
+            jar.hiddenHistory = jar.hiddenHistory.filter((value) => value !== id);
+            sessions.scheduleSave(jar);
+          }
+          return sendJson(res, 200, { ...out, ok: true, scope: 'cloud' });
+        } catch (error) {
+          if (requestSignal?.aborted || error?.name === 'AbortError') throw error;
+          cloudError = error;
+        }
+      }
+      jar.hiddenHistory = [...new Set([...(jar.hiddenHistory || []), id])].slice(-5000);
+      sessions.scheduleSave(jar);
+      return sendJson(res, 200, {
+        ok: true,
+        scope: 'session',
+        warning: cloudError
+          ? '云端历史删除失败，已仅在本会话隐藏'
+          : '当前未登录 JM 账号，已仅在本会话隐藏',
+      });
+    }
 
     case '/chapter': {
       const id = q.get('id');
@@ -623,12 +1169,68 @@ async function api(req, res, u) {
       }
       activeImageRequests++;
       try {
-        if (abs) return await proxyImage(res, abs, 30);
-        return await proxyImagePath(res, upath.startsWith('/') ? upath : '/' + upath);
+        if (abs) return await proxyImage(res, abs, 30, requestSignal);
+        return await proxyImagePath(res, upath.startsWith('/') ? upath : '/' + upath, requestSignal);
       } finally {
         activeImageRequests--;
       }
     }
+
+    /* ---- 高级功能 ---- */
+    case '/ai/config':
+      return sendJson(res, 200, features.aiConfig());
+
+    case '/ai/chat': {
+      if (!rateLimit(`ai:${clientIp(req)}`, 30, 5 * 60 * 1000) ||
+          !rateLimit('ai:global', 60, 5 * 60 * 1000)) return sendJson(res, 429, { error: 'AI 请求过于频繁，请稍后重试' });
+      if (activeAiRequests >= MAX_AI_CONCURRENCY) return sendJson(res, 503, { error: 'AI 服务繁忙，请稍后重试' }, { 'Retry-After': '2' });
+      const body = await readJsonBody(req);
+      activeAiRequests++;
+      try {
+        const upstream = await features.requestAiStream(body, requestSignal);
+        features.addLog('info', `AI chat model=${features.aiConfig().model}`);
+        return await proxyEventStream(res, upstream, requestSignal);
+      } finally {
+        activeAiRequests--;
+      }
+    }
+
+    case '/ai/search': {
+      if (!rateLimit(`ai-search:${clientIp(req)}`, 20, 5 * 60 * 1000) ||
+          !rateLimit('ai-search:global', 120, 5 * 60 * 1000)) return sendJson(res, 429, { error: '搜索请求过于频繁，请稍后重试' });
+      if (activeSearchRequests >= MAX_SEARCH_CONCURRENCY) return sendJson(res, 503, { error: '搜索服务繁忙，请稍后重试' }, { 'Retry-After': '2' });
+      const body = await readJsonBody(req);
+      activeSearchRequests++;
+      try {
+        return sendJson(res, 200, await features.searchWeb(body.query, body, requestSignal));
+      } finally {
+        activeSearchRequests--;
+      }
+    }
+
+    case '/doh': {
+      if (req.method === 'GET') return sendJson(res, 200, features.getDohState());
+      const body = await readJsonBody(req);
+      return sendJson(res, 200, features.setDohState(body));
+    }
+
+    case '/doh/test':
+      if (!rateLimit(`doh-test:${clientIp(req)}`, 10, 5 * 60 * 1000)) return sendJson(res, 429, { error: 'DoH 测试过于频繁，请稍后重试' });
+      return sendJson(res, 200, await features.testDoh(
+        q.get('provider') || features.getDohState().current,
+        q.get('host') || 'github.com',
+        requestSignal
+      ));
+
+    case '/logs':
+      if (req.method === 'DELETE') {
+        features.clearLogs();
+        return sendJson(res, 200, { ok: true });
+      }
+      return sendJson(res, 200, { logs: features.getLogs(q.get('limit')) });
+
+    case '/update':
+      return sendJson(res, 200, await features.checkUpdate(requestSignal));
 
     case '/setting': {
       // 远端设置（img_host 等），同时并入图片域名白名单
@@ -670,45 +1272,68 @@ function serveStatic(req, res, u) {
     res.writeHead(403, baseHeaders());
     return res.end('Forbidden');
   }
-  fs.stat(file, (err, st) => {
-    const afterRead = (e2, buf) => {
-      if (e2) {
-        // SPA 回退：非资源请求一律回 index.html
-        if (!path.extname(p)) {
-          return fs.readFile(path.join(PUBLIC_DIR, 'index.html'), (e3, buf2) => {
-            if (e3) {
-              res.writeHead(500, baseHeaders());
-              return res.end('index.html missing');
-            }
-            res.writeHead(200, baseHeaders({
-              'Content-Type': MIME['.html'],
-              'Content-Security-Policy': CSP,
-              'Cache-Control': 'no-cache',
-            }));
-            res.end(buf2);
-          });
+
+  const sendKnownFile = (target, st, isSpaFallback = false) => {
+    if (!st || !st.isFile()) {
+      if (isSpaFallback) {
+        res.writeHead(500, baseHeaders());
+        return res.end('index.html missing');
+      }
+      return fallbackOrNotFound();
+    }
+    const ext = path.extname(target).toLowerCase();
+    const etag = `W/"${st.size}-${st.mtimeMs}"`;
+    if (req.headers['if-none-match'] === etag) {
+      res.writeHead(304, baseHeaders({ ETag: etag }));
+      return res.end();
+    }
+    const headers = baseHeaders({
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      'Cache-Control': 'no-cache',
+      'Content-Length': st.size,
+      ETag: etag,
+    });
+    if (ext === '.html') headers['Content-Security-Policy'] = CSP;
+
+    // HEAD 必须返回与 GET 相同的元数据，但不应为此把整个静态资源读入内存。
+    if (req.method === 'HEAD') {
+      res.writeHead(200, headers);
+      return res.end();
+    }
+    fs.readFile(target, (error, buf) => {
+      if (error) {
+        if (isSpaFallback) {
+          res.writeHead(500, baseHeaders());
+          return res.end('index.html missing');
         }
-        res.writeHead(404, baseHeaders());
-        return res.end('Not Found');
+        return fallbackOrNotFound();
       }
-      // ETag 协商缓存：资源更新即时生效，未变更走 304
-      const etag = `W/"${st.size}-${st.mtimeMs}"`;
-      if (req.headers['if-none-match'] === etag) {
-        res.writeHead(304, baseHeaders({ ETag: etag }));
-        return res.end();
-      }
-      const ext = path.extname(file).toLowerCase();
-      const headers = baseHeaders({
-        'Content-Type': MIME[ext] || 'application/octet-stream',
-        'Cache-Control': 'no-cache',
-      });
-      if (ext === '.html') headers['Content-Security-Policy'] = CSP;
-      headers.ETag = etag;
+      // stat/read 间文件若被原子替换，以实际发送长度为准，避免响应被截断。
+      headers['Content-Length'] = buf.length;
       res.writeHead(200, headers);
       res.end(buf);
-    };
-    if (err) return afterRead(err);
-    fs.readFile(file, afterRead);
+    });
+  };
+
+  const fallbackOrNotFound = () => {
+    // SPA 回退：非资源请求一律回 index.html；回退页也具备完整 HEAD/ETag 语义。
+    if (!path.extname(p)) {
+      const index = path.join(PUBLIC_DIR, 'index.html');
+      return fs.stat(index, (error, st) => {
+        if (error) {
+          res.writeHead(500, baseHeaders());
+          return res.end('index.html missing');
+        }
+        sendKnownFile(index, st, true);
+      });
+    }
+    res.writeHead(404, baseHeaders());
+    return res.end('Not Found');
+  };
+
+  fs.stat(file, (error, st) => {
+    if (error) return fallbackOrNotFound();
+    sendKnownFile(file, st);
   });
 }
 
@@ -725,7 +1350,9 @@ const server = http.createServer(async (req, res) => {
   }
   res.on('finish', () => {
     if (u.pathname.startsWith('/api/') && u.pathname !== '/api/img') {
-      console.log(`[api] ${req.method} ${u.pathname}${u.search} -> ${res.statusCode} (${Date.now() - started}ms)`);
+      const message = `${req.method} ${u.pathname}${u.search} -> ${res.statusCode} (${Date.now() - started}ms)`;
+      console.log(`[api] ${message}`);
+      features.addLog(res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info', message);
     }
   });
 
@@ -744,6 +1371,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (u.pathname === '/api' || u.pathname.startsWith('/api/')) {
+    const clientAbort = bindClientAbort(res);
     try {
       const route = u.pathname.replace(/^\/api/, '');
       const allowed = Object.prototype.hasOwnProperty.call(API_METHODS, route) ? API_METHODS[route] : null;
@@ -754,12 +1382,19 @@ const server = http.createServer(async (req, res) => {
       if (ACCESS_PASSWORD && u.pathname !== '/api/auth' && !checkAccess(req)) {
         return sendJson(res, 401, { error: '需要访问口令', needAuth: true });
       }
-      await api(req, res, u);
+      await api(req, res, u, clientAbort.signal);
     } catch (e) {
+      if (clientAbort.signal.aborted || res.destroyed || isClientDisconnectError(e)) return;
       const status = e instanceof ApiError ? (e.code >= 400 && e.code < 600 ? e.code : 502) : 500;
       if (!(e instanceof ApiError)) console.error('[api] 内部错误:', e);
       if (!res.headersSent) sendJson(res, status, { error: e.message || '服务器内部错误' });
       else res.end();
+    } finally {
+      clientAbort.cleanup();
+      if (req.jmwJar) {
+        sessions.releaseJar(req.jmwJar);
+        req.jmwJar = null;
+      }
     }
     return;
   }
@@ -802,9 +1437,16 @@ module.exports = {
   server,
   startServer,
   API_METHODS,
+  clientIp,
+  requestIsSecure,
+  rateLimit,
+  bindClientAbort,
   validateImageUrl,
   fetchImageResponse,
   readRasterImage,
+  imageCacheControl,
+  sendUpstreamImage,
+  proxyEventStream,
   MAX_IMAGE_BYTES,
   SAFE_RASTER_MIME,
 };

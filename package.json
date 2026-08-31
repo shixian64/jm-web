@@ -1,17 +1,18 @@
 {
   "name": "jm-web",
   "version": "1.0.0",
+  "private": true,
   "description": "JM 漫画自部署网页版（电脑/手机自适应）- 参照 jmcomic-next 与 jm-mobile 客户端协议实现",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "test": "npm run test:unit && npm run test:backend",
-    "test:unit": "node test/photo.test.js",
-    "test:backend": "node test/backend.test.js",
+    "test:unit": "node test/photo.test.js && node test/content-filter.test.js",
+    "test:backend": "node test/backend.test.js && node test/https-fetch.test.js",
     "check": "node test/check.js"
   },
   "engines": {
-    "node": ">=18.14.1"
+    "node": ">=20.0.0"
   },
   "license": "GPL-3.0"
 }

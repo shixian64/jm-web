@@ -1,10 +1,16 @@
 // 应用外壳与路由：顶栏（桌面导航）/ 底部 Tab（手机）/ 各页面挂载
-import { applyTheme } from './store.js';
+import { applyTheme, setting } from './store.js';
 import { api } from './api.js';
 import { h, toast } from './ui.js';
 import { icon } from './icons.js';
 import { homeView, searchView, categoryView, categoryListView, promoteListView, weekView, albumView } from './views.js';
 import { mountReader } from './reader.js';
+import { downloadsView } from './download-view.js';
+import { registerOfflineWorker } from './offline.js';
+import {
+  advancedHubView, blockedTagsView, paletteView, securityView, backupView, personasView,
+  aiView, networkView, logsView, extractCodeView, cacheView, aboutView, installAdvancedRuntime, isLocalAppLocked,
+} from './advanced.js';
 import {
   userView, signinView, favoritesView, watchHistoryView, localHistoryView, myCommentsView, settingsView,
 } from './user.js';
@@ -12,7 +18,11 @@ import {
 applyTheme();
 
 const app = document.getElementById('app');
-const main = h('div', { id: 'main', tabindex: '-1' });
+const main = h('main', { id: 'main', tabindex: '-1' });
+const skipLink = h('a', {
+  class: 'skip-link', href: '#main',
+  onclick: (e) => { e.preventDefault(); main.focus({ preventScroll: false }); },
+}, '跳到主要内容');
 
 /* ---------- 顶栏 ---------- */
 const avatarMini = h('a', { id: 'avatar-mini', href: '#/user', title: '我的', 'aria-label': '打开我的页面' }, icon('user', 16));
@@ -27,22 +37,26 @@ const searchInput = h('input', {
 });
 
 const topbar = h('div', { id: 'topbar' },
-  h('a', { class: 'logo', href: '#/' }, 'JM', h('span', null, 'Web')),
-  h('nav', { class: 'nav-links' },
+  h('a', { class: 'logo', href: '#/', 'aria-label': 'JM Web 首页' },
+    h('span', { class: 'logo-mark' }, 'JM'),
+    h('span', { class: 'logo-word' }, 'Web'),
+  ),
+  h('nav', { class: 'nav-links', 'aria-label': '主导航' },
     navLink('#/', '首页'),
     navLink('#/category', '分类'),
     navLink('#/week', '每周必看'),
     navLink('#/favorites', '收藏'),
     navLink('#/user', '我的'),
   ),
-  h('div', { class: 'top-search' }, searchInput),
+  h('div', { class: 'top-search' }, h('span', { class: 'search-leading', 'aria-hidden': 'true' }, icon('search', 17)), searchInput),
   h('div', { class: 'spacer' }),
+  h('button', { class: 'icon-btn mobile-search', title: '搜索', 'aria-label': '打开搜索', onclick: () => { location.hash = '#/search'; } }, icon('search', 19)),
   h('button', { class: 'icon-btn', title: '设置', 'aria-label': '打开设置', onclick: () => { location.hash = '#/settings'; } }, icon('settings', 20)),
   avatarMini,
 );
 
 /* ---------- 底部 Tab（手机） ---------- */
-const tabbar = h('nav', { id: 'tabbar' },
+const tabbar = h('nav', { id: 'tabbar', 'aria-label': '移动导航' },
   tab('#/', 'house', '首页'),
   tab('#/category', 'layout-grid', '分类'),
   tab('#/week', 'calendar-days', '每周'),
@@ -52,30 +66,53 @@ const tabbar = h('nav', { id: 'tabbar' },
 /* ---------- 路由 ---------- */
 const routes = [
   { re: /^\/$/, view: (r, _m, _q, ctx) => homeView(r, ctx) },
-  { re: /^\/search/, view: (r, _m, q, ctx) => searchView(r, q, ctx) },
-  { re: /^\/category\/list/, view: (r, _m, q, ctx) => categoryListView(r, q, ctx) },
-  { re: /^\/promote\/list/, view: (r, _m, q, ctx) => promoteListView(r, q, ctx) },
-  { re: /^\/category/, view: (r, _m, _q, ctx) => categoryView(r, ctx) },
-  { re: /^\/week/, view: (r, _m, q, ctx) => weekView(r, q, ctx) },
-  { re: /^\/album\/(\d+)/, view: (r, m, _q, ctx) => albumView(r, m[1], ctx) },
+  { re: /^\/search\/?$/, view: (r, _m, q, ctx) => searchView(r, q, ctx) },
+  { re: /^\/category\/list\/?$/, view: (r, _m, q, ctx) => categoryListView(r, q, ctx) },
+  { re: /^\/promote\/list\/?$/, view: (r, _m, q, ctx) => promoteListView(r, q, ctx) },
+  { re: /^\/category\/?$/, view: (r, _m, _q, ctx) => categoryView(r, ctx) },
+  { re: /^\/week\/?$/, view: (r, _m, q, ctx) => weekView(r, q, ctx) },
+  { re: /^\/album\/(\d+)\/?$/, view: (r, m, _q, ctx) => albumView(r, m[1], ctx) },
+  { re: /^\/downloads\/?$/, view: (r) => downloadsView(r) },
+  { re: /^\/offline\/(\d+)\/(\d+)\/?$/, view: (r, m, q) => {
+    const params = new URLSearchParams(q);
+    params.set('aid', m[1]);
+    const inst = mountReader(r, m[2], params, { offline: true });
+    return () => inst && inst.destroy();
+  } },
   {
-    re: /^\/read\/(\d+)/,
+    re: /^\/read\/(\d+)\/?$/,
     view: (r, m, q) => {
       const inst = mountReader(r, m[1], q);
       return () => inst && inst.destroy();
     },
   },
-  { re: /^\/user$/, view: (r, _m, _q, ctx) => userView(r, ctx) },
-  { re: /^\/signin/, view: (r, _m, _q, ctx) => signinView(r, ctx) },
-  { re: /^\/favorites/, view: (r, _m, q, ctx) => favoritesView(r, q, ctx) },
-  { re: /^\/watch-history/, view: (r, _m, _q, ctx) => watchHistoryView(r, ctx) },
-  { re: /^\/local-history/, view: (r, _m, _q, ctx) => localHistoryView(r, ctx) },
-  { re: /^\/my-comments/, view: (r, _m, q, ctx) => myCommentsView(r, q, ctx) },
-  { re: /^\/settings/, view: (r, _m, _q, ctx) => settingsView(r, ctx) },
+  { re: /^\/user\/?$/, view: (r, _m, _q, ctx) => userView(r, ctx) },
+  { re: /^\/signin\/?$/, view: (r, _m, _q, ctx) => signinView(r, ctx) },
+  { re: /^\/favorites\/?$/, view: (r, _m, q, ctx) => favoritesView(r, q, ctx) },
+  { re: /^\/watch-history\/?$/, view: (r, _m, _q, ctx) => watchHistoryView(r, ctx) },
+  { re: /^\/local-history\/?$/, view: (r, _m, _q, ctx) => localHistoryView(r, ctx) },
+  { re: /^\/my-comments\/?$/, view: (r, _m, q, ctx) => myCommentsView(r, q, ctx) },
+  { re: /^\/advanced\/?$/, view: (r) => advancedHubView(r) },
+  { re: /^\/blocked-tags\/?$/, view: (r) => blockedTagsView(r) },
+  { re: /^\/palette\/?$/, view: (r) => paletteView(r) },
+  { re: /^\/security\/?$/, view: (r) => securityView(r) },
+  { re: /^\/backup\/?$/, view: (r) => backupView(r) },
+  { re: /^\/personas\/?$/, view: (r) => personasView(r) },
+  { re: /^\/ai\/?$/, view: (r, m, q, ctx) => aiView(r, m, q, ctx) },
+  { re: /^\/network\/?$/, view: (r, m, q, ctx) => networkView(r, m, q, ctx) },
+  { re: /^\/logs\/?$/, view: (r, m, q, ctx) => logsView(r, m, q, ctx) },
+  { re: /^\/extract\/?$/, view: (r) => extractCodeView(r) },
+  { re: /^\/cache\/?$/, view: (r) => cacheView(r) },
+  { re: /^\/about\/?$/, view: (r, m, q, ctx) => aboutView(r, m, q, ctx) },
+  { re: /^\/settings\/?$/, view: (r, _m, _q, ctx) => settingsView(r, ctx) },
 ];
 
 let currentCleanup = null;
 let renderGeneration = 0;
+
+function mountShell() {
+  app.replaceChildren(skipLink, topbar, main, tabbar);
+}
 
 function navLink(href, label) {
   return h('a', { href, dataset: { nav: href } }, label);
@@ -90,6 +127,7 @@ function render() {
   const generation = ++renderGeneration;
   if (typeof currentCleanup === 'function') currentCleanup();
   currentCleanup = null;
+  document.body.classList.remove('no-tab');
 
   const hash = location.hash || '#/';
   const path = hash.replace(/^#/, '').split('?')[0] || '/';
@@ -100,9 +138,10 @@ function render() {
     const m = path.match(route.re);
     if (m) {
       main.replaceChildren();
-      app.replaceChildren(topbar, main, tabbar);
+      mountShell();
       // 阅读器为全屏固定层，隐藏底部 Tab
-      document.body.classList.toggle('no-tab', route.re.source.includes('read'));
+      const fullScreenView = route.re.source.includes('read') || path.startsWith('/offline/');
+      document.body.classList.toggle('no-tab', fullScreenView);
       const controller = new AbortController();
       let viewCleanup = null;
       let disposed = false;
@@ -142,7 +181,7 @@ function render() {
         main.replaceChildren(h('div', { class: 'error-box' }, e.message || '页面加载失败'));
       }
       highlightNav(path);
-      if (!route.re.source.includes('read')) {
+      if (!fullScreenView) {
         requestAnimationFrame(() => {
           if (!ctx.isActive()) return;
           window.scrollTo({ top: 0, behavior: 'auto' });
@@ -157,7 +196,7 @@ function render() {
     h('div', { class: 'empty', style: 'padding-top:30vh' },
       h('div', { class: 'big' }, icon('search', 42)), '页面不存在',
       h('p', null, h('a', { href: '#/', style: 'color:var(--primary)' }, '返回首页'))));
-  app.replaceChildren(topbar, main, tabbar);
+  mountShell();
   highlightNav(path);
 }
 
@@ -165,18 +204,29 @@ function highlightNav(path) {
   const active = path === '/' ? '#/'
     : path.startsWith('/category') ? '#/category'
     : path.startsWith('/week') ? '#/week'
-    : path.startsWith('/user') || path.startsWith('/favorites') || path.startsWith('/settings')
+    : (path.startsWith('/user') || path.startsWith('/favorites') || path.startsWith('/settings')
       || path.startsWith('/signin') || path.startsWith('/watch-history')
-      || path.startsWith('/my-comments') || path.startsWith('/local-history') ? '#/user'
+      || path.startsWith('/my-comments') || path.startsWith('/local-history') || path.startsWith('/downloads')
+      || path.startsWith('/advanced') || path.startsWith('/blocked-tags') || path.startsWith('/palette')
+      || path.startsWith('/security') || path.startsWith('/backup') || path.startsWith('/personas')
+      || path.startsWith('/ai') || path.startsWith('/network') || path.startsWith('/logs')
+      || path.startsWith('/extract') || path.startsWith('/cache') || path.startsWith('/about')) ? '#/user'
     : null;
   document.querySelectorAll('#topbar .nav-links a, #tabbar a').forEach((a) => {
-    a.classList.toggle('active', a.dataset.nav === active);
+    const isActive = a.dataset.nav === active;
+    a.classList.toggle('active', isActive);
+    if (isActive) a.setAttribute('aria-current', 'page');
+    else a.removeAttribute('aria-current');
   });
 }
 
 /* ---------- 启动 ---------- */
 async function boot() {
-  app.replaceChildren(topbar, main, tabbar);
+  mountShell();
+  installAdvancedRuntime();
+  if (isLocalAppLocked()) {
+    await new Promise((resolve) => window.addEventListener('jmw-local-unlocked', resolve, { once: true }));
+  }
   render();
 
   window.addEventListener('hashchange', render);
@@ -190,6 +240,8 @@ async function boot() {
       passwordGate(() => {
         render();
         refreshAvatar();
+        installAdvancedRuntime();
+        registerOfflineWorker().catch((error) => console.warn('[offline] Service Worker 注册失败:', error.message));
       });
       return;
     }
@@ -198,6 +250,8 @@ async function boot() {
   }
 
   refreshAvatar();
+  installAdvancedRuntime();
+  registerOfflineWorker().catch((error) => console.warn('[offline] Service Worker 注册失败:', error.message));
 }
 
 let avatarRefreshSeq = 0;
@@ -210,7 +264,11 @@ async function refreshAvatar() {
       const src = me.photo
         ? (/^https?:/i.test(me.photo) ? `/api/img?u=${encodeURIComponent(me.photo)}` : `/api/img?path=${encodeURIComponent(me.photo.startsWith('/') ? me.photo : '/' + me.photo)}`)
         : '';
-      avatarMini.replaceChildren(src ? h('img', { src }) : (me.username || '友').slice(0, 1));
+      const fallback = (me.username || '友').slice(0, 1);
+      if (src) {
+        const avatar = h('img', { src, alt: '', onerror: () => avatarMini.replaceChildren(fallback) });
+        avatarMini.replaceChildren(avatar);
+      } else avatarMini.replaceChildren(fallback);
     } else avatarMini.replaceChildren(icon('user', 16));
   } catch (_) {}
 }

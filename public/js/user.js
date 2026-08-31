@@ -2,10 +2,12 @@
 import { api, imgSrc } from './api.js';
 import { h, toast, comicCard, infiniteList, errorBox, loadingBox } from './ui.js';
 import {
-  setting, updateSetting, getLocalHistory, clearLocalHistory,
+  setting, updateSetting, getLocalHistory, clearLocalHistory, removeLocalHistory,
 } from './store.js';
 import { fmt, fmtTime } from './views.js';
 import { icon } from './icons.js';
+import { filterComics } from './content-filter.js';
+import { chooseFolder, folderEntries } from './content-actions.js';
 
 function isAbort(e) { return !!(e && e.name === 'AbortError'); }
 function isInactive(ctx) {
@@ -15,7 +17,7 @@ function isInactive(ctx) {
 /* ============================== 我的 / 登录 ============================== */
 
 export async function userView(root, ctx) {
-  const page = h('div', { class: 'page' });
+  const page = h('div', { class: 'page user-page' });
   root.append(page);
   await refreshUserPage(page, ctx);
 }
@@ -41,7 +43,7 @@ function renderLogin(page, ctx) {
   const submit = h('button', { class: 'btn primary block', type: 'submit' }, '登 录');
 
   const form = h('form', {
-    class: 'card', style: 'max-width:380px;margin:8vh auto 0;padding:26px',
+    class: 'card login-panel', style: 'max-width:380px;margin:8vh auto 0;padding:26px',
     onsubmit: async (e) => {
       e.preventDefault();
       if (!username.value.trim() || !password.value) return toast('请输入用户名和密码');
@@ -72,7 +74,11 @@ function renderLogin(page, ctx) {
   );
 
   page.replaceChildren(
-    h('div', { class: 'empty', style: 'padding-top:8vh' }, h('div', { class: 'big' }, icon('lock', 40)), '登录后可同步收藏与阅读记录'),
+    h('div', { class: 'empty login-intro', style: 'padding-top:8vh' },
+      h('div', { class: 'big' }, icon('lock', 40)),
+      h('h1', null, '你的阅读空间'),
+      h('p', null, '登录后可同步收藏与阅读记录'),
+    ),
     form,
   );
 }
@@ -81,15 +87,22 @@ function renderProfile(page, me, ctx) {
   const avatarSrc = me.photo
     ? (/^https?:/i.test(me.photo) ? `/api/img?u=${encodeURIComponent(me.photo)}` : `/api/img?path=${encodeURIComponent(me.photo.startsWith('/') ? me.photo : '/' + me.photo)}`)
     : '';
+  const avatarFallback = (me.username || '友').slice(0, 1);
+  const avatar = h('div', { class: 'avatar' }, avatarFallback);
+  if (avatarSrc) {
+    const image = h('img', { src: avatarSrc, alt: '', onerror: () => avatar.replaceChildren(avatarFallback) });
+    avatar.replaceChildren(image);
+  }
   const exp = Number(me.exp) || 0;
   const next = Number(me.nextLevelExp) || 1;
   const pct = Math.min(100, Math.round((Number(me.expPercent) || (exp / next) * 100)));
 
   page.replaceChildren(
-    h('div', { class: 'card' },
+    h('div', { class: 'card profile-card' },
       h('div', { class: 'profile-head' },
-        h('div', { class: 'avatar' }, avatarSrc ? h('img', { src: avatarSrc }) : (me.username || '友').slice(0, 1)),
+        avatar,
         h('div', { style: 'flex:1;min-width:0' },
+          h('div', { class: 'profile-kicker' }, 'JM Web 会员'),
           h('div', { class: 'name' }, me.username || `用户 ${me.uid}`),
           h('div', { class: 'sub' }, `${me.level_name || ''} Lv.${me.level || 1}`,
             h('span', { class: 'ico-t', style: 'margin-left:8px' }, icon('coins', 13), ` ${me.coin || 0} 金币`)),
@@ -109,6 +122,9 @@ function renderProfile(page, me, ctx) {
       menuItem('history', '阅读历史（云端）', '#/watch-history'),
       menuItem('smartphone', '本地阅读记录', '#/local-history'),
       menuItem('message-square', '我的评论', '#/my-comments'),
+      menuItem('inbox', '下载与离线缓存', '#/downloads'),
+      setting.showAiEntry ? menuItem('message-square', 'AI 对话', '#/ai') : null,
+      menuItem('layout-grid', '完整功能中心', '#/advanced'),
       menuItem('settings', '设置', '#/settings'),
     ),
     h('button', {
@@ -154,7 +170,7 @@ function menuItem(ic, label, href) {
 /* ============================== 签到 ============================== */
 
 export function signinView(root, ctx) {
-  const page = h('div', { class: 'page', style: 'max-width:560px' });
+  const page = h('div', { class: 'page signin-page', style: 'max-width:560px' });
   root.append(page);
   let refreshSeq = 0;
 
@@ -184,6 +200,7 @@ export function signinView(root, ctx) {
 
     const flat = (data.record || []).flat();
     const todayIdx = Number(data.currentProgress) || 0;
+    const isTodaySigned = flat[new Date().getDate() - 1]?.signed === true;
     const grid = h('div', { class: 'sign-grid' });
     flat.forEach((d, i) => {
       grid.append(h('div', { class: 'd' + (d.signed ? ' signed' : '') + (d.bonus ? ' bonus' : '') },
@@ -193,8 +210,9 @@ export function signinView(root, ctx) {
     });
 
     const btn = h('button', {
-      class: 'btn primary block', type: 'button',
+      class: 'btn primary block', type: 'button', disabled: isTodaySigned,
       onclick: async () => {
+        if (isTodaySigned) return;
         btn.disabled = true;
         btn.textContent = '签到中…';
         try {
@@ -210,7 +228,7 @@ export function signinView(root, ctx) {
           }
         }
       },
-    }, '立即签到');
+    }, isTodaySigned ? '今日已签到' : '立即签到');
 
     page.replaceChildren(
       h('div', { class: 'list-head' }, h('h2', null, '每日签到')),
@@ -232,19 +250,262 @@ const FAV_ORDERS = [['mr', '收藏时间'], ['mp', '更新时间']];
 
 export function favoritesView(root, params) {
   const o = params.get('o') || 'mr';
-  const page = h('div', { class: 'page' });
+  const folderId = params.get('folder') || params.get('folder_id') || '0';
+  const page = h('div', { class: 'page collect-page' });
+  const scopeHint = h('div', { class: 'hint', style: 'margin:0 2px 8px' },
+    '登录后优先管理 JM 账号云端收藏夹；云端不可用时会明确降级为仅本会话。');
+  const folderWrap = h('div', { class: 'chips', style: 'margin-bottom:4px' });
+  const localSearch = h('input', {
+    class: 'input', type: 'search', placeholder: '按名称、作者或标签筛选收藏…',
+    style: 'margin:8px 0 10px',
+  });
+  const filterPanel = h('div', { class: 'card favorite-filter-panel', style: 'padding:12px;margin-bottom:10px' });
+  const manageBar = h('div', { class: 'action-bar', style: 'margin:4px 0 10px' });
+  const selectionBar = h('div', { class: 'card', style: 'padding:10px 12px;margin-bottom:10px;display:none;align-items:center;gap:8px;flex-wrap:wrap' });
+  const selected = new Set();
+  const cards = new Map();
+  const selectedTags = new Set();
+  const selectedAuthors = new Set();
+  const tagCounts = new Map();
+  const authorCounts = new Map();
+  let filterLogic = 'and';
+  let list;
+  let facetRenderQueued = false;
+  let folders = [['0', '全部']];
+  let sessionFolderIds = new Set();
+
   page.append(
     h('div', { class: 'list-head' }, h('h2', null, '我的收藏')),
+    scopeHint,
     h('div', { class: 'chips' }, FAV_ORDERS.map(([v, l]) =>
-      h('a', { class: 'chip' + (v === o ? ' active' : ''), href: `#/favorites?o=${v}` }, l))),
+      h('a', { class: 'chip' + (v === o ? ' active' : ''), href: `#/favorites?o=${v}&folder=${encodeURIComponent(folderId)}` }, l))),
+    folderWrap,
+    manageBar,
+    localSearch,
+    filterPanel,
+    selectionBar,
   );
   root.append(page);
-  const list = infiniteList(async (p, signal) => {
-    const res = await api.favorites(o, p, 0, signal);
+
+  function refreshRoute(nextFolder = folderId) {
+    location.hash = `#/favorites?o=${encodeURIComponent(o)}&folder=${encodeURIComponent(nextFolder)}&_r=${Date.now()}`;
+  }
+
+  function renderFolders() {
+    folderWrap.replaceChildren(...folders.map(([id, name]) => h('a', {
+      class: 'chip' + (String(id) === String(folderId) ? ' active' : ''),
+      href: `#/favorites?o=${encodeURIComponent(o)}&folder=${encodeURIComponent(id)}`,
+    }, sessionFolderIds.has(String(id)) ? `${name}（本会话）` : name)));
+    const currentName = folders.find(([id]) => id === String(folderId))?.[1] || '收藏夹';
+    const create = h('button', {
+      class: 'btn', type: 'button',
+      onclick: async () => {
+        const name = window.prompt('新收藏夹名称');
+        if (!name || !name.trim()) return;
+        try {
+          const result = await api.favoriteFolder('add', '0', name.trim(), '');
+          toast(result?.scope === 'cloud' ? '云端收藏夹已创建' : '收藏夹已创建（仅本会话）');
+          refreshRoute('0');
+        } catch (e) { if (!isAbort(e)) toast(e.message); }
+      },
+    }, '＋ 新建收藏夹');
+    const rename = h('button', {
+      class: 'btn', type: 'button', disabled: folderId === '0',
+      onclick: async () => {
+        const name = window.prompt('重命名收藏夹', currentName);
+        if (!name || !name.trim() || name.trim() === currentName) return;
+        try {
+          const result = await api.favoriteFolder('edit', folderId, name.trim(), '');
+          toast(result?.scope === 'cloud' ? '云端收藏夹已重命名' : '收藏夹已重命名（仅本会话）');
+          refreshRoute();
+        } catch (e) { if (!isAbort(e)) toast(e.message); }
+      },
+    }, '重命名');
+    const remove = h('button', {
+      class: 'btn', type: 'button', disabled: folderId === '0',
+      onclick: async () => {
+        if (!window.confirm(`删除“${currentName}”？其中漫画不会从总收藏中移除。`)) return;
+        try {
+          const result = await api.favoriteFolder('del', folderId, '', '');
+          toast(result?.scope === 'cloud' ? '云端收藏夹已删除' : '收藏夹已删除（仅本会话）');
+          refreshRoute('0');
+        } catch (e) { if (!isAbort(e)) toast(e.message); }
+      },
+    }, '删除收藏夹');
+    manageBar.replaceChildren(create, rename, remove);
+  }
+
+  function updateSelectionBar() {
+    if (!selected.size) {
+      selectionBar.style.display = 'none';
+      selectionBar.replaceChildren();
+      return;
+    }
+    selectionBar.style.display = 'flex';
+    const move = h('button', {
+      class: 'btn primary', type: 'button',
+      onclick: async () => {
+        const target = await chooseFolder(folders, `移动 ${selected.size} 项到…`, folderId);
+        if (!target) return;
+        move.disabled = true;
+        let success = 0;
+        let cloud = 0;
+        let session = 0;
+        for (const id of [...selected]) {
+          try {
+            const result = await api.favoriteFolder('move', target[0], '', id);
+            if (result?.scope === 'cloud') cloud++; else session++;
+            success++;
+          }
+          catch (_) { /* 汇总提示，继续处理其他项 */ }
+        }
+        const scopeText = cloud && session
+          ? `（云端 ${cloud}，仅本会话 ${session}）`
+          : (cloud ? '（已同步云端）' : '（仅本会话）');
+        toast(`已移动 ${success}/${selected.size} 项到 ${target[1]}${scopeText}`);
+        if (folderId !== '0') {
+          [...selected].forEach((id) => cards.get(id)?.remove());
+        }
+        selected.clear();
+        updateSelectionBar();
+      },
+    }, '移动到收藏夹');
+    const unfavorite = h('button', {
+      class: 'btn', type: 'button',
+      onclick: async () => {
+        if (!window.confirm(`取消收藏选中的 ${selected.size} 项？`)) return;
+        unfavorite.disabled = true;
+        let success = 0;
+        for (const id of [...selected]) {
+          try {
+            await api.favorite(id);
+            cards.get(id)?.remove();
+            cards.delete(id);
+            success++;
+          } catch (_) { /* 汇总提示 */ }
+        }
+        selected.clear();
+        toast(`已取消收藏 ${success} 项`);
+        updateSelectionBar();
+      },
+    }, '取消收藏');
+    selectionBar.replaceChildren(h('strong', { style: 'flex:1;font-size:13px' }, `已选择 ${selected.size} 项`), move, unfavorite,
+      h('button', {
+        class: 'btn', type: 'button',
+        onclick: () => {
+          selected.clear();
+          cards.forEach((card) => { const box = card.querySelector('input[data-select]'); if (box) box.checked = false; });
+          updateSelectionBar();
+        },
+      }, '取消选择'));
+  }
+
+  function filterCards() {
+    const query = localSearch.value.trim().toLocaleLowerCase();
+    cards.forEach((card) => {
+      const meta = card._favoriteMeta || { tags: [], authors: [] };
+      const chosen = [...selectedTags].map((value) => meta.tags.includes(value))
+        .concat([...selectedAuthors].map((value) => meta.authors.includes(value)));
+      const facetMatch = !chosen.length || (filterLogic === 'and' ? chosen.every(Boolean) : chosen.some(Boolean));
+      card.hidden = !(facetMatch && (!query || card.dataset.search.includes(query)));
+    });
+  }
+
+  function facetChips(counts, selected, emptyText) {
+    const rows = [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'zh-CN'));
+    if (!rows.length) return h('span', { class: 'hint' }, emptyText);
+    return rows.map(([value, count]) => h('button', {
+      class: `chip${selected.has(value) ? ' active' : ''}`, type: 'button',
+      onclick: () => { if (selected.has(value)) selected.delete(value); else selected.add(value); renderFacets(); filterCards(); },
+    }, `${value} (${count})`));
+  }
+
+  function renderFacets() {
+    facetRenderQueued = false;
+    const logic = h('select', { class: 'input', style: 'width:auto;min-width:100px' },
+      h('option', { value: 'and', selected: filterLogic === 'and' }, '全部满足'),
+      h('option', { value: 'or', selected: filterLogic === 'or' }, '任一满足'));
+    logic.onchange = () => { filterLogic = logic.value; filterCards(); };
+    filterPanel.replaceChildren(
+      h('div', { class: 'setting-row' }, h('strong', null, '收藏高级筛选'),
+        h('div', { style: 'display:flex;gap:7px;flex-wrap:wrap' }, logic,
+          h('button', { class: 'btn', type: 'button', onclick: async (event) => {
+            const button = event.currentTarget; button.disabled = true; button.textContent = '正在加载全部收藏…';
+            try { await list?.loadAll(500); button.textContent = '已加载完整收藏'; }
+            catch (_) { button.textContent = '加载全部后筛选'; }
+            finally { button.disabled = false; renderFacets(); filterCards(); }
+          } }, '加载全部后筛选'),
+          h('button', { class: 'btn ghost', type: 'button', onclick: () => {
+            selectedTags.clear(); selectedAuthors.clear(); localSearch.value = ''; renderFacets(); filterCards();
+          } }, '重置'))),
+      h('div', { class: 'hint', style: 'margin:8px 0 5px' }, '标签（可多选）'),
+      h('div', { class: 'chips favorite-facet-chips' }, facetChips(tagCounts, selectedTags, '加载收藏后显示标签计数')),
+      h('div', { class: 'hint', style: 'margin:8px 0 5px' }, '作者（可多选）'),
+      h('div', { class: 'chips favorite-facet-chips' }, facetChips(authorCounts, selectedAuthors, '加载收藏后显示作者计数')),
+      h('div', { class: 'hint' }, '滚动时持续纳入新页；点击“加载全部后筛选”可覆盖整个收藏库。'));
+  }
+
+  function scheduleFacetRender() {
+    if (facetRenderQueued) return;
+    facetRenderQueued = true;
+    queueMicrotask(renderFacets);
+  }
+
+  function decorateFavorite(item) {
+    const id = String(item.id ?? item.aid ?? item.AID ?? '');
+    const card = comicCard(item);
+    card.dataset.favoriteCard = '1';
+    const authors = (Array.isArray(item.author) ? item.author : [item.author]).map((x) => String(x || '').trim()).filter(Boolean);
+    const tags = (Array.isArray(item.tags) ? item.tags : []).map((x) => String(x || '').trim()).filter(Boolean);
+    card.dataset.search = [item.name, ...authors, ...tags].filter(Boolean).join(' ').toLocaleLowerCase();
+    card._favoriteMeta = { authors, tags };
+    card.style.position = 'relative';
+    const checkbox = h('input', {
+      type: 'checkbox', 'data-select': '1', 'aria-label': `选择${item.name || id}`,
+      style: 'position:absolute;z-index:3;left:8px;top:8px;width:20px;height:20px;accent-color:var(--primary)',
+      onclick: (e) => e.stopPropagation(),
+      onkeydown: (e) => e.stopPropagation(),
+      onchange: (e) => {
+        if (e.target.checked) selected.add(id); else selected.delete(id);
+        updateSelectionBar();
+      },
+    });
+    card.append(checkbox);
+    if (id && !cards.has(id)) {
+      cards.set(id, card);
+      tags.forEach((value) => tagCounts.set(value, (tagCounts.get(value) || 0) + 1));
+      authors.forEach((value) => authorCounts.set(value, (authorCounts.get(value) || 0) + 1));
+      scheduleFacetRender();
+    }
+    filterCards();
+    return card;
+  }
+
+  localSearch.addEventListener('input', () => {
+    filterCards();
+  });
+  renderFacets();
+  renderFolders();
+  let foldersHydrated = false;
+  list = infiniteList(async (p, signal) => {
+    const res = await api.favorites(o, p, folderId, signal);
     const d = res.data || {};
+    if (!foldersHydrated) {
+      foldersHydrated = true;
+      sessionFolderIds = new Set((d.session_folder_ids || []).map(String));
+      folders = folderEntries(d.folder_list).map(([id, name]) => [id, id === '0' ? '全部' : name]);
+      scopeHint.textContent = res.scope === 'cloud'
+        ? (sessionFolderIds.size
+          ? '已连接 JM 账号云端收藏夹；标注“本会话”的分组来自云端失败后的本地降级。'
+          : '已连接 JM 账号云端收藏夹，收藏夹管理会同步到账号。')
+        : '当前收藏夹分组仅保存在本会话；登录且云端接口可用后会优先同步账号。';
+      renderFolders();
+    }
+    const source = filterComics(d.list || [], setting.blockedTagList || []);
     return {
-      items: (d.list || []).map(comicCard),
-      hasMore: (d.list || []).length > 0 && Number(d.total) > p * 20,
+      items: source.map(decorateFavorite),
+      // 本地收藏夹映射按上游分页后过滤，当前页为空不代表后续页也为空。
+      hasMore: Number(d.total) > p * 20 || Number(d.source_count) > 0,
     };
   });
   page.append(list.root);
@@ -254,15 +515,83 @@ export function favoritesView(root, params) {
 /* ============================== 云端阅读历史 ============================== */
 
 export function watchHistoryView(root) {
-  const page = h('div', { class: 'page' });
-  page.append(h('div', { class: 'list-head' }, h('h2', null, '阅读历史（云端）')));
+  const page = h('div', { class: 'page history-page' });
+  const loaded = new Map();
+  const scopeHint = h('div', { class: 'hint', style: 'margin:0 2px 8px' },
+    '登录后优先删除 JM 账号云端历史；云端不可用时只会在本会话隐藏。');
+  const clearLoaded = h('button', {
+    class: 'btn', type: 'button', disabled: true,
+    onclick: async () => {
+      if (!loaded.size || !window.confirm(`删除当前已加载的 ${loaded.size} 条账号历史？云端失败时将仅在本会话隐藏。`)) return;
+      clearLoaded.disabled = true;
+      let success = 0;
+      let cloud = 0;
+      let session = 0;
+      for (const [id, card] of [...loaded]) {
+        try {
+          const result = await api.deleteHistory(id);
+          if (result?.scope === 'cloud') cloud++; else session++;
+          card.remove();
+          loaded.delete(id);
+          success++;
+        } catch (_) { /* 继续删除其余项 */ }
+      }
+      const scopeText = cloud && session
+        ? `（云端 ${cloud}，仅本会话隐藏 ${session}）`
+        : (cloud ? '（已从云端删除）' : '（仅本会话隐藏）');
+      toast(`已处理 ${success} 条历史${scopeText}`);
+      clearLoaded.disabled = loaded.size === 0;
+    },
+  }, '清空已加载');
+  page.append(
+    h('div', { class: 'list-head' }, h('h2', null, '账号阅读历史')),
+    scopeHint,
+    h('div', { class: 'action-bar', style: 'margin:2px 0 10px' }, clearLoaded),
+  );
   root.append(page);
+
+  function decorateHistory(item) {
+    const id = String(item.id ?? item.aid ?? item.AID ?? '');
+    const card = comicCard(item);
+    card.style.position = 'relative';
+    const remove = h('button', {
+      class: 'chip', type: 'button', title: '删除这条历史', 'aria-label': `删除${item.name || id}的历史`,
+      style: 'position:absolute;z-index:3;right:7px;top:7px;padding:5px 7px;background:var(--card)',
+      onclick: async (e) => {
+        e.stopPropagation();
+        if (!window.confirm(`删除“${item.name || id}”的账号阅读历史？云端失败时将仅在本会话隐藏。`)) return;
+        remove.disabled = true;
+        try {
+          const result = await api.deleteHistory(id);
+          card.remove();
+          loaded.delete(id);
+          clearLoaded.disabled = loaded.size === 0;
+          toast(result?.scope === 'cloud' ? '历史记录已从云端删除' : '历史记录仅在本会话隐藏');
+        } catch (err) {
+          remove.disabled = false;
+          if (!isAbort(err)) toast(err.message);
+        }
+      },
+      onkeydown: (e) => e.stopPropagation(),
+    }, icon('trash-2', 14));
+    card.append(remove);
+    if (id) loaded.set(id, card);
+    clearLoaded.disabled = loaded.size === 0;
+    return card;
+  }
+
   const list = infiniteList(async (p, signal) => {
     const res = await api.history(p, signal);
     const d = res.data || {};
+    if (p === 1) {
+      scopeHint.textContent = res.scope === 'cloud'
+        ? '正在显示 JM 账号云端历史；删除成功时会同步到账号。'
+        : '当前未连接账号云端；删除操作只会在本会话隐藏记录。';
+    }
+    const source = filterComics(d.list || [], setting.blockedTagList || []);
     return {
-      items: (d.list || []).map(comicCard),
-      hasMore: (d.list || []).length > 0,
+      items: source.map(decorateHistory),
+      hasMore: Number(d.total) > p * 20 || Number(d.source_count) > 0,
     };
   });
   page.append(list.root);
@@ -272,7 +601,7 @@ export function watchHistoryView(root) {
 /* ============================== 本地阅读记录 ============================== */
 
 export function localHistoryView(root) {
-  const page = h('div', { class: 'page' });
+  const page = h('div', { class: 'page history-page' });
   root.append(page);
 
   const render = () => {
@@ -295,7 +624,7 @@ export function localHistoryView(root) {
       const photoId = String(it.photoId || it.aid || '');
       const aid = String(it.aid || '');
       const canOpen = /^\d+$/.test(photoId) && /^\d+$/.test(aid);
-      const open = () => { if (canOpen) location.hash = `#/read/${photoId}?aid=${aid}`; };
+      const open = () => { if (canOpen) location.hash = it.offline ? `#/offline/${aid}/${photoId}` : `#/read/${photoId}?aid=${aid}`; };
       const item = h('div', {
         class: 'comment-item',
         style: canOpen ? 'cursor:pointer' : '',
@@ -308,6 +637,10 @@ export function localHistoryView(root) {
           h('div', { class: 'foot' },
             it.total ? `读到第 ${Number(it.page || 0) + 1} / ${it.total} 页 · ` : '',
             fmtTime(it.ts))),
+        h('button', {
+          class: 'icon-btn', type: 'button', title: '删除这条记录', 'aria-label': `删除${it.name || '漫画'}的本地阅读记录`,
+          onclick: (event) => { event.stopPropagation(); removeLocalHistory(aid, photoId); render(); },
+        }, icon('trash-2', 17)),
       );
       if (canOpen) item.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
       list.append(item);
@@ -346,27 +679,32 @@ export function myCommentsView(root, params, ctx) {
     page.replaceChildren(h('div', { class: 'list-head' }, h('h2', null, '我的评论')));
     let pageIdx = 0;
     let loading = false;
+    let finished = false;
     const listWrap = h('div');
     const sentinel = h('div');
     page.append(listWrap, sentinel);
 
-    obs = new IntersectionObserver(async (es) => {
-      if (destroyed || loading || !es.some((e) => e.isIntersecting)) return;
+    const loadNext = async () => {
+      if (destroyed || loading || finished || isInactive(ctx)) return;
       loading = true;
-      pageIdx++;
       obs.disconnect();
+      const nextPage = pageIdx + 1;
       const controller = new AbortController();
       requestController = controller;
+      let observeAgain = false;
+      sentinel.replaceChildren(h('div', { class: 'loading-more' }, h('div', { class: 'spinner-sm' })));
       try {
-        const res = await api.userComments(uid, pageIdx, controller.signal);
+        const res = await api.userComments(uid, nextPage, controller.signal);
         if (destroyed || isInactive(ctx) || controller.signal.aborted) return;
         const d = res.data || {};
         const list = d.list || [];
-        if (pageIdx === 1 && !list.length) {
+        if (nextPage === 1 && !list.length) {
           listWrap.replaceChildren(h('div', { class: 'empty' }, h('div', { class: 'big' }, icon('message-square', 40)), '还没有发表过评论'));
+          sentinel.replaceChildren();
+          finished = true;
           return;
         }
-        listWrap.append(...list.map((c) => {
+        const nodes = list.map((c) => {
           const aid = String(c.AID || c.aid || '');
           const canOpen = /^\d+$/.test(aid);
           const open = () => { if (canOpen) location.hash = `#/album/${aid}`; };
@@ -381,14 +719,28 @@ export function myCommentsView(root, params, ctx) {
           );
           if (canOpen) item.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
           return item;
-        }));
-        if (list.length >= 20 && !destroyed) obs.observe(sentinel);
+        });
+        listWrap.append(...nodes);
+        // 只有完整追加成功后才推进页码；失败重试仍请求同一页，不会跳页或重复已有页。
+        pageIdx = nextPage;
+        sentinel.replaceChildren();
+        if (list.length >= 20) observeAgain = true;
+        else finished = true;
       } catch (e) {
-        if (!destroyed && !isInactive(ctx) && !controller.signal.aborted && !isAbort(e)) listWrap.append(errorBox(e.message));
+        if (!destroyed && !isInactive(ctx) && !controller.signal.aborted && !isAbort(e)) {
+          sentinel.replaceChildren(errorBox(e.message, () => {
+            if (!destroyed && !loading) loadNext();
+          }));
+        }
       } finally {
         if (requestController === controller) requestController = null;
         loading = false;
+        if (observeAgain && !destroyed && !finished && !isInactive(ctx)) obs.observe(sentinel);
       }
+    };
+
+    obs = new IntersectionObserver((es) => {
+      if (es.some((e) => e.isIntersecting)) loadNext();
     }, { rootMargin: '300px' });
     obs.observe(sentinel);
   })();
@@ -406,7 +758,7 @@ export function myCommentsView(root, params, ctx) {
 /* ============================== 设置 ============================== */
 
 export async function settingsView(root, ctx) {
-  const page = h('div', { class: 'page', style: 'max-width:620px' });
+  const page = h('div', { class: 'page settings-page', style: 'max-width:620px' });
   page.append(h('div', { class: 'list-head' }, h('h2', null, '设置')));
   root.append(page);
 
@@ -425,7 +777,9 @@ export async function settingsView(root, ctx) {
     (v) => updateSetting({ theme: v }));
 
   /* 阅读模式 */
-  const modeSel = selectRow('默认阅读模式', [['scroll', '连续滚动'], ['page', '单页翻页']], setting.readMode,
+  const modeSel = selectRow('默认阅读模式', [
+    ['scroll', '连续滚动'], ['page', '向右翻页'], ['pageReverse', '向左翻页（RTL）'], ['tap', '纯点击翻页'],
+  ], setting.readMode,
     (v) => updateSetting({ readMode: v }));
 
   /* 翻页适配 */
@@ -461,7 +815,17 @@ export async function settingsView(root, ctx) {
   });
 
   page.append(
-    h('div', { class: 'setting-group' }, themeSel),
+    h('div', { class: 'setting-group' },
+      h('div', { class: 'setting-item setting-section-title' }, h('div', { class: 'lab' }, '功能入口')),
+      h('div', { class: 'setting-item', style: 'display:flex;gap:8px;flex-wrap:wrap' },
+        h('a', { class: 'btn', href: '#/advanced' }, icon('layout-grid', 16), '完整功能中心'),
+        h('a', { class: 'btn', href: '#/downloads' }, icon('inbox', 16), '下载与离线缓存'),
+        h('a', { class: 'btn', href: '#/ai' }, icon('message-square', 16), 'AI 对话')),
+    ),
+    h('div', { class: 'setting-group' },
+      h('div', { class: 'setting-item setting-section-title' }, h('div', { class: 'lab' }, '外观')),
+      h('div', { class: 'setting-item' }, themeSel),
+    ),
     h('div', { class: 'setting-group' },
       h('div', { class: 'setting-item' }, h('div', { class: 'lab' }, '阅读'), modeSel, fitSel, preSel)),
     h('div', { class: 'setting-group' },

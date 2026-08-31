@@ -2,6 +2,11 @@
 data/
 .test/
 
+# 本地部署配置可能包含 ACCESS_PASSWORD 等敏感值
+.env
+.env.*
+!.env.example
+
 node_modules/
 *.log
 .DS_Store
