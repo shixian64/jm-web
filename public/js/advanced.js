@@ -698,10 +698,41 @@ function downloadJson(value, name) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+async function rebuildOfflineDownloads(requests) {
+  const list = Array.isArray(requests) ? requests.slice(0, 1000) : [];
+  if (!list.length) return { queued: 0, failed: 0 };
+  const { downloads } = await import('./downloads.js');
+  await downloads.ready;
+  let queued = 0; let failed = 0;
+  for (const request of list) {
+    const aid = String(request?.aid || '').trim();
+    if (!/^\d{1,24}$/.test(aid)) { failed++; continue; }
+    let chapterIds = null;
+    if (request.chapterIds != null) {
+      if (!Array.isArray(request.chapterIds)) { failed++; continue; }
+      chapterIds = [...new Set(request.chapterIds.map((id) => String(id || '').trim())
+        .filter((id) => /^\d{1,24}$/.test(id)))].slice(0, 10_000);
+      if (!chapterIds.length) { failed++; continue; }
+    }
+    try {
+      await downloads.enqueueAlbum(aid, {
+        chapterIds,
+        name: String(request.name || '').slice(0, 300),
+        shunt: setting.shunt,
+        concurrency: 3,
+      });
+      queued++;
+    } catch (_) { failed++; }
+  }
+  return { queued, failed };
+}
+
 export function backupView(root) {
   const page = h('div', { class: 'page settings-page', style: 'max-width:680px' }, pageTitle('备份与恢复'));
   const password = h('input', { class: 'input', type: 'password', placeholder: '可选：备份加密口令', autocomplete: 'new-password' });
   const file = h('input', { class: 'input', type: 'file', accept: 'application/json,.json' });
+  const rebuildQueue = h('input', { type: 'checkbox', checked: true });
+  const restoreStatus = h('div', { class: 'hint', role: 'status', 'aria-live': 'polite' });
   page.append(h('div', { class: 'setting-group' }, h('div', { class: 'setting-item' },
     h('div', { class: 'lab' }, '导出本地数据'), h('div', { class: 'hint' }, '包含设置、阅读/搜索历史、AI 会话、人格及离线缓存元数据；不会导出 JM 登录 Cookie、应用锁凭据或 WebAuthn 标识。'), password,
     h('button', { class: 'btn primary', style: 'margin-top:10px', onclick: async () => {
@@ -714,22 +745,48 @@ export function backupView(root) {
       } catch (error) { toast('导出失败：' + error.message); }
     } }, '导出备份'))),
     h('div', { class: 'setting-group' }, h('div', { class: 'setting-item' },
-      h('div', { class: 'lab' }, '恢复备份'), file,
-      h('button', { class: 'btn', style: 'margin-top:10px', onclick: async () => {
+      h('div', { class: 'lab' }, '恢复备份'),
+      h('div', { class: 'hint' }, '备份不包含图片正文；可根据原有整本/选章记录重新建立下载队列。'), file,
+      h('label', { class: 'setting-row compact', style: 'margin-top:10px' }, rebuildQueue,
+        h('span', null, '恢复离线目录后自动重建下载任务')),
+      h('button', { class: 'btn', style: 'margin-top:10px', onclick: async (event) => {
+        const button = event.currentTarget;
         try {
           if (!file.files?.[0]) throw new Error('请选择备份文件');
           if (file.files[0].size > 20 * 1024 * 1024) throw new Error('备份文件过大');
+          button.disabled = true;
+          restoreStatus.textContent = '正在验证并恢复备份…';
           let payload = JSON.parse(await file.files[0].text());
           if (payload.encrypted) {
-            const pass = prompt('请输入备份加密口令'); if (pass == null) return;
+            const pass = prompt('请输入备份加密口令');
+            if (pass == null) { restoreStatus.textContent = '已取消恢复'; return; }
             payload = await decryptBackup(payload, pass);
           }
           if (payload.format !== 'jmw-backup' || !payload.local) throw new Error('不是有效的 JM Web 备份');
+          let offlineResult = { albums: 0, chapters: 0, restoreRequests: [] };
+          if (payload.offline) offlineResult = await (await import('./offline.js')).importOfflineMetadata(payload.offline);
           importLocalState(payload.local);
-          if (payload.offline) { try { await (await import('./offline.js')).importOfflineMetadata?.(payload.offline); } catch (_) {} }
-          toast('恢复完成，正在刷新'); setTimeout(() => location.reload(), 500);
-        } catch (error) { toast('恢复失败：' + error.message); }
-      } }, '恢复并刷新'))));
+          syncSettingFromStorage(localStorage.getItem(SETTING_STORAGE_KEY));
+          let queueResult = { queued: 0, failed: 0 };
+          const requests = offlineResult.restoreRequests || [];
+          if (rebuildQueue.checked && requests.length) {
+            const accepted = confirm(`备份记录了 ${requests.length} 部漫画。恢复后将重新加入下载队列并开始续传，是否继续？`);
+            if (accepted) {
+              restoreStatus.textContent = `正在重建 ${requests.length} 个下载任务…`;
+              queueResult = await rebuildOfflineDownloads(requests);
+            }
+          }
+          const queueMessage = queueResult.queued || queueResult.failed
+            ? `，已重建 ${queueResult.queued} 个下载任务${queueResult.failed ? `，${queueResult.failed} 个失败` : ''}` : '';
+          restoreStatus.textContent = `恢复完成：${offlineResult.albums} 本、${offlineResult.chapters} 章元数据${queueMessage}。`;
+          toast('恢复完成，正在刷新'); setTimeout(() => location.reload(), 1200);
+        } catch (error) {
+          restoreStatus.textContent = '恢复失败：' + error.message;
+          toast('恢复失败：' + error.message);
+        } finally {
+          if (button.isConnected) button.disabled = false;
+        }
+      } }, '恢复并刷新'), restoreStatus)));
   root.append(page);
 }
 

@@ -7,6 +7,7 @@ import { homeView, searchView, categoryView, categoryListView, promoteListView, 
 import { mountReader } from './reader.js';
 import { downloadsView } from './download-view.js';
 import { registerOfflineWorker } from './offline.js';
+import { NAV_STATE_KEY, hashRouteKey } from './navigation.js';
 import {
   advancedHubView, blockedTagsView, paletteView, securityView, backupView, personasView,
   aiView, networkView, logsView, extractCodeView, cacheView, aboutView, installAdvancedRuntime, isLocalAppLocked,
@@ -109,6 +110,118 @@ const routes = [
 
 let currentCleanup = null;
 let renderGeneration = 0;
+const routeScrollPositions = new Map();
+let routeEntrySequence = 0;
+let currentRouteEntryId = null;
+let currentRouteKey = null;
+let currentRouteIsFullScreen = false;
+let cancelScheduledScroll = null;
+
+// Hash SPA 自己管理滚动位置，避免浏览器原生恢复与异步 View 渲染互相抢写。
+if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+
+function readRouteEntry() {
+  const marker = history.state && typeof history.state === 'object'
+    ? history.state[NAV_STATE_KEY] : null;
+  if (!marker || !Number.isSafeInteger(marker.id) || typeof marker.key !== 'string') return null;
+  routeEntrySequence = Math.max(routeEntrySequence, marker.id);
+  return marker;
+}
+
+function stampRouteEntry(key) {
+  const marker = { id: ++routeEntrySequence, key };
+  const base = history.state && typeof history.state === 'object' ? history.state : {};
+  try { history.replaceState({ ...base, [NAV_STATE_KEY]: marker }, ''); } catch (_) {}
+  return marker;
+}
+
+function ensureInitialRouteEntry() {
+  const key = hashRouteKey();
+  const existing = readRouteEntry();
+  const marker = existing && existing.key === key ? existing : stampRouteEntry(key);
+  currentRouteEntryId = marker.id;
+}
+
+/**
+ * 新的 hash 导航没有本应用写入的同路由 marker；返回/前进会回到已有 marker。
+ * 这样无需猜测 hashchange/popstate 的浏览器事件顺序，也能区分正常导航和遍历。
+ */
+function prepareHashNavigation() {
+  const key = hashRouteKey();
+  let marker = readRouteEntry();
+  const historyTraversal = !!(marker && marker.key === key && marker.id !== currentRouteEntryId);
+  if (!marker || marker.key !== key) marker = stampRouteEntry(key);
+  return { entryId: marker.id, historyTraversal };
+}
+
+function rememberCurrentScroll() {
+  if (currentRouteEntryId == null || !currentRouteKey || currentRouteIsFullScreen) return;
+  const y = Math.max(0, Number(window.scrollY) || 0);
+  routeScrollPositions.delete(currentRouteEntryId);
+  routeScrollPositions.set(currentRouteEntryId, y);
+  while (routeScrollPositions.size > 120) {
+    routeScrollPositions.delete(routeScrollPositions.keys().next().value);
+  }
+}
+
+function scheduleRouteScroll(ctx, targetY, { restore = false } = {}) {
+  if (cancelScheduledScroll) cancelScheduledScroll();
+  const desired = Math.max(0, Number(targetY) || 0);
+  let stopped = false;
+  let raf = 0;
+  let timeout = 0;
+  let fallbackTimer = 0;
+  let resizeObserver = null;
+  let focusDone = false;
+  let stableFrames = 0;
+
+  const interactionEvents = ['wheel', 'touchstart', 'pointerdown', 'keydown'];
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    if (raf) cancelAnimationFrame(raf);
+    if (timeout) clearTimeout(timeout);
+    if (fallbackTimer) clearInterval(fallbackTimer);
+    resizeObserver?.disconnect();
+    interactionEvents.forEach((name) => window.removeEventListener(name, stop, true));
+    if (cancelScheduledScroll === stop) cancelScheduledScroll = null;
+  };
+  const apply = () => {
+    raf = 0;
+    if (stopped || !ctx.isActive()) return stop();
+    window.scrollTo({ top: desired, behavior: 'auto' });
+    if (!focusDone) {
+      focusDone = true;
+      // View 若已主动聚焦输入框（如新搜索页），路由层不再把焦点抢回 main。
+      if (!main.contains(document.activeElement)) main.focus({ preventScroll: true });
+    }
+    if (!restore || desired <= 1) return stop();
+
+    // 异步列表可能尚未长到目标位置；ResizeObserver 会在内容扩展后再次尝试。
+    const maxY = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+    const reached = maxY + 2 >= desired && Math.abs(window.scrollY - desired) <= 2;
+    stableFrames = reached ? stableFrames + 1 : 0;
+    if (stableFrames >= 2) return stop();
+    if (reached) raf = requestAnimationFrame(apply);
+  };
+  const queueApply = () => {
+    if (!stopped && !raf) raf = requestAnimationFrame(apply);
+  };
+
+  interactionEvents.forEach((name) => window.addEventListener(name, stop, true));
+  if (restore && typeof ResizeObserver === 'function') {
+    resizeObserver = new ResizeObserver(queueApply);
+    resizeObserver.observe(main);
+  } else if (restore) {
+    fallbackTimer = setInterval(queueApply, 150);
+  }
+  // 网络异常时不无限占用监听器；用户主动滚动也会立即取消恢复。
+  timeout = setTimeout(stop, restore ? 10000 : 1000);
+  cancelScheduledScroll = stop;
+  queueApply();
+}
+
+ensureInitialRouteEntry();
 
 function mountShell() {
   app.replaceChildren(skipLink, topbar, main, tabbar);
@@ -123,13 +236,22 @@ function tab(href, ic, label) {
     h('span', { class: 'ti' }, icon(ic, 22)), label);
 }
 
-function render() {
+function render(navigation = {}) {
+  const previousEntryId = currentRouteEntryId;
+  rememberCurrentScroll();
+  if (cancelScheduledScroll) cancelScheduledScroll();
+  const targetEntryId = Number.isSafeInteger(navigation.entryId)
+    ? navigation.entryId : (readRouteEntry()?.id ?? currentRouteEntryId);
+  currentRouteEntryId = targetEntryId;
   const generation = ++renderGeneration;
   if (typeof currentCleanup === 'function') currentCleanup();
   currentCleanup = null;
   document.body.classList.remove('no-tab');
 
   const hash = location.hash || '#/';
+  const routeKey = hashRouteKey(hash);
+  const sameEntryRefresh = currentRouteKey === routeKey
+    && previousEntryId != null && previousEntryId === targetEntryId;
   const path = hash.replace(/^#/, '').split('?')[0] || '/';
   const queryStr = hash.includes('?') ? hash.slice(hash.indexOf('?')) : '';
   const search = new URLSearchParams(queryStr);
@@ -141,6 +263,8 @@ function render() {
       mountShell();
       // 阅读器为全屏固定层，隐藏底部 Tab
       const fullScreenView = route.re.source.includes('read') || path.startsWith('/offline/');
+      currentRouteKey = routeKey;
+      currentRouteIsFullScreen = fullScreenView;
       document.body.classList.toggle('no-tab', fullScreenView);
       const controller = new AbortController();
       let viewCleanup = null;
@@ -157,6 +281,8 @@ function render() {
       const ctx = {
         signal: controller.signal,
         isActive: () => !disposed && generation === renderGeneration,
+        navigationType: navigation.historyTraversal === true ? 'history' : 'new',
+        restoreScroll: navigation.historyTraversal === true || sameEntryRefresh,
       };
       currentCleanup = dispose;
 
@@ -182,11 +308,9 @@ function render() {
       }
       highlightNav(path);
       if (!fullScreenView) {
-        requestAnimationFrame(() => {
-          if (!ctx.isActive()) return;
-          window.scrollTo({ top: 0, behavior: 'auto' });
-          main.focus({ preventScroll: true });
-        });
+        const shouldRestore = navigation.historyTraversal === true || sameEntryRefresh;
+        const savedY = routeScrollPositions.get(currentRouteEntryId);
+        scheduleRouteScroll(ctx, shouldRestore ? (savedY ?? 0) : 0, { restore: shouldRestore });
       }
       return;
     }
@@ -198,6 +322,14 @@ function render() {
       h('p', null, h('a', { href: '#/', style: 'color:var(--primary)' }, '返回首页'))));
   mountShell();
   highlightNav(path);
+  currentRouteKey = routeKey;
+  currentRouteIsFullScreen = false;
+  const controller = new AbortController();
+  const ctx = { isActive: () => !controller.signal.aborted && generation === renderGeneration };
+  currentCleanup = () => controller.abort();
+  const shouldRestore = navigation.historyTraversal === true || sameEntryRefresh;
+  scheduleRouteScroll(ctx, shouldRestore ? (routeScrollPositions.get(currentRouteEntryId) ?? 0) : 0,
+    { restore: shouldRestore });
 }
 
 function highlightNav(path) {
@@ -229,7 +361,7 @@ async function boot() {
   }
   render();
 
-  window.addEventListener('hashchange', render);
+  window.addEventListener('hashchange', () => render(prepareHashNavigation()));
 
   // 访问口令保护：/api/me 返回 401 说明服务器开启了口令且本机未验证
   try {

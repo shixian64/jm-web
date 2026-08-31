@@ -1,8 +1,11 @@
 // 浏览类页面：首页 / 搜索 / 分类 / 每周必看 / 漫画详情
 import { api, imgSrc } from './api.js';
-import { h, toast, comicCard, infiniteList, errorBox, loadingBox } from './ui.js';
+import {
+  h, toast, comicCard, comicSkeletons, infiniteList, installPullToRefresh, errorBox, loadingBox,
+} from './ui.js';
 import { setting, getLocalHistory, getSearchHistory, addSearchHistory, clearSearchHistory } from './store.js';
 import { icon } from './icons.js';
+import { replaceCurrentRouteHash } from './navigation.js';
 import {
   buildSearchQuery, deserializeExcludedTags, filterComics, isComicBlocked,
   normalizeTags, parseSearchSyntax, searchContentWithoutExcludedTags, serializeExcludedTags,
@@ -45,6 +48,8 @@ export function homeView(root, ctx) {
   const cleanups = [];
   let destroyed = false;
   let loadSeq = 0;
+  let loadController = null;
+  let removePullRefresh = null;
   const clearEffects = () => {
     for (const fn of cleanups.splice(0)) fn();
   };
@@ -52,9 +57,15 @@ export function homeView(root, ctx) {
     if (destroyed) return;
     destroyed = true;
     loadSeq++;
+    loadController?.abort();
+    loadController = null;
+    removePullRefresh?.();
+    removePullRefresh = null;
     clearEffects();
   };
   const page = h('div', { class: 'page home-page' });
+  const content = h('div', { class: 'home-content' });
+  page.append(content);
 
   const buildContinueStrip = () => {
     const strip = h('div', { class: 'hscroll continue-strip' });
@@ -93,20 +104,23 @@ export function homeView(root, ctx) {
   };
 
   const showLoading = () => {
-    page.replaceChildren();
+    content.replaceChildren();
     if (getLocalHistory().length) {
-      page.append(sectionHeading('继续阅读', null, '最近打开'), buildContinueStrip());
+      content.append(sectionHeading('继续阅读', null, '最近打开'), buildContinueStrip());
     }
-    page.append(loadingBox());
+    content.append(h('div', { class: 'grid home-loading-grid', 'aria-label': '正在加载首页内容' }, comicSkeletons()));
   };
 
   async function loadHome() {
     const seq = ++loadSeq;
+    loadController?.abort();
+    const controller = new AbortController();
+    loadController = controller;
     clearEffects();
     showLoading();
     try {
-      const res = await api.home(ctx && ctx.signal);
-      if (destroyed || isInactive(ctx) || seq !== loadSeq) return;
+      const res = await api.home(controller.signal);
+      if (destroyed || isInactive(ctx) || controller.signal.aborted || seq !== loadSeq) return;
       const homeBlockedTags = normalizeTags([
         ...(setting.blockedTagList || []),
         ...(setting.homeExcludedTags || []),
@@ -114,23 +128,23 @@ export function homeView(root, ctx) {
       const blocks = (res.data || [])
         .map((b) => ({ ...b, content: filterComics(b.content || [], homeBlockedTags) }))
         .filter((b) => b.content.length);
-      page.replaceChildren();
+      content.replaceChildren();
 
       if (getLocalHistory().length) {
-        page.append(sectionHeading('继续阅读', null, '最近打开'), buildContinueStrip());
+        content.append(sectionHeading('继续阅读', null, '最近打开'), buildContinueStrip());
       }
 
       const firstBlock = blocks[0];
       const firstIsSwiper = !!(firstBlock && firstBlock.content.length > 2 && firstBlock.type !== 'record');
       // 首屏先给内容，再给工具入口；减少传统后台式的按钮墙。
       if (firstIsSwiper) {
-        page.append(
+        content.append(
           sectionHeading(displayBlockTitle(firstBlock.title, '连载更新'), () => gotoBlockFilter(firstBlock), '精选更新'),
           buildSwiper(firstBlock.content, cleanups, firstBlock.title),
         );
       }
 
-      page.append(
+      content.append(
         sectionHeading('探索', null, '快捷入口'),
         h('div', { class: 'quick-actions', 'aria-label': '快捷入口' },
           entry('search', '搜索', '#/search'),
@@ -145,15 +159,15 @@ export function homeView(root, ctx) {
       if (setting.preferenceRecommendEnabled) {
         const preferenceHost = h('section', { class: 'preference-recommend', 'aria-live': 'polite' },
           h('div', { class: 'loading-more' }, h('div', { class: 'spinner-sm' }), '正在根据收藏生成推荐…'));
-        page.append(preferenceHost);
+        content.append(preferenceHost);
         const existingIds = new Set(blocks.flatMap((block) => block.content || [])
           .map((item) => String(item?.id ?? item?.aid ?? item?.AID ?? '')).filter(Boolean));
         void getPreferenceRecommendations({
           source: setting.recommendSource === 'network' ? 'network' : 'builtin',
           maxResults: 20,
-          signal: ctx?.signal,
+          signal: controller.signal,
         }).then((recommendation) => {
-          if (destroyed || isInactive(ctx) || seq !== loadSeq) return;
+          if (destroyed || isInactive(ctx) || controller.signal.aborted || seq !== loadSeq) return;
           const recommended = filterComics(recommendation.items || [], homeBlockedTags)
             .filter((item) => {
               const id = String(item?.id ?? item?.aid ?? item?.AID ?? '');
@@ -178,7 +192,7 @@ export function homeView(root, ctx) {
             strip,
           ].filter(Boolean));
         }).catch((error) => {
-          if (destroyed || isInactive(ctx) || isAbort(error) || seq !== loadSeq) return;
+          if (destroyed || isInactive(ctx) || controller.signal.aborted || isAbort(error) || seq !== loadSeq) return;
           preferenceHost.replaceChildren(h('div', { class: 'hint', style: 'padding:8px 2px' },
             error?.status === 401 ? '登录后可根据收藏生成偏好推荐。' : `偏好推荐暂不可用：${error.message}`));
         });
@@ -187,19 +201,20 @@ export function homeView(root, ctx) {
       blocks.forEach((block, bi) => {
         const isSwiper = bi === 0 && block.content.length > 2 && block.type !== 'record';
         if (isSwiper) return;
-        page.append(sectionHeading(displayBlockTitle(block.title), () => gotoBlockFilter(block), bi === 0 ? '最新内容' : '为你推荐'));
+        content.append(sectionHeading(displayBlockTitle(block.title), () => gotoBlockFilter(block), bi === 0 ? '最新内容' : '为你推荐'));
         const strip = h('div', { class: 'hscroll' });
         block.content.forEach((it) => strip.append(comicCard(it)));
-        page.append(strip);
+        content.append(strip);
       });
     } catch (e) {
-      if (destroyed || isInactive(ctx) || isAbort(e) || seq !== loadSeq) return;
+      if (destroyed || isInactive(ctx) || controller.signal.aborted || isAbort(e) || seq !== loadSeq) return;
       clearEffects();
-      page.replaceChildren(errorBox(e.message, loadHome));
+      content.replaceChildren(errorBox(e.message, loadHome));
     }
   }
 
   root.append(page);
+  removePullRefresh = installPullToRefresh(page, loadHome);
   loadHome();
 
   // 离开首页时清理轮播定时器，避免在已脱离 DOM 的节点上空转
@@ -318,7 +333,7 @@ const CATEGORY_ORDERS = [
   ['mv_m', '月排行'], ['mv_w', '周排行'], ['mv_t', '日排行'],
 ];
 
-export function searchView(root, params) {
+export function searchView(root, params, ctx) {
   const rawQuery = params.get('q') || '';
   const parsedQuery = parseSearchSyntax(rawQuery);
   const q = searchContentWithoutExcludedTags(rawQuery);
@@ -328,6 +343,7 @@ export function searchView(root, params) {
     ...deserializeExcludedTags(params.get('exclude')),
   ]);
   const page = h('div', { class: 'page search-page' });
+  let autoFocusPending = !ctx || ctx.navigationType !== 'history';
 
   const navigateSearch = (value, nextExcluded = excludedTags, order = o) => {
     const parsed = parseSearchSyntax(value);
@@ -339,7 +355,14 @@ export function searchView(root, params) {
 
   if (!q) {
     const renderLanding = () => {
-      page.replaceChildren(buildSearchBar('', (v) => navigateSearch(v, excludedTags, 'mr')));
+      const searchBar = buildSearchBar('', (v) => navigateSearch(v, excludedTags, 'mr'));
+      page.replaceChildren(searchBar);
+      if (autoFocusPending) {
+        autoFocusPending = false;
+        requestAnimationFrame(() => {
+          if (searchBar.isConnected && !ctx?.signal?.aborted) searchBar.searchInput?.focus({ preventScroll: true });
+        });
+      }
       page.append(buildSearchExclusionEditor(excludedTags, (tags) => {
         excludedTags = tags;
         renderLanding();
@@ -408,7 +431,9 @@ function buildSearchBar(value, onSubmit) {
   const form = h('form', { class: 'search-form', onsubmit: (e) => { e.preventDefault(); onSubmit(input.value.trim()); } },
     input,
     h('button', { class: 'btn primary', type: 'submit' }, '搜索'));
-  return h('div', { class: 'search-bar' }, form);
+  const bar = h('div', { class: 'search-bar' }, form);
+  bar.searchInput = input;
+  return bar;
 }
 
 function searchHref(q, order, excludedTags) {
@@ -467,73 +492,111 @@ function buildSearchExclusionEditor(excludedTags, onChange) {
 
 /* ============================== 分类 ============================== */
 
-export async function categoryView(root, ctx) {
+export function categoryView(root, ctx) {
   const page = h('div', { class: 'page category-page' });
-  page.append(loadingBox());
+  const content = h('div');
+  page.append(content);
   root.append(page);
-  try {
-    const res = await api.categories(ctx && ctx.signal);
-    if (isInactive(ctx)) return;
-    const data = res.data || {};
-    page.replaceChildren();
+  let destroyed = false;
+  let loadSeq = 0;
+  let loadController = null;
 
-    page.append(h('div', { class: 'list-head' }, h('h2', null, '分类浏览')));
-    page.append(sectionHeading('排行榜', null, '按热度浏览'));
-    page.append(h('div', { class: 'chips', style: 'flex-wrap:wrap' },
-      CATEGORY_ORDERS.map(([order, label]) => h('a', {
-        class: 'chip', href: `#/category/list?c=&o=${encodeURIComponent(order)}&title=${encodeURIComponent(label)}`,
-      }, label))));
+  const showSkeleton = () => {
+    const tiles = Array.from({ length: 8 }, () => h('div', {
+      class: 'category-tile', 'aria-hidden': 'true', style: 'min-height:54px',
+    },
+    h('span', { class: 'skeleton-block', style: 'width:34px;height:34px;border-radius:11px;flex:none' }),
+    h('span', { class: 'skeleton-line wide', style: 'width:58%;margin:0' })));
+    content.replaceChildren(
+      h('div', { class: 'list-head', 'aria-label': '正在加载分类' },
+        h('div', { class: 'skeleton-line wide', style: 'width:120px;height:18px' })),
+      h('div', { class: 'category-grid' }, tiles),
+    );
+  };
 
-    const cats = data.categories || [];
-    if (cats.length) {
-      page.append(sectionHeading('主分类', null, '按类型浏览'));
-      const categoryGrid = h('div', { class: 'category-grid' });
-      const categoryIcons = ['layout-grid', 'book-open', 'star', 'calendar-days', 'smartphone', 'search'];
-      cats.forEach((c, index) => {
-        const href = c.type === 'slug' || String(c.id) === '0'
-          ? `#/category/list?c=${encodeURIComponent(c.slug)}&o=`
-          : `#/search?q=${encodeURIComponent(c.name)}&o=mr`;
-        categoryGrid.append(h('a', { class: 'category-tile', href },
-          h('span', { class: 'category-icon' }, icon(categoryIcons[index % categoryIcons.length], 19)),
-          h('span', { class: 'category-name' }, c.name),
-          c.total_albums ? h('span', { style: 'font-size:11px;color:var(--text-2)' }, c.total_albums) : null,
-          h('span', { class: 'category-arrow', 'aria-hidden': 'true' }, icon('arrow-up-right', 14)),
-        ));
-      });
-      page.append(categoryGrid);
+  const load = async () => {
+    const seq = ++loadSeq;
+    loadController?.abort();
+    const controller = new AbortController();
+    loadController = controller;
+    showSkeleton();
+    try {
+      const res = await api.categories(controller.signal);
+      if (destroyed || isInactive(ctx) || controller.signal.aborted || seq !== loadSeq) return;
+      const data = res.data || {};
+      content.replaceChildren();
 
-      // 上游把子分类挂在主分类对象下，组合 slug 以“主_子”请求筛选接口。
-      cats.forEach((category) => {
-        const children = category.sub_categories || category.subCategories || [];
-        if (!children.length || !(category.type === 'slug' || String(category.id) === '0')) return;
-        const row = h('div', { class: 'chips', style: 'flex-wrap:wrap;margin-bottom:10px' });
-        row.append(h('a', {
-          class: 'chip',
-          href: `#/category/list?c=${encodeURIComponent(category.slug || '')}&o=&title=${encodeURIComponent(category.name || '分类')}`,
-        }, '全部'));
-        children.forEach((child) => {
-          const childSlug = String(child.slug || '').trim();
-          const combined = [category.slug, childSlug].filter(Boolean).join('_');
+      content.append(h('div', { class: 'list-head' }, h('h2', null, '分类浏览')));
+      content.append(sectionHeading('排行榜', null, '按热度浏览'));
+      content.append(h('div', { class: 'chips', style: 'flex-wrap:wrap' },
+        CATEGORY_ORDERS.map(([order, label]) => h('a', {
+          class: 'chip', href: `#/category/list?c=&o=${encodeURIComponent(order)}&title=${encodeURIComponent(label)}`,
+        }, label))));
+
+      const cats = data.categories || [];
+      if (cats.length) {
+        content.append(sectionHeading('主分类', null, '按类型浏览'));
+        const categoryGrid = h('div', { class: 'category-grid' });
+        const categoryIcons = ['layout-grid', 'book-open', 'star', 'calendar-days', 'smartphone', 'search'];
+        cats.forEach((c, index) => {
+          const href = c.type === 'slug' || String(c.id) === '0'
+            ? `#/category/list?c=${encodeURIComponent(c.slug)}&o=`
+            : `#/search?q=${encodeURIComponent(c.name)}&o=mr`;
+          categoryGrid.append(h('a', { class: 'category-tile', href },
+            h('span', { class: 'category-icon' }, icon(categoryIcons[index % categoryIcons.length], 19)),
+            h('span', { class: 'category-name' }, c.name),
+            c.total_albums ? h('span', { style: 'font-size:11px;color:var(--text-2)' }, c.total_albums) : null,
+            h('span', { class: 'category-arrow', 'aria-hidden': 'true' }, icon('arrow-up-right', 14)),
+          ));
+        });
+        content.append(categoryGrid);
+
+        // 上游把子分类挂在主分类对象下，组合 slug 以“主_子”请求筛选接口。
+        cats.forEach((category) => {
+          const children = category.sub_categories || category.subCategories || [];
+          if (!children.length || !(category.type === 'slug' || String(category.id) === '0')) return;
+          const row = h('div', { class: 'chips', style: 'flex-wrap:wrap;margin-bottom:10px' });
           row.append(h('a', {
             class: 'chip',
-            href: `#/category/list?c=${encodeURIComponent(combined)}&o=&title=${encodeURIComponent(`${category.name || ''} · ${child.name || childSlug}`)}`,
-          }, child.name || childSlug));
+            href: `#/category/list?c=${encodeURIComponent(category.slug || '')}&o=&title=${encodeURIComponent(category.name || '分类')}`,
+          }, '全部'));
+          children.forEach((child) => {
+            const childSlug = String(child.slug || '').trim();
+            const combined = [category.slug, childSlug].filter(Boolean).join('_');
+            row.append(h('a', {
+              class: 'chip',
+              href: `#/category/list?c=${encodeURIComponent(combined)}&o=&title=${encodeURIComponent(`${category.name || ''} · ${child.name || childSlug}`)}`,
+            }, child.name || childSlug));
+          });
+          content.append(sectionHeading(category.name || '子分类', null, '细分类型'), row);
         });
-        page.append(sectionHeading(category.name || '子分类', null, '细分类型'), row);
-      });
-    }
+      }
 
-    const tagList = (data.blocks || []).flatMap((b) => b.content || []);
-    if (tagList.length) {
-      page.append(sectionHeading('热门标签', null, '快速筛选'));
-      const chips = h('div', { class: 'chips tag-cloud', style: 'flex-wrap:wrap' });
-      tagList.forEach((t) => chips.append(h('a', { class: 'chip', href: `#/search?q=${encodeURIComponent(t)}&o=mr` }, t)));
-      page.append(chips);
+      const tagList = (data.blocks || []).flatMap((b) => b.content || []);
+      if (tagList.length) {
+        content.append(sectionHeading('热门标签', null, '快速筛选'));
+        const chips = h('div', { class: 'chips tag-cloud', style: 'flex-wrap:wrap' });
+        tagList.forEach((t) => chips.append(h('a', { class: 'chip', href: `#/search?q=${encodeURIComponent(t)}&o=mr` }, t)));
+        content.append(chips);
+      }
+    } catch (e) {
+      if (destroyed || isInactive(ctx) || controller.signal.aborted || isAbort(e) || seq !== loadSeq) return;
+      content.replaceChildren(errorBox(e.message, load));
+    } finally {
+      if (loadController === controller) loadController = null;
     }
-  } catch (e) {
-    if (isInactive(ctx) || isAbort(e)) return;
-    page.replaceChildren(errorBox(e.message));
-  }
+  };
+
+  const removePullRefresh = installPullToRefresh(page, load);
+  load();
+  return () => {
+    if (destroyed) return;
+    destroyed = true;
+    loadSeq++;
+    loadController?.abort();
+    loadController = null;
+    removePullRefresh();
+  };
 }
 
 export function categoryListView(root, params) {
@@ -614,15 +677,19 @@ function chipButton(label, active, onclick) {
 
 export function weekView(root, params, ctx) {
   const page = h('div', { class: 'page' });
-  page.append(loadingBox());
+  const content = h('div', null, loadingBox());
+  page.append(content);
   root.append(page);
   let destroyed = false;
   let loadController = null;
   let loadSeq = 0;
+  let reloadCurrent = null;
+  const removePullRefresh = installPullToRefresh(page, () => reloadCurrent?.() || Promise.resolve());
 
   const dispose = () => {
     if (destroyed) return;
     destroyed = true;
+    removePullRefresh();
     if (loadController) loadController.abort();
     loadController = null;
   };
@@ -647,7 +714,7 @@ export function weekView(root, params, ctx) {
       const listWrap = h('div');
       const pagerWrap = h('div');
 
-      page.replaceChildren(
+      content.replaceChildren(
         h('div', { class: 'list-head' }, h('h2', null, '每周必看')),
         h('div', { class: 'setting-row', style: 'margin-bottom:10px' },
           h('label', { for: 'week-period', style: 'font-size:13px;color:var(--text-2)' }, '期数'),
@@ -678,9 +745,9 @@ export function weekView(root, params, ctx) {
         if (loadController) loadController.abort();
         const controller = new AbortController();
         loadController = controller;
-        listWrap.replaceChildren(loadingBox());
+        listWrap.replaceChildren(h('div', { class: 'grid', 'aria-label': '正在加载每周必看' }, comicSkeletons()));
         pagerWrap.replaceChildren();
-        history.replaceState(null, '', `#/week?id=${encodeURIComponent(curCat)}&type=${encodeURIComponent(curType)}`);
+        replaceCurrentRouteHash(`#/week?id=${encodeURIComponent(curCat)}&type=${encodeURIComponent(curType)}`);
         try {
           const r = await api.weekFilter(curCat, curType, p, controller.signal);
           if (destroyed || isInactive(ctx) || controller.signal.aborted || seq !== loadSeq) return;
@@ -714,10 +781,11 @@ export function weekView(root, params, ctx) {
       }
 
       renderTypes();
+      reloadCurrent = () => load(1);
       load(1);
     } catch (e) {
       if (destroyed || isInactive(ctx) || isAbort(e)) return;
-      page.replaceChildren(errorBox(e.message));
+      content.replaceChildren(errorBox(e.message));
     }
   })();
 

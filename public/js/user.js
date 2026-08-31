@@ -1,6 +1,6 @@
 // 用户与设置页面：登录 / 个人中心 / 签到 / 收藏 / 阅读历史 / 评论历史 / 本地记录 / 设置
 import { api, imgSrc } from './api.js';
-import { h, toast, comicCard, infiniteList, errorBox, loadingBox } from './ui.js';
+import { h, toast, comicCard, infiniteList, installPullToRefresh, errorBox, loadingBox } from './ui.js';
 import {
   setting, updateSetting, getLocalHistory, clearLocalHistory, removeLocalHistory,
 } from './store.js';
@@ -16,28 +16,64 @@ function isInactive(ctx) {
 
 /* ============================== 我的 / 登录 ============================== */
 
-export async function userView(root, ctx) {
+export function userView(root, ctx) {
   const page = h('div', { class: 'page user-page' });
+  const content = h('div');
+  page.append(content);
   root.append(page);
-  await refreshUserPage(page, ctx);
+  let destroyed = false;
+  let loadSeq = 0;
+  let loadController = null;
+
+  const load = async () => {
+    const seq = ++loadSeq;
+    loadController?.abort();
+    const controller = new AbortController();
+    loadController = controller;
+    content.replaceChildren(profileSkeleton());
+    try {
+      const me = (await api.me(controller.signal)).user;
+      if (destroyed || isInactive(ctx) || controller.signal.aborted || seq !== loadSeq) return;
+      if (!me) renderLogin(content, ctx, load);
+      else renderProfile(content, me, ctx, load);
+    } catch (e) {
+      if (destroyed || isInactive(ctx) || controller.signal.aborted || isAbort(e) || seq !== loadSeq) return;
+      content.replaceChildren(errorBox(e.message, load));
+    } finally {
+      if (loadController === controller) loadController = null;
+    }
+  };
+
+  const removePullRefresh = installPullToRefresh(page, load);
+  load();
+  return () => {
+    if (destroyed) return;
+    destroyed = true;
+    loadSeq++;
+    loadController?.abort();
+    loadController = null;
+    removePullRefresh();
+  };
 }
 
-async function refreshUserPage(page, ctx) {
-  page.replaceChildren(loadingBox());
-  let me;
-  try {
-    me = (await api.me(ctx && ctx.signal)).user;
-    if (isInactive(ctx)) return;
-  } catch (e) {
-    if (isInactive(ctx) || isAbort(e)) return;
-    page.replaceChildren(errorBox(e.message));
-    return;
-  }
-  if (!me) return renderLogin(page, ctx);
-  renderProfile(page, me, ctx);
+function profileSkeleton() {
+  const menuRows = Array.from({ length: 6 }, () => h('div', { 'aria-hidden': 'true' },
+    h('div', { class: 'skeleton-line wide', style: 'width:58%;height:13px;margin:20px 16px' })));
+  return h('div', { role: 'status', 'aria-label': '正在加载用户信息' },
+    h('div', { class: 'card profile-card' },
+      h('div', { class: 'profile-head' },
+        h('div', { class: 'avatar skeleton-block', 'aria-hidden': 'true' }),
+        h('div', { style: 'flex:1;min-width:0' },
+          h('div', { class: 'skeleton-line wide' }),
+          h('div', { class: 'skeleton-line short' }),
+          h('div', { class: 'skeleton-line wide' })))),
+    h('div', { class: 'stat-row' }, [1, 2, 3].map(() => h('div', { class: 'cell', 'aria-hidden': 'true' },
+      h('div', { class: 'skeleton-line wide', style: 'margin:6px auto' }),
+      h('div', { class: 'skeleton-line short', style: 'margin:8px auto 2px' })))),
+    h('div', { class: 'menu-list' }, menuRows));
 }
 
-function renderLogin(page, ctx) {
+function renderLogin(page, ctx, reload) {
   const username = h('input', { class: 'input', placeholder: '用户名', autocomplete: 'username' });
   const password = h('input', { class: 'input', placeholder: '密码', type: 'password', autocomplete: 'current-password' });
   const submit = h('button', { class: 'btn primary block', type: 'submit' }, '登 录');
@@ -54,7 +90,7 @@ function renderLogin(page, ctx) {
         if (isInactive(ctx)) return;
         toast('登录成功');
         window.dispatchEvent(new CustomEvent('jmw-auth-changed'));
-        await refreshUserPage(page, ctx);
+        await reload();
       } catch (err) {
         if (!isInactive(ctx) && !isAbort(err)) toast(err.message);
       } finally {
@@ -83,7 +119,7 @@ function renderLogin(page, ctx) {
   );
 }
 
-function renderProfile(page, me, ctx) {
+function renderProfile(page, me, ctx, reload) {
   const avatarSrc = me.photo
     ? (/^https?:/i.test(me.photo) ? `/api/img?u=${encodeURIComponent(me.photo)}` : `/api/img?path=${encodeURIComponent(me.photo.startsWith('/') ? me.photo : '/' + me.photo)}`)
     : '';
@@ -138,7 +174,7 @@ function renderProfile(page, me, ctx) {
           if (isInactive(ctx)) return;
           toast('已退出登录');
           window.dispatchEvent(new CustomEvent('jmw-auth-changed'));
-          renderLogin(page, ctx);
+          renderLogin(page, ctx, reload);
         } catch (e) {
           if (!isInactive(ctx) && !isAbort(e)) toast(e.message);
         } finally {
@@ -171,31 +207,45 @@ function menuItem(ic, label, href) {
 
 export function signinView(root, ctx) {
   const page = h('div', { class: 'page signin-page', style: 'max-width:560px' });
+  const content = h('div');
+  page.append(content);
   root.append(page);
   let refreshSeq = 0;
+  let destroyed = false;
+  let loadController = null;
 
   async function load() {
     const seq = ++refreshSeq;
-    page.replaceChildren(loadingBox());
+    loadController?.abort();
+    const controller = new AbortController();
+    loadController = controller;
+    content.replaceChildren(signinSkeleton());
     let me;
     try {
-      me = (await api.me(ctx && ctx.signal)).user;
-      if (isInactive(ctx) || seq !== refreshSeq) return;
+      me = (await api.me(controller.signal)).user;
+      if (destroyed || isInactive(ctx) || controller.signal.aborted || seq !== refreshSeq) return;
     } catch (e) {
-      if (isInactive(ctx) || isAbort(e) || seq !== refreshSeq) return;
-      page.replaceChildren(errorBox(e.message, load));
+      if (loadController === controller) loadController = null;
+      if (destroyed || isInactive(ctx) || controller.signal.aborted || isAbort(e) || seq !== refreshSeq) return;
+      content.replaceChildren(errorBox(e.message, load));
       return;
     }
-    if (!me) { location.hash = '#/user'; return; }
+    if (!me) {
+      if (loadController === controller) loadController = null;
+      location.hash = '#/user';
+      return;
+    }
 
     let data;
     try {
-      data = (await api.daily(me.uid, ctx && ctx.signal)).data;
-      if (isInactive(ctx) || seq !== refreshSeq) return;
+      data = (await api.daily(me.uid, controller.signal)).data;
+      if (destroyed || isInactive(ctx) || controller.signal.aborted || seq !== refreshSeq) return;
     } catch (e) {
-      if (isInactive(ctx) || isAbort(e) || seq !== refreshSeq) return;
-      page.replaceChildren(errorBox(e.message, load));
+      if (destroyed || isInactive(ctx) || controller.signal.aborted || isAbort(e) || seq !== refreshSeq) return;
+      content.replaceChildren(errorBox(e.message, load));
       return;
+    } finally {
+      if (loadController === controller) loadController = null;
     }
 
     const flat = (data.record || []).flat();
@@ -230,7 +280,7 @@ export function signinView(root, ctx) {
       },
     }, isTodaySigned ? '今日已签到' : '立即签到');
 
-    page.replaceChildren(
+    content.replaceChildren(
       h('div', { class: 'list-head' }, h('h2', null, '每日签到')),
       h('div', { class: 'card', style: 'padding:16px' },
         h('div', { style: 'color:var(--text-2);font-size:13px' },
@@ -241,7 +291,28 @@ export function signinView(root, ctx) {
     );
   }
 
+  const removePullRefresh = installPullToRefresh(page, load);
   load();
+  return () => {
+    if (destroyed) return;
+    destroyed = true;
+    refreshSeq++;
+    loadController?.abort();
+    loadController = null;
+    removePullRefresh();
+  };
+}
+
+function signinSkeleton() {
+  const days = Array.from({ length: 35 }, () => h('div', {
+    class: 'd skeleton-block', 'aria-hidden': 'true',
+  }));
+  return h('div', { role: 'status', 'aria-label': '正在加载签到信息' },
+    h('div', { class: 'list-head' }, h('div', { class: 'skeleton-line wide', style: 'width:110px;height:18px' })),
+    h('div', { class: 'card', style: 'padding:16px' },
+      h('div', { class: 'skeleton-line wide' }),
+      h('div', { class: 'sign-grid' }, days),
+      h('div', { class: 'skeleton-block', style: 'height:42px;border-radius:10px' })));
 }
 
 /* ============================== 收藏 ============================== */
@@ -655,104 +726,145 @@ export function localHistoryView(root) {
 
 export function myCommentsView(root, params, ctx) {
   const page = h('div', { class: 'page' });
-  page.append(loadingBox());
+  const content = h('div');
+  page.append(content);
   root.append(page);
   let destroyed = false;
   let obs = null;
   let requestController = null;
+  let generation = 0;
+  let pageIdx = 0;
+  let loading = false;
+  let finished = false;
+  let uid = '';
+  let listWrap = null;
+  let sentinel = null;
 
-  (async () => {
-    let uid = params.get('uid');
-    if (!uid) {
-      try {
-        const me = (await api.me(ctx && ctx.signal)).user;
-        if (destroyed || isInactive(ctx)) return;
-        if (!me) { location.hash = '#/user'; return; }
-        uid = me.uid;
-      } catch (e) {
-        if (destroyed || isInactive(ctx) || isAbort(e)) return;
-        page.replaceChildren(errorBox(e.message));
+  const buildCommentNodes = (list) => list.map((c) => {
+    const aid = String(c.AID || c.aid || '');
+    const canOpen = /^\d+$/.test(aid);
+    const open = () => { if (canOpen) location.hash = `#/album/${aid}`; };
+    const item = h('div', {
+      class: 'comment-item', style: canOpen ? 'cursor:pointer' : '',
+      ...(canOpen ? { role: 'button', tabindex: '0', 'aria-label': `查看${c.name || '漫画'}详情`, onclick: open } : { 'aria-disabled': 'true' }),
+    },
+      h('div', { class: 'body' },
+        h('div', { class: 'name' }, `《${c.name || '漫画 ' + aid}》`),
+        h('div', { class: 'content' }, c.content || ''),
+        h('div', { class: 'foot' }, fmtTime(c.addtime))),
+    );
+    if (canOpen) item.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+    return item;
+  });
+
+  const loadNext = async (seq = generation) => {
+    if (destroyed || seq !== generation || loading || finished || !uid || isInactive(ctx)) return;
+    loading = true;
+    obs?.disconnect();
+    const nextPage = pageIdx + 1;
+    const controller = new AbortController();
+    requestController = controller;
+    let observeAgain = false;
+    if (nextPage === 1) listWrap.replaceChildren(commentListSkeleton());
+    else sentinel.replaceChildren(h('div', { class: 'loading-more' }, h('div', { class: 'spinner-sm' })));
+    try {
+      const res = await api.userComments(uid, nextPage, controller.signal);
+      if (destroyed || seq !== generation || isInactive(ctx) || controller.signal.aborted) return;
+      const d = res.data || {};
+      const list = d.list || [];
+      if (nextPage === 1 && !list.length) {
+        listWrap.replaceChildren(h('div', { class: 'empty' }, h('div', { class: 'big' }, icon('message-square', 40)), '还没有发表过评论'));
+        sentinel.replaceChildren();
+        finished = true;
         return;
+      }
+      const nodes = buildCommentNodes(list);
+      if (nextPage === 1) listWrap.replaceChildren(...nodes);
+      else listWrap.append(...nodes);
+      // 只有完整追加成功后才推进页码；失败重试仍请求同一页，不会跳页或重复已有页。
+      pageIdx = nextPage;
+      sentinel.replaceChildren();
+      if (list.length >= 20) observeAgain = true;
+      else finished = true;
+    } catch (e) {
+      if (!destroyed && seq === generation && !isInactive(ctx) && !controller.signal.aborted && !isAbort(e)) {
+        const retry = () => { if (!destroyed && seq === generation && !loading) loadNext(seq); };
+        if (nextPage === 1) listWrap.replaceChildren(errorBox(e.message, retry));
+        else sentinel.replaceChildren(errorBox(e.message, retry));
+      }
+    } finally {
+      if (requestController === controller) requestController = null;
+      if (seq === generation) {
+        loading = false;
+        if (observeAgain && !destroyed && !finished && !isInactive(ctx)) obs?.observe(sentinel);
+      }
+    }
+  };
+
+  const reload = async () => {
+    const seq = ++generation;
+    requestController?.abort();
+    requestController = null;
+    obs?.disconnect();
+    obs = null;
+    pageIdx = 0;
+    loading = false;
+    finished = false;
+    uid = String(params.get('uid') || '');
+    content.replaceChildren(
+      h('div', { class: 'list-head' }, h('h2', null, '我的评论')),
+      commentListSkeleton(),
+    );
+
+    if (!uid) {
+      const controller = new AbortController();
+      requestController = controller;
+      try {
+        const me = (await api.me(controller.signal)).user;
+        if (destroyed || seq !== generation || isInactive(ctx) || controller.signal.aborted) return;
+        if (!me) { location.hash = '#/user'; return; }
+        uid = String(me.uid || '');
+      } catch (e) {
+        if (destroyed || seq !== generation || isInactive(ctx) || controller.signal.aborted || isAbort(e)) return;
+        content.replaceChildren(errorBox(e.message, reload));
+        return;
+      } finally {
+        if (requestController === controller) requestController = null;
       }
     }
 
-    page.replaceChildren(h('div', { class: 'list-head' }, h('h2', null, '我的评论')));
-    let pageIdx = 0;
-    let loading = false;
-    let finished = false;
-    const listWrap = h('div');
-    const sentinel = h('div');
-    page.append(listWrap, sentinel);
-
-    const loadNext = async () => {
-      if (destroyed || loading || finished || isInactive(ctx)) return;
-      loading = true;
-      obs.disconnect();
-      const nextPage = pageIdx + 1;
-      const controller = new AbortController();
-      requestController = controller;
-      let observeAgain = false;
-      sentinel.replaceChildren(h('div', { class: 'loading-more' }, h('div', { class: 'spinner-sm' })));
-      try {
-        const res = await api.userComments(uid, nextPage, controller.signal);
-        if (destroyed || isInactive(ctx) || controller.signal.aborted) return;
-        const d = res.data || {};
-        const list = d.list || [];
-        if (nextPage === 1 && !list.length) {
-          listWrap.replaceChildren(h('div', { class: 'empty' }, h('div', { class: 'big' }, icon('message-square', 40)), '还没有发表过评论'));
-          sentinel.replaceChildren();
-          finished = true;
-          return;
-        }
-        const nodes = list.map((c) => {
-          const aid = String(c.AID || c.aid || '');
-          const canOpen = /^\d+$/.test(aid);
-          const open = () => { if (canOpen) location.hash = `#/album/${aid}`; };
-          const item = h('div', {
-            class: 'comment-item', style: canOpen ? 'cursor:pointer' : '',
-            ...(canOpen ? { role: 'button', tabindex: '0', 'aria-label': `查看${c.name || '漫画'}详情`, onclick: open } : { 'aria-disabled': 'true' }),
-          },
-            h('div', { class: 'body' },
-              h('div', { class: 'name' }, `《${c.name || '漫画 ' + aid}》`),
-              h('div', { class: 'content' }, c.content || ''),
-              h('div', { class: 'foot' }, fmtTime(c.addtime))),
-          );
-          if (canOpen) item.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
-          return item;
-        });
-        listWrap.append(...nodes);
-        // 只有完整追加成功后才推进页码；失败重试仍请求同一页，不会跳页或重复已有页。
-        pageIdx = nextPage;
-        sentinel.replaceChildren();
-        if (list.length >= 20) observeAgain = true;
-        else finished = true;
-      } catch (e) {
-        if (!destroyed && !isInactive(ctx) && !controller.signal.aborted && !isAbort(e)) {
-          sentinel.replaceChildren(errorBox(e.message, () => {
-            if (!destroyed && !loading) loadNext();
-          }));
-        }
-      } finally {
-        if (requestController === controller) requestController = null;
-        loading = false;
-        if (observeAgain && !destroyed && !finished && !isInactive(ctx)) obs.observe(sentinel);
-      }
-    };
-
-    obs = new IntersectionObserver((es) => {
-      if (es.some((e) => e.isIntersecting)) loadNext();
+    if (destroyed || seq !== generation || !uid || isInactive(ctx)) return;
+    listWrap = h('div');
+    sentinel = h('div');
+    content.replaceChildren(h('div', { class: 'list-head' }, h('h2', null, '我的评论')), listWrap, sentinel);
+    obs = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) loadNext(seq);
     }, { rootMargin: '300px' });
-    obs.observe(sentinel);
-  })();
+    await loadNext(seq);
+  };
+
+  const removePullRefresh = installPullToRefresh(page, reload);
+  reload();
 
   return () => {
     if (destroyed) return;
     destroyed = true;
+    generation++;
     if (obs) obs.disconnect();
     obs = null;
     if (requestController) requestController.abort();
     requestController = null;
+    removePullRefresh();
   };
+}
+
+function commentListSkeleton(count = 4) {
+  return h('div', { role: 'status', 'aria-label': '正在加载评论' },
+    Array.from({ length: count }, () => h('div', { class: 'comment-item', 'aria-hidden': 'true' },
+      h('div', { class: 'body' },
+        h('div', { class: 'skeleton-line short' }),
+        h('div', { class: 'skeleton-line wide', style: 'height:13px;margin-top:12px' }),
+        h('div', { class: 'skeleton-line short' })))));
 }
 
 /* ============================== 设置 ============================== */

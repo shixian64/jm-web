@@ -86,12 +86,103 @@ export function comicCard(item) {
   return card;
 }
 
+/** 与漫画网格同尺寸的轻量骨架，避免首屏列表从空白突然跳变。 */
+export function comicSkeletons(count = 12) {
+  const total = Math.max(1, Math.min(30, Number(count) || 12));
+  return Array.from({ length: total }, () => h('div', {
+    class: 'comic-card skeleton-card', 'aria-hidden': 'true',
+  },
+  h('div', { class: 'cover skeleton-block' }),
+  h('div', { class: 'skeleton-line wide' }),
+  h('div', { class: 'skeleton-line short' })));
+}
+
+/**
+ * 移动端下拉刷新。只在页面已经位于顶部、纵向手势明确后接管触摸，
+ * 横向内容条、表单控件和阅读器不会被拦截。
+ */
+export function installPullToRefresh(container, refresh, options = {}) {
+  if (!container || typeof refresh !== 'function' || typeof window === 'undefined') return () => {};
+  const threshold = Math.max(48, Math.min(100, Number(options.threshold) || 68));
+  const indicator = h('div', {
+    class: 'pull-refresh-indicator', role: 'status', 'aria-live': 'polite',
+  }, h('span', { class: 'pull-refresh-spinner', 'aria-hidden': 'true' }), h('span', null, '下拉刷新'));
+  container.classList.add('pull-refresh-host');
+  container.prepend(indicator);
+  let startX = 0; let startY = 0; let distance = 0;
+  let tracking = false; let pulling = false; let refreshing = false;
+
+  const atTop = () => Math.max(0, Number(window.scrollY)
+    || Number(document.scrollingElement?.scrollTop) || 0) <= 1;
+  const blockedTarget = (target) => target instanceof Element
+    && !!target.closest('input,textarea,select,[contenteditable="true"],.hscroll,.chips,dialog');
+  const setDistance = (value) => {
+    distance = Math.max(0, Math.min(104, value));
+    container.style.setProperty('--pull-distance', `${distance}px`);
+    container.classList.toggle('is-pulling', distance > 0);
+    container.classList.toggle('is-ready', distance >= threshold);
+    indicator.lastElementChild.textContent = distance >= threshold ? '松开刷新' : '下拉刷新';
+  };
+  const reset = () => {
+    tracking = false; pulling = false; setDistance(0);
+  };
+  const onStart = (event) => {
+    if (refreshing || event.touches.length !== 1 || !atTop() || blockedTarget(event.target)
+        || document.body.classList.contains('reading') || document.body.classList.contains('offline-reading')) return;
+    startX = event.touches[0].clientX;
+    startY = event.touches[0].clientY;
+    tracking = true;
+  };
+  const onMove = (event) => {
+    if (!tracking || event.touches.length !== 1) return;
+    const dx = event.touches[0].clientX - startX;
+    const dy = event.touches[0].clientY - startY;
+    if (!pulling && (dy <= 7 || Math.abs(dx) > Math.abs(dy))) {
+      if (dy < -4 || Math.abs(dx) > 12) reset();
+      return;
+    }
+    if (!atTop() || dy <= 0) return reset();
+    pulling = true;
+    event.preventDefault();
+    setDistance(Math.pow(Math.max(0, dy - 6), 0.82) * 1.35);
+  };
+  const onEnd = async () => {
+    if (!tracking) return;
+    const shouldRefresh = pulling && distance >= threshold;
+    reset();
+    if (!shouldRefresh || refreshing) return;
+    refreshing = true;
+    container.classList.add('is-refreshing');
+    indicator.lastElementChild.textContent = '正在刷新…';
+    try { await refresh(); }
+    catch (error) { toast(error?.message || '刷新失败'); }
+    finally {
+      refreshing = false;
+      container.classList.remove('is-refreshing');
+      indicator.lastElementChild.textContent = '下拉刷新';
+    }
+  };
+  container.addEventListener('touchstart', onStart, { passive: true });
+  container.addEventListener('touchmove', onMove, { passive: false });
+  container.addEventListener('touchend', onEnd, { passive: true });
+  container.addEventListener('touchcancel', reset, { passive: true });
+  return () => {
+    container.removeEventListener('touchstart', onStart);
+    container.removeEventListener('touchmove', onMove);
+    container.removeEventListener('touchend', onEnd);
+    container.removeEventListener('touchcancel', reset);
+    container.classList.remove('pull-refresh-host', 'is-pulling', 'is-ready', 'is-refreshing');
+    container.style.removeProperty('--pull-distance');
+    indicator.remove();
+  };
+}
+
 import { imgSrc } from './api.js';
 function imgSrcOf(item) { return imgSrc(item); }
 
 /** 无限滚动列表容器：返回 { root, destroy }；路由离开时必须调用 destroy */
 export function infiniteList(loader) {
-  const grid = h('div', { class: 'grid' });
+  const grid = h('div', { class: 'grid' }, comicSkeletons());
   const sentinel = h('div');
   const root = h('div', null, grid, sentinel);
   let page = 0;
@@ -101,6 +192,8 @@ export function infiniteList(loader) {
   let obs = null;
   let controller = null;
   let destroyed = false;
+  let refreshPromise = null;
+  let removePullRefresh = null;
 
   async function loadMore() {
     if (destroyed || loading || finished || failed) return;
@@ -116,6 +209,7 @@ export function infiniteList(loader) {
       const { items, hasMore } = await loader(next, requestController.signal);
       if (destroyed || requestController.signal.aborted) return;
       page = next;
+      grid.querySelectorAll(':scope > .skeleton-card').forEach((node) => node.remove());
       if (!items.length && page === 1) {
         grid.replaceChildren(h('div', { class: 'empty', style: { gridColumn: '1/-1' } },
           h('div', { class: 'big' }, icon('inbox', 40)), '这里什么都没有'));
@@ -130,6 +224,7 @@ export function infiniteList(loader) {
     } catch (e) {
       if (destroyed || requestController.signal.aborted || (e && e.name === 'AbortError')) return;
       failed = true;
+      grid.querySelectorAll(':scope > .skeleton-card').forEach((node) => node.remove());
       toast(e.message);
       sentinel.replaceChildren(h('div', { class: 'error-box' },
         h('div', null, e.message),
@@ -166,6 +261,25 @@ export function infiniteList(loader) {
     obs = null;
     if (controller) controller.abort();
     controller = null;
+    removePullRefresh?.();
+    removePullRefresh = null;
+  }
+
+  function refresh() {
+    if (destroyed) return Promise.resolve();
+    if (refreshPromise) return refreshPromise;
+    refreshPromise = (async () => {
+      controller?.abort();
+      while (loading && !destroyed) await new Promise((resolve) => setTimeout(resolve, 0));
+      if (destroyed) return;
+      page = 0;
+      failed = false;
+      finished = false;
+      sentinel.replaceChildren();
+      grid.replaceChildren(...comicSkeletons());
+      await loadMore();
+    })().finally(() => { refreshPromise = null; });
+    return refreshPromise;
   }
 
   async function loadAll(maxPages = 200) {
@@ -177,8 +291,10 @@ export function infiniteList(loader) {
     return { page, finished, failed };
   }
 
+  removePullRefresh = installPullToRefresh(root, refresh);
   retryObserve();
-  return { root, destroy, loadAll };
+  queueMicrotask(loadMore);
+  return { root, destroy, loadAll, refresh };
 }
 
 /** 简单分页（分类/每周必看） */

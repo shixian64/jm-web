@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "test": "npm run test:unit && npm run test:backend",
-    "test:unit": "node test/photo.test.js && node test/content-filter.test.js",
+    "test:unit": "node test/photo.test.js && node test/content-filter.test.js && node test/offline-metadata.test.js && node test/navigation.test.js",
     "test:backend": "node test/backend.test.js && node test/https-fetch.test.js",
     "check": "node test/check.js"
   },

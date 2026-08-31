@@ -75,6 +75,23 @@ export function createReaderSettings(options) {
     target.click();
   });
 
+  const themeSelect = h('select', { class: 'r-setting-select', 'aria-label': '主题外观' },
+    h('option', { value: 'auto' }, '跟随系统'),
+    h('option', { value: 'light' }, '浅色'),
+    h('option', { value: 'dark' }, '深色'),
+  );
+  themeSelect.addEventListener('change', () => options.onSetting('theme', themeSelect.value));
+
+  const shuntSelect = h('select', { class: 'r-setting-select', 'aria-label': '图片分流线路' },
+    ...[1, 2, 3, 4].map((value) => h('option', { value: String(value) }, `线路 ${value}`)),
+  );
+  shuntSelect.addEventListener('change', () => options.onSetting('shunt', shuntSelect.value));
+
+  const prefetchSelect = h('select', { class: 'r-setting-select', 'aria-label': '阅读预加载数量' },
+    ...[1, 3, 5, 8].map((value) => h('option', { value: String(value) }, `${value} 页`)),
+  );
+  prefetchSelect.addEventListener('change', () => options.onSetting('prefetchCount', Number(prefetchSelect.value)));
+
   const fitSelect = h('select', { class: 'r-setting-select', 'aria-label': '图片适配方式' },
     h('option', { value: 'contain' }, '完整显示'),
     h('option', { value: 'width' }, '适应宽度'),
@@ -164,6 +181,10 @@ export function createReaderSettings(options) {
       ),
       h('section', { class: 'r-setting-section' },
         h('h4', null, '显示'),
+        h('label', { class: 'r-setting-row' },
+          h('span', { class: 'r-setting-copy' }, h('span', { class: 'r-setting-label' }, '主题外观')),
+          themeSelect,
+        ),
         switchRow('亮度跟随系统', '关闭后使用下方阅读亮度', followBrightness),
         rangeRow('阅读亮度', brightness, brightnessValue),
         switchRow('显示页码', '在图片角落显示当前页', showPageNumber),
@@ -177,6 +198,20 @@ export function createReaderSettings(options) {
       ),
       h('section', { class: 'r-setting-section' },
         h('h4', null, '性能'),
+        h('label', { class: 'r-setting-row' },
+          h('span', { class: 'r-setting-copy' },
+            h('span', { class: 'r-setting-label' }, '图片分流'),
+            h('span', { class: 'r-setting-desc' }, '切换后当前章节后续图片立即使用新线路'),
+          ),
+          shuntSelect,
+        ),
+        h('label', { class: 'r-setting-row' },
+          h('span', { class: 'r-setting-copy' },
+            h('span', { class: 'r-setting-label' }, '预加载数量'),
+            h('span', { class: 'r-setting-desc' }, '按设备性能控制前后缓存页数'),
+          ),
+          prefetchSelect,
+        ),
         switchRow('内存优化', '限制同时解码数，适合内存较小的设备', memoryOpt),
         h('label', { class: 'r-setting-row' },
           h('span', { class: 'r-setting-copy' },
@@ -208,6 +243,11 @@ export function createReaderSettings(options) {
     fitSelect.disabled = mode === 'scroll';
     tapModeSelect.value = s.tapMode === 'side' ? 'side' : 'default';
     tapModeSelect.disabled = mode !== 'scroll';
+    themeSelect.value = ['auto', 'light', 'dark'].includes(s.theme) ? s.theme : 'auto';
+    shuntSelect.value = ['1', '2', '3', '4'].includes(String(s.shunt)) ? String(s.shunt) : '1';
+    shuntSelect.disabled = s.offline === true || s.sourceRefreshPending === true || !s.sourceReady;
+    prefetchSelect.value = ['1', '3', '5', '8'].includes(String(s.prefetchCount))
+      ? String(s.prefetchCount) : '3';
     followBrightness.checked = s.brightnessFollowSystem !== false;
     brightness.value = String(Math.round(clamp(s.brightness ?? 1, .2, 1) * 100));
     brightness.disabled = followBrightness.checked;

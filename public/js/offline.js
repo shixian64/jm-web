@@ -417,15 +417,64 @@ export async function requestPersistentStorage() {
   return navigator.storage.persist().catch(() => false);
 }
 
+const RESTORE_REQUEST_LIMIT = 1000;
+const RESTORE_CHAPTER_LIMIT = 10_000;
+
+function backupId(value) {
+  const id = String(value == null ? '' : value).trim();
+  return /^\d{1,24}$/.test(id) ? id : '';
+}
+
+export function buildRestoreRequests(tasks, albums, chapters) {
+  const names = new Map((albums || []).map((album) => [backupId(album?.aid), String(album?.name || '').slice(0, 300)]));
+  const requests = new Map();
+  const merge = (rawAid, rawChapterIds) => {
+    const aid = backupId(rawAid);
+    if (rawChapterIds != null && !Array.isArray(rawChapterIds)) return;
+    if (!aid || (!requests.has(aid) && requests.size >= RESTORE_REQUEST_LIMIT)) return;
+    const incoming = rawChapterIds == null ? null : [...new Set(rawChapterIds
+      .map((item) => backupId(item && typeof item === 'object' ? item.id : item)).filter(Boolean))]
+      .slice(0, RESTORE_CHAPTER_LIMIT);
+    if (rawChapterIds != null && !incoming.length) return;
+    const current = requests.get(aid);
+    if (!current) {
+      requests.set(aid, { aid, name: names.get(aid) || '', chapterIds: incoming });
+      return;
+    }
+    if (current.chapterIds === null || incoming === null) current.chapterIds = null;
+    else current.chapterIds = [...new Set([...current.chapterIds, ...incoming])].slice(0, RESTORE_CHAPTER_LIMIT);
+  };
+
+  // 任务记录最能表达用户原先选择的是整本还是部分章节。
+  for (const task of tasks || []) {
+    if (!task || typeof task !== 'object' || !task.request
+        || !Object.prototype.hasOwnProperty.call(task.request, 'chapterIds')) continue;
+    merge(task.aid, task.request.chapterIds);
+  }
+  // 兼容任务被手动移除、但正文仍保留在资料库中的情况。
+  const chaptersByAlbum = new Map();
+  for (const chapter of chapters || []) {
+    const aid = backupId(chapter?.aid); const photoId = backupId(chapter?.photoId);
+    if (!aid || !photoId) continue;
+    if (!chaptersByAlbum.has(aid)) chaptersByAlbum.set(aid, []);
+    if (chaptersByAlbum.get(aid).length < RESTORE_CHAPTER_LIMIT) chaptersByAlbum.get(aid).push(photoId);
+  }
+  for (const [aid, chapterIds] of chaptersByAlbum) merge(aid, chapterIds);
+  return [...requests.values()];
+}
+
 /**
  * 备份用轻量元数据（不包含可能达数 GiB 的图片/封面 Blob）。
- * 恢复后只作为下载目录参考，不会把没有正文的章节误标为“可离线”。
+ * 恢复后只作为下载目录参考，不会把没有正文的章节误标为“可离线”；
+ * restoreRequests 记录用户原来的整本/选章意图，供恢复页显式重建队列。
  */
 export async function exportOfflineMetadata() {
-  const [albums, chapters] = await Promise.all([getAll(STORE_ALBUMS), getAll(STORE_CHAPTERS)]);
+  const [albums, chapters, tasks] = await Promise.all([
+    getAll(STORE_ALBUMS), getAll(STORE_CHAPTERS), getAll(STORE_TASKS),
+  ]);
   return {
     format: 'jmw-offline-metadata',
-    version: 1,
+    version: 2,
     exportedAt: new Date().toISOString(),
     albums: albums.map(({ coverBlob, ...album }) => ({ ...album, complete: false })),
     chapters: chapters.map((chapter) => ({
@@ -433,37 +482,62 @@ export async function exportOfflineMetadata() {
       complete: false,
       totalBytes: 0,
     })),
+    restoreRequests: buildRestoreRequests(tasks, albums, chapters),
   };
 }
 
 export async function importOfflineMetadata(payload) {
-  if (!payload || payload.format !== 'jmw-offline-metadata' || Number(payload.version) !== 1) {
+  const version = Number(payload?.version);
+  if (!payload || payload.format !== 'jmw-offline-metadata' || ![1, 2].includes(version)) {
     throw new Error('离线缓存元数据格式不受支持');
   }
   const albums = Array.isArray(payload.albums) ? payload.albums.slice(0, 5000) : [];
   const chapters = Array.isArray(payload.chapters) ? payload.chapters.slice(0, 50_000) : [];
+  let importedAlbums = 0; let importedChapters = 0;
   for (const album of albums) {
-    if (!album || !album.aid) continue;
-    const existing = await getOfflineAlbum(album.aid);
+    const aid = backupId(album?.aid);
+    if (!aid || typeof album !== 'object' || Array.isArray(album)) continue;
+    const existing = await getOfflineAlbum(aid);
     await putOfflineAlbum({
       ...album,
+      aid,
       coverBlob: existing && existing.coverBlob,
       complete: Boolean(existing && existing.complete),
       totalBytes: Number(existing && existing.totalBytes || 0),
       totalImages: Number(existing && existing.totalImages || 0),
       downloadedChapters: (existing && existing.downloadedChapters) || [],
     });
+    importedAlbums++;
   }
   for (const chapter of chapters) {
-    if (!chapter || !chapter.aid || !chapter.photoId) continue;
-    const existing = await getOfflineChapter(chapter.aid, chapter.photoId);
+    const aid = backupId(chapter?.aid); const photoId = backupId(chapter?.photoId);
+    if (!aid || !photoId || typeof chapter !== 'object' || Array.isArray(chapter)) continue;
+    const existing = await getOfflineChapter(aid, photoId);
     await putOfflineChapter({
       ...chapter,
+      aid,
+      photoId,
       complete: Boolean(existing && existing.complete),
       totalBytes: Number(existing && existing.totalBytes || 0),
     });
+    importedChapters++;
   }
-  return { albums: albums.length, chapters: chapters.length };
+  const sourceRequests = version >= 2 && Array.isArray(payload.restoreRequests)
+    ? payload.restoreRequests.slice(0, RESTORE_REQUEST_LIMIT).filter((item) => item
+      && typeof item === 'object' && !Array.isArray(item)
+      && Object.prototype.hasOwnProperty.call(item, 'chapterIds'))
+    : [];
+  const restoreRequests = buildRestoreRequests(
+    sourceRequests.map((item) => ({ aid: item?.aid, request: { chapterIds: item?.chapterIds } })),
+    albums,
+    // 旧格式没有显式恢复意图，只能把目录里的章节作为选章任务恢复。
+    sourceRequests.length ? [] : chapters,
+  ).map((request) => ({
+    ...request,
+    name: String(sourceRequests.find((item) => backupId(item?.aid) === request.aid)?.name
+      || request.name || '').slice(0, 300),
+  }));
+  return { albums: importedAlbums, chapters: importedChapters, restoreRequests };
 }
 
 /**

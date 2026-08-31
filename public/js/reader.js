@@ -12,6 +12,7 @@ import {
 } from './offline.js';
 
 const RAW_CACHE_LIMIT = 24;
+const READER_TUTORIAL_KEY = 'jmw_reader_tutorial_dismissed_v1';
 
 export function mountReader(root, photoId, query, options = {}) {
   const aid = query.get('aid') || '';
@@ -47,7 +48,14 @@ export function mountReader(root, photoId, query, options = {}) {
   };
 
   const decodeQueue = new Map(); // idx -> 进行中的解码 Promise（并发去重 + 复用）
+  const retiredObjectUrls = new Set();
+  let imageController = new AbortController();
+  let imageGeneration = 0;
+  let imageSourceVersion = 0;
   let activeDecodes = 0;
+  let sourceRefreshSeq = 0;
+  let sourceRefreshPending = false;
+  let activeImageShunt = ['1', '2', '3', '4'].includes(String(setting.shunt)) ? String(setting.shunt) : '1';
   let scrollObserver = null;
   let scrollRaf = 0;
   let historyTimer = null;
@@ -56,8 +64,15 @@ export function mountReader(root, photoId, query, options = {}) {
   let restoreTimer = null;
   let toolbarTimer = null;
   let progressTimer = null;
+  let tutorialTimer = null;
+  let tutorialEl = null;
   let wakeLock = null;
   let explicitStartPending = requestedPage != null;
+  const colorSchemeMedia = typeof window.matchMedia === 'function'
+    ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+  const onColorSchemeChange = () => {
+    if (!state.destroyed && setting.theme === 'auto') applyReaderSettings();
+  };
 
   function abortError() {
     try {
@@ -71,6 +86,11 @@ export function mountReader(root, photoId, query, options = {}) {
 
   function assertActive() {
     if (state.destroyed || signal.aborted) throw abortError();
+  }
+
+  function assertImageActive(generation, imageSignal) {
+    assertActive();
+    if (generation !== imageGeneration || imageSignal.aborted) throw abortError();
   }
 
   async function readerRequest(path) {
@@ -211,6 +231,74 @@ export function mountReader(root, photoId, query, options = {}) {
   refreshModeBtns();
   applyReaderSettings();
   root.appendChild(container);
+  if (typeof colorSchemeMedia?.addEventListener === 'function') {
+    colorSchemeMedia.addEventListener('change', onColorSchemeChange);
+  } else if (typeof colorSchemeMedia?.addListener === 'function') {
+    colorSchemeMedia.addListener(onColorSchemeChange);
+  }
+
+  function dismissTutorial() {
+    if (tutorialTimer) clearTimeout(tutorialTimer);
+    tutorialTimer = null;
+    if (!tutorialEl) return;
+    const restoreFocus = tutorialEl.contains(document.activeElement);
+    tutorialEl.remove();
+    tutorialEl = null;
+    if (restoreFocus && !state.destroyed) fabBtn.focus({ preventScroll: true });
+  }
+
+  function maybeShowReaderTutorial() {
+    if (state.destroyed || tutorialEl || !state.images.length) return;
+    try {
+      if (localStorage.getItem(READER_TUTORIAL_KEY) === '1') return;
+      // 记录“已经展示”而非等到完成，确保任何设备上都只自动出现一次。
+      localStorage.setItem(READER_TUTORIAL_KEY, '1');
+    } catch (_) {}
+
+    const modeTip = state.mode === 'scroll'
+      ? '上下滑动连续阅读；工具栏隐藏时，轻点上/下区域可快速滚动一屏。'
+      : state.mode === 'pageReverse'
+        ? '向左阅读：左右轻扫或轻点两侧翻页，桌面也可使用方向键。'
+        : state.mode === 'tap'
+          ? '轻点画面两侧翻页，中间区域用于显示或隐藏工具栏。'
+          : '左右轻扫或轻点两侧翻页，桌面也可使用方向键。';
+    const steps = [
+      ['找到控制', '点右下角圆形按钮显示工具栏；再次点底部页码即可专注阅读。'],
+      ['阅读与翻页', modeTip],
+      ['缩放与设置', setting.supportZoom === false
+        ? '点工具栏齿轮可切换模式、主题、线路与预加载，也能重新开启图片缩放。'
+        : '翻页模式支持双指缩放、双击放大；点工具栏齿轮可随时调整主题、线路与预加载。'],
+    ];
+    let step = 0;
+    const title = h('strong', { class: 'r-tutorial-title' });
+    const copy = h('p', { class: 'r-tutorial-copy' });
+    const next = h('button', { class: 'r-tutorial-next', type: 'button' });
+    const skip = h('button', {
+      class: 'r-tutorial-skip', type: 'button', onclick: dismissTutorial,
+    }, '跳过');
+    const paint = () => {
+      title.textContent = `${steps[step][0]} · ${step + 1}/${steps.length}`;
+      copy.textContent = steps[step][1];
+      next.textContent = step === steps.length - 1 ? '知道了' : '下一步';
+    };
+    next.addEventListener('click', () => {
+      if (step >= steps.length - 1) dismissTutorial();
+      else { step++; paint(); }
+    });
+    tutorialEl = h('aside', {
+      class: 'r-tutorial', role: 'dialog', 'aria-modal': 'false', 'aria-label': '首次阅读操作引导',
+    },
+      h('div', { class: 'r-tutorial-head' }, h('span', { 'aria-hidden': 'true' }, icon('book-open', 18)), title),
+      copy,
+      h('div', { class: 'r-tutorial-actions' }, skip, next),
+    );
+    paint();
+    container.append(tutorialEl);
+    tutorialTimer = setTimeout(() => {
+      tutorialTimer = null;
+      if (!state.destroyed && tutorialEl) next.focus({ preventScroll: true });
+    }, 80);
+  }
 
   function isPagedMode(mode = state.mode) {
     return mode === 'page' || mode === 'pageReverse' || mode === 'tap';
@@ -223,6 +311,12 @@ export function mountReader(root, photoId, query, options = {}) {
   function settingsSnapshot() {
     return {
       mode: state.mode,
+      theme: setting.theme,
+      shunt: setting.shunt,
+      prefetchCount: setting.prefetchCount,
+      offline,
+      sourceReady: state.images.length > 0,
+      sourceRefreshPending,
       pageFit: setting.pageFit,
       tapMode: setting.tapMode,
       brightnessFollowSystem: setting.brightnessFollowSystem,
@@ -245,7 +339,11 @@ export function mountReader(root, photoId, query, options = {}) {
     if (state.destroyed) return;
     const brightness = Math.max(.2, Math.min(1, Number(setting.brightness) || 1));
     const follow = setting.brightnessFollowSystem !== false;
+    const systemDark = typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const lightTheme = setting.theme === 'light' || (setting.theme === 'auto' && !systemDark);
     brightnessLayer.style.opacity = follow ? '0' : String(1 - brightness);
+    container.classList.toggle('theme-light', lightTheme);
     container.classList.toggle('hide-page-numbers', setting.showPageNumber === false);
     container.classList.toggle('zoom-enabled', setting.supportZoom !== false && isPagedMode());
     container.classList.toggle('progress-pinned', setting.readerToolbarAutoHide === false);
@@ -256,6 +354,13 @@ export function mountReader(root, photoId, query, options = {}) {
 
   function changeReaderSetting(key, value) {
     if (state.destroyed) return;
+    if (key === 'theme' && !['auto', 'light', 'dark'].includes(value)) return;
+    if (key === 'shunt') {
+      value = String(value);
+      if (!['1', '2', '3', '4'].includes(value)) return;
+    }
+    if (key === 'prefetchCount') value = Math.max(1, Math.min(12, Number(value) || 3));
+    const previous = setting[key];
     const patch = { [key]: value };
     if (key === 'brightness') patch.brightness = Math.max(.2, Math.min(1, Number(value) || 1));
     updateSetting(patch);
@@ -266,6 +371,10 @@ export function mountReader(root, photoId, query, options = {}) {
     }
     if (key === 'supportZoom' && value === false) resetZoom();
     if (key === 'keepAwake') syncWakeLock(true);
+    if (key === 'prefetchCount' && Number(previous) !== Number(value)) refreshPrefetchWindow();
+    if (key === 'shunt' && String(previous) !== value && !offline && state.images.length) {
+      refreshImageShunt(value);
+    }
     applyReaderSettings();
     if (key === 'readerToolbarAutoHide') scheduleToolbarHide();
   }
@@ -479,6 +588,8 @@ export function mountReader(root, photoId, query, options = {}) {
     if (state.destroyed) return; // 路由清理与手动 close 可能双重触发
     flushHistory();
     state.destroyed = true;
+    sourceRefreshSeq++;
+    imageController.abort();
     abortController.abort();
     body.classList.remove('reading', 'no-tab');
     disconnectScrollObserver();
@@ -488,6 +599,11 @@ export function mountReader(root, photoId, query, options = {}) {
     window.removeEventListener('keydown', keyHandler);
     window.removeEventListener('pagehide', pageHideHandler);
     document.removeEventListener('visibilitychange', visibilityHandler);
+    if (typeof colorSchemeMedia?.removeEventListener === 'function') {
+      colorSchemeMedia.removeEventListener('change', onColorSchemeChange);
+    } else if (typeof colorSchemeMedia?.removeListener === 'function') {
+      colorSchemeMedia.removeListener(onColorSchemeChange);
+    }
     clearToolbarTimer();
     if (progressTimer) clearTimeout(progressTimer);
     progressTimer = null;
@@ -501,11 +617,14 @@ export function mountReader(root, photoId, query, options = {}) {
     historyTimer = null;
     if (hintTimer) clearTimeout(hintTimer);
     hintTimer = null;
+    dismissTutorial();
     if (restoreTimer) clearTimeout(restoreTimer);
     restoreTimer = null;
     hint.classList.remove('show');
     decodeQueue.clear();
     for (const d of state.decoded.values()) URL.revokeObjectURL(d.url);
+    for (const url of retiredObjectUrls) URL.revokeObjectURL(url);
+    retiredObjectUrls.clear();
     state.decoded.clear();
     state.raws.clear();
     state.dims.clear();
@@ -574,8 +693,9 @@ export function mountReader(root, photoId, query, options = {}) {
       ? readerRequest(`/album?id=${encodeURIComponent(state.aid)}`).catch(() => null)
       : Promise.resolve(null);
     let data;
+    const requestedShunt = ['1', '2', '3', '4'].includes(String(setting.shunt)) ? String(setting.shunt) : '1';
     try {
-      data = await readerRequest(`/chapter?id=${encodeURIComponent(state.photoId)}&shunt=${encodeURIComponent(setting.shunt || 1)}`);
+      data = await readerRequest(`/chapter?id=${encodeURIComponent(state.photoId)}&shunt=${encodeURIComponent(requestedShunt)}`);
     } catch (e) {
       if (state.destroyed || signal.aborted || e.name === 'AbortError') return;
       showFatal(e.message);
@@ -586,6 +706,7 @@ export function mountReader(root, photoId, query, options = {}) {
     state.images = d.images || [];
     state.scrambleId = d.scrambleId || 0;
     state.speed = d.speed || '';
+    activeImageShunt = requestedShunt;
 
     const album = await albumPromise;
     if (state.destroyed) return;
@@ -664,6 +785,94 @@ export function mountReader(root, photoId, query, options = {}) {
 
   /* ---------- 解码调度 ---------- */
 
+  function restartImagePipeline({ reuseDecoded = false } = {}) {
+    imageController.abort();
+    imageController = new AbortController();
+    imageGeneration++;
+    decodeQueue.clear();
+    if (reuseDecoded) {
+      // 仅调整预加载窗口时，已验证的图片仍然有效；给它们换代，避免当前页闪烁。
+      for (const rec of state.decoded.values()) {
+        if (rec.sourceVersion === imageSourceVersion) rec.generation = imageGeneration;
+      }
+      pages.querySelectorAll('.slot[data-idx]').forEach((slot) => {
+        const rec = state.decoded.get(Number(slot.dataset.idx));
+        if (rec?.sourceVersion === imageSourceVersion && slot.dataset.objectUrl === rec.url) {
+          slot.dataset.generation = String(imageGeneration);
+        }
+      });
+    } else {
+      // 分流变更后 URL/解扰参数可能改变，原始响应绝不能跨线路复用。
+      imageSourceVersion++;
+      state.raws.clear();
+    }
+  }
+
+  function refreshPrefetchWindow() {
+    if (state.destroyed || !state.images.length) return;
+    restartImagePipeline({ reuseDecoded: true });
+    const generation = imageGeneration;
+    if (isPagedMode()) {
+      ensureDecoded(state.cur).then((rec) => {
+        if (rec && !state.destroyed && generation === imageGeneration && isPagedMode()) mountSlot(state.cur);
+      });
+    }
+    prefetchAround(state.cur);
+  }
+
+  async function refreshImageShunt(shunt) {
+    if (state.destroyed || offline || !state.images.length) return;
+    const seq = ++sourceRefreshSeq;
+    sourceRefreshPending = true;
+    settingsUI.refresh();
+    showHint(`正在切换到图片线路 ${shunt}…`);
+    try {
+      const data = await readerRequest(`/chapter?id=${encodeURIComponent(state.photoId)}&shunt=${encodeURIComponent(shunt)}`);
+      if (state.destroyed || seq !== sourceRefreshSeq) return;
+      const next = data && data.data || {};
+      if (!Array.isArray(next.images) || !next.images.length) throw new Error('新线路没有返回有效图片');
+
+      const previousTotal = state.images.length;
+      restartImagePipeline({ reuseDecoded: false });
+      state.images = next.images;
+      state.scrambleId = next.scrambleId || 0;
+      state.speed = next.speed || '';
+      state.cur = Math.max(0, Math.min(state.images.length - 1, state.cur));
+      activeImageShunt = shunt;
+      sourceRefreshPending = false;
+      settingsUI.refresh();
+
+      const generation = imageGeneration;
+      if (state.images.length !== previousTotal) {
+        // 页数异常变化时先在后台准备当前页，再重建槽位，避免把正在看的图先清空。
+        const rec = await ensureDecoded(state.cur);
+        if (state.destroyed || seq !== sourceRefreshSeq || generation !== imageGeneration) return;
+        if (rec) render();
+        else {
+          showHint(`已切换到线路 ${shunt}，当前页加载失败，请重试`);
+          return;
+        }
+      } else {
+        if (isPagedMode()) {
+          const current = state.cur;
+          ensureDecoded(current).then((rec) => {
+            if (rec && !state.destroyed && seq === sourceRefreshSeq
+                && generation === imageGeneration && state.cur === current && isPagedMode()) mountSlot(current);
+          });
+        }
+        prefetchAround(state.cur);
+      }
+      showHint(`图片线路已切换为 ${shunt}`);
+    } catch (e) {
+      if (state.destroyed || seq !== sourceRefreshSeq || e.name === 'AbortError') return;
+      sourceRefreshPending = false;
+      // 设置值必须与仍在显示的实际线路一致，失败时安全回退。
+      updateSetting({ shunt: activeImageShunt });
+      applyReaderSettings();
+      showHint(`线路切换失败：${e.message || '无法连接'}`);
+    }
+  }
+
   function isRaw(idx) {
     if (offline) return true;
     const img = state.images[idx];
@@ -680,8 +889,8 @@ export function mountReader(root, photoId, query, options = {}) {
     return chapterImgSrc(state.images[idx].url);
   }
 
-  async function getRawBlob(idx) {
-    assertActive();
+  async function getRawBlob(idx, generation, imageSignal) {
+    assertImageActive(generation, imageSignal);
     if (state.raws.has(idx)) {
       const b = state.raws.get(idx);
       state.raws.delete(idx);
@@ -697,12 +906,12 @@ export function mountReader(root, photoId, query, options = {}) {
       const res = await fetch(srcOf(idx), {
         headers: { 'X-JMW-Data-Source': selectedDataSource() },
         credentials: 'same-origin',
-        signal,
+        signal: imageSignal,
       });
       if (!res.ok) throw new Error(`图片 ${idx + 1} 获取失败（${res.status}）`);
       blob = await res.blob();
     }
-    assertActive();
+    assertImageActive(generation, imageSignal);
     state.raws.set(idx, blob);
     while (state.raws.size > RAW_CACHE_LIMIT) {
       const firstKey = state.raws.keys().next().value;
@@ -714,33 +923,54 @@ export function mountReader(root, photoId, query, options = {}) {
   /** 同一页的并发请求共享同一个解码 Promise；完成后从队列移除 */
   function ensureDecoded(idx) {
     if (state.destroyed || signal.aborted) return Promise.resolve(null);
-    if (state.decoded.has(idx)) return Promise.resolve(state.decoded.get(idx));
+    const cached = state.decoded.get(idx);
+    if (cached && cached.generation === imageGeneration && cached.sourceVersion === imageSourceVersion) {
+      return Promise.resolve(cached);
+    }
     if (decodeQueue.has(idx)) return decodeQueue.get(idx);
-    const p = doDecode(idx).finally(() => decodeQueue.delete(idx));
+    const generation = imageGeneration;
+    const sourceVersion = imageSourceVersion;
+    const imageSignal = imageController.signal;
+    let p;
+    p = doDecode(idx, generation, sourceVersion, imageSignal).finally(() => {
+      // 换线路后同一页可能已有新 Promise，旧任务结束时不能误删新任务。
+      if (decodeQueue.get(idx) === p) decodeQueue.delete(idx);
+    });
     decodeQueue.set(idx, p);
     return p;
   }
 
-  async function doDecode(idx) {
+  function retireDecoded(rec) {
+    if (!rec?.url) return;
+    let mounted = false;
+    pages.querySelectorAll('.slot[data-object-url]').forEach((slot) => {
+      if (slot.dataset.objectUrl === rec.url) mounted = true;
+    });
+    if (mounted) retiredObjectUrls.add(rec.url);
+    else URL.revokeObjectURL(rec.url);
+  }
+
+  async function doDecode(idx, generation, sourceVersion, imageSignal) {
     let acquired = false;
     try {
-      assertActive();
+      assertImageActive(generation, imageSignal);
       // 限制完整的“取图 + 解扰/校验”任务，而不只是 Canvas 解扰阶段。
       // 否则一次预取可同时发出二十余个图片请求，挤满服务端图片代理槽位。
       while (activeDecodes >= decodeConcurrency()) {
-        await waitForDecodeSlot();
-        assertActive();
+        await waitForDecodeSlot(generation, imageSignal);
+        assertImageActive(generation, imageSignal);
       }
       activeDecodes++;
       acquired = true;
       const img = state.images[idx];
       // 原图统一走 raws LRU：解扰页重看时也能复用已下载的 blob
-      const blob = await getRawBlob(idx);
+      const blob = await getRawBlob(idx, generation, imageSignal);
       if (!isRaw(idx)) {
         const { blob: out, width, height } = await decodeFromBlob(blob, Number(state.photoId), img.page);
-        assertActive();
+        assertImageActive(generation, imageSignal);
         const url = URL.createObjectURL(out);
-        const rec = { url, width, height };
+        const rec = { url, width, height, generation, sourceVersion };
+        retireDecoded(state.decoded.get(idx));
         state.decoded.set(idx, rec);
         state.dims.set(idx, { width, height });
         return rec;
@@ -750,34 +980,39 @@ export function mountReader(root, photoId, query, options = {}) {
         : null;
       const dims = bmp ? { width: bmp.width, height: bmp.height } : null;
       bmp?.close();
-      assertActive();
+      assertImageActive(generation, imageSignal);
       const url = URL.createObjectURL(blob);
-      const rec = { url, ...dims };
+      const rec = { url, ...dims, generation, sourceVersion };
+      retireDecoded(state.decoded.get(idx));
       state.decoded.set(idx, rec);
       state.dims.set(idx, dims || {});
       return rec;
     } catch (e) {
-      if (!state.destroyed && !signal.aborted && e.name !== 'AbortError') markError(idx, e.message);
+      if (!state.destroyed && !signal.aborted && !imageSignal.aborted
+          && generation === imageGeneration && e.name !== 'AbortError') markError(idx, e.message);
       return null;
     } finally {
       if (acquired) activeDecodes--;
     }
   }
 
-  function waitForDecodeSlot() {
-    if (signal.aborted) return Promise.reject(abortError());
+  function waitForDecodeSlot(generation, imageSignal) {
+    if (signal.aborted || imageSignal.aborted || generation !== imageGeneration) return Promise.reject(abortError());
     return new Promise((resolve, reject) => {
       const timer = setTimeout(done, 60);
       const onAbort = () => {
         clearTimeout(timer);
         signal.removeEventListener('abort', onAbort);
+        imageSignal.removeEventListener('abort', onAbort);
         reject(abortError());
       };
       function done() {
         signal.removeEventListener('abort', onAbort);
+        imageSignal.removeEventListener('abort', onAbort);
         resolve();
       }
       signal.addEventListener('abort', onAbort, { once: true });
+      imageSignal.addEventListener('abort', onAbort, { once: true });
     });
   }
 
@@ -832,9 +1067,13 @@ export function mountReader(root, photoId, query, options = {}) {
     const slot = pages.querySelector(`.slot[data-idx="${idx}"]`);
     if (!slot || state.destroyed) return;
     const rec = state.decoded.get(idx);
-    if (!rec) return;
-    if (slot.dataset.mounted === '1') return;
+    if (!rec || rec.generation !== imageGeneration || rec.sourceVersion !== imageSourceVersion) return;
+    if (slot.dataset.mounted === '1' && slot.dataset.generation === String(rec.generation)
+        && slot.dataset.objectUrl === rec.url) return;
+    const previousObjectUrl = slot.dataset.objectUrl || '';
     slot.dataset.mounted = '1';
+    slot.dataset.generation = String(rec.generation);
+    slot.dataset.objectUrl = rec.url;
     const image = h('img', {
       src: rec.url, alt: `第${idx + 1}页`, draggable: 'false',
       onerror: () => {
@@ -847,6 +1086,8 @@ export function mountReader(root, photoId, query, options = {}) {
         state.raws.delete(idx);
         state.dims.delete(idx);
         slot.dataset.mounted = '0';
+        delete slot.dataset.generation;
+        delete slot.dataset.objectUrl;
         slot.replaceChildren(placeholderFor(idx));
         markError(idx, '图片数据损坏或浏览器无法解码');
       },
@@ -857,6 +1098,9 @@ export function mountReader(root, photoId, query, options = {}) {
       applyZoomTransform();
     } else {
       slot.replaceChildren(h('div', { class: 'page-num' }, `${idx + 1}`), image);
+    }
+    if (previousObjectUrl && previousObjectUrl !== rec.url && retiredObjectUrls.delete(previousObjectUrl)) {
+      URL.revokeObjectURL(previousObjectUrl);
     }
   }
 
@@ -914,6 +1158,8 @@ export function mountReader(root, photoId, query, options = {}) {
         const slot = pages.querySelector(`.slot[data-idx="${k}"]`);
         if (slot) {
           slot.dataset.mounted = '0';
+          delete slot.dataset.generation;
+          delete slot.dataset.objectUrl;
           slot.replaceChildren(placeholderFor(k));
         }
       }
@@ -1295,6 +1541,13 @@ export function mountReader(root, photoId, query, options = {}) {
 
   const keyHandler = (e) => {
     if (e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+    if (tutorialEl) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        dismissTutorial();
+      }
+      return;
+    }
     if (settingsUI.isOpen()) {
       if (e.key === 'Escape') {
         e.preventDefault();
@@ -1439,6 +1692,7 @@ export function mountReader(root, photoId, query, options = {}) {
       if (saved) showHint(saved.explicit ? `已跳转到第 ${saved.page + 1} 页` : '已恢复上次阅读位置');
     }
     applyReaderSettings();
+    maybeShowReaderTutorial();
   }
 
   function scheduleScrollRestore(idx, offset = .5) {

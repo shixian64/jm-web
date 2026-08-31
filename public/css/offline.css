@@ -224,6 +224,88 @@ body.offline-reading {
   font-size: 17px;
 }
 
+.download-section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.download-section-heading .download-batch-toggle {
+  margin-top: 12px;
+}
+
+.download-batch-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line, #e4e6eb);
+  border-radius: 12px;
+  background: var(--card, #fff);
+}
+
+.download-batch-toolbar[hidden],
+.download-task-select[hidden] {
+  display: none;
+}
+
+.download-select-all,
+.download-task-select {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  cursor: pointer;
+}
+
+.download-select-all input,
+.download-task-select input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--primary, #e5588a);
+  cursor: pointer;
+}
+
+.download-select-all input:disabled,
+.download-task-select input:disabled {
+  cursor: wait;
+}
+
+.download-batch-summary {
+  min-width: 0;
+  margin-right: auto;
+  color: var(--text-2, #747986);
+  font-size: 12px;
+}
+
+.download-batch-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.download-batch-actions .download-action {
+  white-space: nowrap;
+}
+
+.download-batch-announcement,
+.download-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .download-center p,
 .download-storage,
 .download-meta,
@@ -252,6 +334,36 @@ body.offline-reading {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.download-task-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+}
+
+.download-task-title strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.download-task-select {
+  width: 34px;
+}
+
+.download-section.batch-selecting .download-task {
+  cursor: pointer;
+}
+
+.download-section.batch-selecting .download-task.is-selected {
+  border-color: var(--primary, #e5588a);
+  background: color-mix(in srgb, var(--card, #fff) 94%, var(--primary, #e5588a));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary, #e5588a) 16%, transparent);
+}
+
+.download-section.batch-selecting .download-task > .download-actions {
+  display: none;
 }
 
 .download-task progress {
@@ -450,6 +562,37 @@ body.offline-reading {
 
   .download-storage {
     width: 100%;
+  }
+
+  .download-batch-toolbar {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    padding: 10px;
+  }
+
+  .download-select-all,
+  .download-task-select {
+    min-height: 42px;
+  }
+
+  .download-batch-summary {
+    align-self: center;
+  }
+
+  .download-batch-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .download-batch-actions .download-action {
+    min-height: 42px;
+    min-width: 0;
+  }
+
+  .download-section-heading .download-batch-toggle {
+    min-height: 40px;
   }
 
   .offline-album {

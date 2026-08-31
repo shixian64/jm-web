@@ -54,6 +54,11 @@ function statusLabel(status) {
   })[status] || status;
 }
 
+const ACTIVE_TASK_STATUSES = new Set(['queued', 'fetching', 'downloading']);
+// 批量操作会逐项经过下载管理器的跨标签停写/锁流程，限制单批数量既避免
+// 无意中一次删除过多任务，也让不支持 Web Locks 的浏览器能在可预期时间内完成。
+const MAX_BATCH_SELECTION = 50;
+
 function actionButton(label, fn, kind = '') {
   const button = element('button', { type: 'button', class: `download-action ${kind}`.trim() }, label);
   button.addEventListener('click', async () => {
@@ -78,14 +83,54 @@ export function mountDownloadCenter(root, options = {}) {
   let libraryRenderPending = false;
   let storageRefreshPromise = null;
   let storageRefreshPending = false;
+  let latestTasks = [];
+  let batchMode = false;
+  let batchBusy = false;
   const coverUrls = new Set();
   const taskNodes = new Map();
+  const selectedTaskIds = new Set();
   const taskArea = element('section', { class: 'download-section' });
   const libraryArea = element('section', { class: 'download-section' });
   const integrityArea = element('section', { class: 'download-section', 'aria-live': 'polite' });
   const taskHeading = element('h2', { text: '下载任务 (0)', tabindex: '-1' });
+  const batchToolbarId = `download-batch-${Math.random().toString(36).slice(2, 10)}`;
+  const batchToggle = element('button', {
+    type: 'button',
+    class: 'download-action download-batch-toggle',
+    'aria-expanded': 'false',
+    'aria-controls': batchToolbarId,
+    hidden: '',
+  }, '批量管理');
+  const selectAll = element('input', { type: 'checkbox', 'aria-label': '全选下载任务' });
+  const selectAllText = element('span', { text: '全选' });
+  const batchSummary = element('span', { class: 'download-batch-summary', text: '已选择 0 项' });
+  const batchAnnouncement = element('span', {
+    class: 'download-batch-announcement',
+    'aria-live': 'polite',
+    'aria-atomic': 'true',
+  });
+  const batchPause = element('button', { type: 'button', class: 'download-action' }, '暂停');
+  const batchResume = element('button', { type: 'button', class: 'download-action primary' }, '继续');
+  const batchRetry = element('button', { type: 'button', class: 'download-action primary' }, '重试');
+  const batchRemove = element('button', { type: 'button', class: 'download-action danger' }, '删除任务');
+  const batchButtons = [batchPause, batchResume, batchRetry, batchRemove];
+  const batchToolbar = element('div', {
+    id: batchToolbarId,
+    class: 'download-batch-toolbar',
+    role: 'group',
+    'aria-label': '批量管理下载任务',
+    hidden: '',
+  },
+  element('label', { class: 'download-select-all' }, selectAll, selectAllText),
+  batchSummary,
+  element('div', { class: 'download-batch-actions' }, ...batchButtons));
   const taskEmpty = element('div', { class: 'download-empty', text: '还没有下载任务，可从漫画详情页选择下载。' });
-  taskArea.append(taskHeading, taskEmpty);
+  taskArea.append(
+    element('div', { class: 'download-section-heading' }, taskHeading, batchToggle),
+    batchToolbar,
+    batchAnnouncement,
+    taskEmpty,
+  );
   const storageText = element('span', { class: 'download-storage', text: '正在统计空间…' });
   const container = element('div', { class: 'download-center' },
     element('header', { class: 'download-center-head' },
@@ -105,6 +150,164 @@ export function mountDownloadCenter(root, options = {}) {
     libraryArea,
   );
   root.append(container);
+
+  function selectedTasks(predicate = () => true) {
+    return latestTasks.filter((task) => selectedTaskIds.has(String(task.id)) && predicate(task));
+  }
+
+  function announceBatch(message) {
+    // 重复执行同一种操作时也要让屏幕阅读器重新播报。
+    batchAnnouncement.textContent = '';
+    queueMicrotask(() => {
+      if (!destroyed) batchAnnouncement.textContent = message;
+    });
+  }
+
+  function updateBatchUi() {
+    const taskIds = new Set(latestTasks.map((task) => String(task.id)));
+    for (const id of selectedTaskIds) if (!taskIds.has(id)) selectedTaskIds.delete(id);
+
+    const selectable = latestTasks.slice(0, MAX_BATCH_SELECTION);
+    const allSelected = selectable.length > 0
+      && selectable.every((task) => selectedTaskIds.has(String(task.id)))
+      && selectedTaskIds.size === selectable.length;
+    selectAll.checked = allSelected;
+    selectAll.indeterminate = selectedTaskIds.size > 0 && !allSelected;
+    selectAll.disabled = batchBusy || latestTasks.length === 0;
+    selectAllText.textContent = latestTasks.length > MAX_BATCH_SELECTION
+      ? `全选前 ${MAX_BATCH_SELECTION} 项`
+      : '全选';
+    selectAll.setAttribute('aria-label', latestTasks.length > MAX_BATCH_SELECTION
+      ? `全选前 ${MAX_BATCH_SELECTION} 个下载任务`
+      : '全选下载任务');
+    batchSummary.textContent = `已选择 ${selectedTaskIds.size} 项${latestTasks.length > MAX_BATCH_SELECTION ? `（单批最多 ${MAX_BATCH_SELECTION} 项）` : ''}`;
+
+    const pausable = selectedTasks((task) => ACTIVE_TASK_STATUSES.has(task.status)).length;
+    const resumable = selectedTasks((task) => task.status === 'paused').length;
+    const retryable = selectedTasks((task) => task.status === 'failed').length;
+    batchPause.textContent = pausable ? `暂停 (${pausable})` : '暂停';
+    batchResume.textContent = resumable ? `继续 (${resumable})` : '继续';
+    batchRetry.textContent = retryable ? `重试 (${retryable})` : '重试';
+    batchRemove.textContent = selectedTaskIds.size ? `删除任务 (${selectedTaskIds.size})` : '删除任务';
+    batchToolbar.setAttribute('aria-busy', String(batchBusy));
+    batchPause.disabled = batchBusy || pausable === 0;
+    batchResume.disabled = batchBusy || resumable === 0;
+    batchRetry.disabled = batchBusy || retryable === 0;
+    batchRemove.disabled = batchBusy || selectedTaskIds.size === 0;
+    batchToggle.disabled = batchBusy;
+
+    for (const [id, record] of taskNodes) {
+      const checked = selectedTaskIds.has(id);
+      record.checkbox.checked = checked;
+      record.checkbox.disabled = batchBusy
+        || (!checked && selectedTaskIds.size >= MAX_BATCH_SELECTION);
+      record.selection.hidden = !batchMode;
+      record.article.classList.toggle('is-selected', batchMode && checked);
+    }
+  }
+
+  function setBatchMode(enabled, { restoreFocus = false } = {}) {
+    batchMode = Boolean(enabled) && latestTasks.length > 0;
+    if (!batchMode) selectedTaskIds.clear();
+    taskArea.classList.toggle('batch-selecting', batchMode);
+    batchToolbar.hidden = !batchMode;
+    batchToggle.textContent = batchMode ? '完成' : '批量管理';
+    batchToggle.setAttribute('aria-expanded', String(batchMode));
+    updateBatchUi();
+    announceBatch(batchMode ? '已进入批量管理模式' : '已退出批量管理模式');
+    if (batchMode) queueMicrotask(() => selectAll.focus({ preventScroll: true }));
+    else if (restoreFocus) queueMicrotask(() => batchToggle.focus({ preventScroll: true }));
+  }
+
+  function toggleTaskSelection(id, checked, checkbox) {
+    id = String(id);
+    if (checked) {
+      if (selectedTaskIds.size >= MAX_BATCH_SELECTION && !selectedTaskIds.has(id)) {
+        checkbox.checked = false;
+        announceBatch(`每批最多选择 ${MAX_BATCH_SELECTION} 个任务，请先处理当前选择`);
+        return;
+      }
+      selectedTaskIds.add(id);
+    } else selectedTaskIds.delete(id);
+    updateBatchUi();
+    announceBatch(`已选择 ${selectedTaskIds.size} 个任务`);
+  }
+
+  async function runBatch({ label, pastLabel, predicate, operation, confirmMessage }) {
+    if (batchBusy) return;
+    const targets = selectedTasks(predicate).slice(0, MAX_BATCH_SELECTION);
+    if (!targets.length) return;
+    if (confirmMessage && !confirm(confirmMessage(targets.length))) return;
+
+    batchBusy = true;
+    updateBatchUi();
+    announceBatch(`正在${label} ${targets.length} 个任务`);
+    let completed = 0;
+    let skipped = 0;
+    const failures = [];
+    try {
+      // 有意串行复用单任务方法。每项都会重新读取状态并走原有跨标签停写和
+      // IndexedDB 锁；若同一本漫画存在多个任务，也不会让多个删除/恢复相互争用。
+      for (const snapshot of targets) {
+        try {
+          const current = await downloads.get(snapshot.id);
+          if (!current || !predicate(current)) {
+            skipped++;
+            continue;
+          }
+          const result = await operation(current);
+          if (result === false) skipped++;
+          else completed++;
+        } catch (error) {
+          failures.push(error?.message || '操作失败');
+        }
+      }
+    } finally {
+      batchBusy = false;
+      const currentTasks = await downloads.list().catch(() => null);
+      if (currentTasks) renderTasks(currentTasks);
+      else updateBatchUi();
+    }
+    const details = [`已${pastLabel} ${completed} 个任务`];
+    if (skipped) details.push(`${skipped} 个状态已变化`);
+    if (failures.length) details.push(`${failures.length} 个失败`);
+    announceBatch(details.join('，'));
+    if (failures.length) {
+      const first = failures[0];
+      alert(`${label}完成，但有 ${failures.length} 个任务失败：${first}${failures.length > 1 ? '（其余错误请稍后重试）' : ''}`);
+    }
+  }
+
+  batchToggle.addEventListener('click', () => setBatchMode(!batchMode, { restoreFocus: batchMode }));
+  selectAll.addEventListener('change', () => {
+    selectedTaskIds.clear();
+    if (selectAll.checked) {
+      for (const task of latestTasks.slice(0, MAX_BATCH_SELECTION)) selectedTaskIds.add(String(task.id));
+    }
+    updateBatchUi();
+    announceBatch(selectAll.checked ? `已选择 ${selectedTaskIds.size} 个任务` : '已取消全选');
+  });
+  batchPause.addEventListener('click', () => runBatch({
+    label: '暂停', pastLabel: '暂停',
+    predicate: (task) => ACTIVE_TASK_STATUSES.has(task.status),
+    operation: (task) => downloads.pause(task.id),
+  }));
+  batchResume.addEventListener('click', () => runBatch({
+    label: '继续', pastLabel: '继续',
+    predicate: (task) => task.status === 'paused',
+    operation: (task) => downloads.resume(task.id),
+  }));
+  batchRetry.addEventListener('click', () => runBatch({
+    label: '重试', pastLabel: '加入重试队列',
+    predicate: (task) => task.status === 'failed',
+    operation: (task) => downloads.retry(task.id),
+  }));
+  batchRemove.addEventListener('click', () => runBatch({
+    label: '删除', pastLabel: '删除',
+    predicate: () => true,
+    operation: (task) => downloads.remove(task.id),
+    confirmMessage: (count) => `确定删除选中的 ${count} 个下载任务吗？已下载的离线正文将保留。`,
+  }));
 
   async function runAutomaticIntegrityCheck() {
     const mode = ['partial', 'full'].includes(setting.cacheIntegrityCheckMode) ? setting.cacheIntegrityCheckMode : 'off';
@@ -185,6 +388,11 @@ export function mountDownloadCenter(root, options = {}) {
   }
 
   function createTaskRecord(task) {
+    const checkbox = element('input', { type: 'checkbox' });
+    const selection = element('label', { class: 'download-task-select', hidden: '' },
+      checkbox,
+      element('span', { class: 'download-visually-hidden', text: '选择任务' }),
+    );
     const progress = element('progress', { max: '100', value: '0', 'aria-label': '下载进度' });
     const title = element('strong');
     const status = element('span');
@@ -192,14 +400,24 @@ export function mountDownloadCenter(root, options = {}) {
     const message = element('div', { class: 'download-message' });
     const controls = element('div', { class: 'download-actions' });
     const article = element('article', { class: 'download-task', 'data-task-id': task.id },
-      element('div', { class: 'download-task-row' }, title, status),
+      element('div', { class: 'download-task-row' },
+        element('div', { class: 'download-task-title' }, selection, title),
+        status,
+      ),
       progress, meta, message, controls);
-    return { article, title, status, progress, meta, message, controls, controlKey: '' };
+    const record = { article, title, status, progress, meta, message, controls, checkbox, selection, taskId: String(task.id), controlKey: '' };
+    checkbox.addEventListener('change', () => toggleTaskSelection(record.taskId, checkbox.checked, checkbox));
+    article.addEventListener('click', (event) => {
+      if (!batchMode || batchBusy || event.target.closest('button, input, label, a')) return;
+      checkbox.click();
+    });
+    return record;
   }
 
   function renderTasks(tasks) {
     if (destroyed) return;
     const list = Array.isArray(tasks) ? tasks : [];
+    latestTasks = list;
     const wanted = new Set(list.map((task) => String(task.id)));
     let removedFocusedTask = false;
     for (const [id, record] of taskNodes) {
@@ -210,6 +428,8 @@ export function mountDownloadCenter(root, options = {}) {
     }
     taskHeading.textContent = `下载任务 (${list.length})`;
     taskEmpty.hidden = list.length > 0;
+    batchToggle.hidden = list.length === 0;
+    if (!list.length && batchMode) setBatchMode(false);
     let cursor = taskEmpty.nextSibling;
     for (const task of list) {
       const id = String(task.id);
@@ -219,7 +439,9 @@ export function mountDownloadCenter(root, options = {}) {
         taskNodes.set(id, record);
       }
       const p = task.progress || {};
+      record.taskId = id;
       record.title.textContent = task.albumName || `漫画 ${task.aid}`;
+      record.checkbox.setAttribute('aria-label', `选择下载任务：${record.title.textContent}`);
       record.status.className = `download-status ${task.status}`;
       record.status.textContent = statusLabel(task.status);
       record.progress.value = Number(p.percent || 0);
@@ -239,9 +461,12 @@ export function mountDownloadCenter(root, options = {}) {
       cursor = record.article.nextSibling;
     }
     if (removedFocusedTask) {
-      const next = taskArea.querySelector('.download-task button:not(:disabled)');
+      const next = batchMode
+        ? taskArea.querySelector('.download-task-select input:not(:disabled)')
+        : taskArea.querySelector('.download-task button:not(:disabled)');
       queueMicrotask(() => (next || taskHeading).focus({ preventScroll: true }));
     }
+    updateBatchUi();
   }
 
   function scheduleTaskRender(tasks) {

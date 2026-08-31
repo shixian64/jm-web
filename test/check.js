@@ -18,12 +18,18 @@ for (const file of files) {
   if (result.status !== 0) process.exit(result.status || 1);
 }
 
-const css = fs.readFileSync(path.join(root, 'public', 'css', 'app.css'), 'utf8');
-const opens = (css.match(/\{/g) || []).length;
-const closes = (css.match(/\}/g) || []).length;
-if (opens !== closes) {
-  console.error(`app.css 花括号不匹配：${opens} / ${closes}`);
-  process.exit(1);
+const cssFiles = fs.readdirSync(path.join(root, 'public', 'css'))
+  .filter((name) => name.endsWith('.css')).sort();
+let cssBlocks = 0;
+for (const name of cssFiles) {
+  const css = fs.readFileSync(path.join(root, 'public', 'css', name), 'utf8');
+  const opens = (css.match(/\{/g) || []).length;
+  const closes = (css.match(/\}/g) || []).length;
+  if (opens !== closes) {
+    console.error(`${name} 花括号不匹配：${opens} / ${closes}`);
+    process.exit(1);
+  }
+  cssBlocks += opens;
 }
 
-console.log(`syntax/style check all pass (${files.length} JS, CSS ${opens}/${closes})`);
+console.log(`syntax/style check all pass (${files.length} JS, ${cssFiles.length} CSS / ${cssBlocks} blocks)`);
