@@ -234,9 +234,11 @@ function gotoBlockFilter(block) {
   location.hash = `#/search?q=${encodeURIComponent(block.slug || block.title || '')}&o=mr`;
 }
 
-function buildSwiper(items, cleanups = [], contextTitle = '') {
+export function buildSwiper(items, cleanups = [], contextTitle = '') {
   const swiper = h('div', { class: 'swiper', 'aria-label': '精选内容轮播' });
-  const slides = items.slice(0, 6).map((it, i) => {
+  const featuredItems = items.slice(0, 6);
+  const slideImages = featuredItems.map((item) => imgSrc(item));
+  const slides = featuredItems.map((it, i) => {
     const id = String((it && (it.id ?? it.aid)) || '');
     const canOpen = /^\d+$/.test(id);
     const open = () => { if (canOpen) location.hash = `#/album/${id}`; };
@@ -245,7 +247,6 @@ function buildSwiper(items, cleanups = [], contextTitle = '') {
     const title = String(it?.name || '精选漫画');
     const s = h('div', {
       class: 'slide' + (i === 0 ? ' on' : ''),
-      style: { backgroundImage: `url("${imgSrc(it)}")` },
       'aria-roledescription': 'slide',
       'aria-hidden': i === 0 ? 'false' : 'true',
       'aria-label': `${i + 1} / ${Math.min(items.length, 6)}：${title}`,
@@ -264,6 +265,16 @@ function buildSwiper(items, cleanups = [], contextTitle = '') {
     );
     return s;
   });
+  // 背景图不会受 <img loading="lazy"> 控制。只给实际需要显示的 slide
+  // 写入 background-image，避免首页初次渲染时 6 张大图同时回源。
+  const loadSlideBackground = (index) => {
+    const slide = slides[index];
+    if (!slide || slide.dataset.backgroundReady === 'true') return;
+    const source = slideImages[index];
+    if (source) slide.style.backgroundImage = `url("${source}")`;
+    slide.dataset.backgroundReady = 'true';
+  };
+  loadSlideBackground(0);
   const dots = h('div', { class: 'dots' }, slides.map((_, i) => h('i', { class: i === 0 ? 'on' : '' })));
   const prev = h('button', { class: 'swiper-arrow prev', type: 'button', 'aria-label': '上一张精选内容' }, icon('arrow-left', 17));
   const next = h('button', { class: 'swiper-arrow next', type: 'button', 'aria-label': '下一张精选内容' }, icon('arrow-right', 17));
@@ -272,6 +283,8 @@ function buildSwiper(items, cleanups = [], contextTitle = '') {
   let cur = 0;
   const show = (nextIndex) => {
     const next = (nextIndex + slides.length) % slides.length;
+    // 目标图先进入加载队列再切换可见态；状态切换后仅预取它的下一张。
+    loadSlideBackground(next);
     slides.forEach((slide, i) => {
       const active = i === next;
       slide.classList.toggle('on', active);
@@ -280,6 +293,7 @@ function buildSwiper(items, cleanups = [], contextTitle = '') {
       dots.children[i].classList.toggle('on', active);
     });
     cur = next;
+    loadSlideBackground((next + 1) % slides.length);
   };
   prev.addEventListener('click', (e) => { e.stopPropagation(); show(cur - 1); });
   next.addEventListener('click', (e) => { e.stopPropagation(); show(cur + 1); });

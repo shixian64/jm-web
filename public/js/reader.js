@@ -45,6 +45,88 @@ export function normalizeReaderSeries(value) {
     }));
 }
 
+/**
+ * 生成阅读器预取顺序。prefetchCount 表示当前页两侧各自的最大半径，
+ * 不再额外扩大窗口；顺序对齐客户端：当前页、后续页、前序页。
+ */
+export function readerPrefetchOrder(current, total, prefetchCount) {
+  const length = Math.max(0, Math.trunc(Number(total) || 0));
+  const center = Math.trunc(Number(current));
+  if (!Number.isInteger(center) || center < 0 || center >= length) return [];
+  const radius = Math.max(1, Math.min(12, Math.trunc(Number(prefetchCount) || 3)));
+  const order = [center];
+  for (let distance = 1; distance <= radius; distance++) {
+    if (center + distance < length) order.push(center + distance);
+  }
+  for (let distance = 1; distance <= radius; distance++) {
+    if (center - distance >= 0) order.push(center - distance);
+  }
+  return order;
+}
+
+/** 仅保留严格预取窗口内的合法页码，同时维持调用方原有顺序。 */
+export function filterReaderPrefetchWindow(indices, current, total, prefetchCount) {
+  if (!Array.isArray(indices)) return [];
+  const allowed = new Set(readerPrefetchOrder(current, total, prefetchCount));
+  return indices.filter((index) => Number.isInteger(index) && allowed.has(index));
+}
+
+/**
+ * 当前页完成前不启动任何邻页任务。返回的 Promise 在当前页完成且邻页任务均已
+ * 按既定顺序启动后解决；邻页自身仍并行执行，不阻塞阅读器交互。
+ */
+export function scheduleReaderPrefetch(order, ensureDecoded, onDecoded, isActive = () => true, onDiscarded) {
+  if (!Array.isArray(order) || !order.length || typeof ensureDecoded !== 'function' || !isActive()) {
+    return Promise.resolve();
+  }
+  const start = (index) => {
+    try {
+      return Promise.resolve(ensureDecoded(index));
+    } catch (_) {
+      return Promise.resolve(null);
+    }
+  };
+  const deliver = (index, rec) => {
+    if (!rec) return;
+    if (isActive()) {
+      if (typeof onDecoded === 'function') onDecoded(index, rec);
+    } else if (typeof onDiscarded === 'function') {
+      onDiscarded(index, rec);
+    }
+  };
+  const afterCurrent = (rec) => {
+    if (!isActive()) {
+      if (rec && typeof onDiscarded === 'function') onDiscarded(order[0], rec);
+      return;
+    }
+    deliver(order[0], rec);
+    if (!isActive()) return;
+    for (const index of order.slice(1)) {
+      if (!isActive()) break;
+      start(index).then(
+        (nextRec) => deliver(index, nextRec),
+        () => {},
+      );
+    }
+  };
+  return start(order[0]).then(afterCurrent, () => afterCurrent(null));
+}
+
+/** 最终 <img> 已验证可解码后，才把天然尺寸写回缓存。 */
+export function backfillReaderImageDimensions({ image, slot, index, record, state, generation, sourceVersion }) {
+  if (!image || !slot || !record || !state || state.destroyed || !slot.isConnected
+      || slot.dataset.idx !== String(index) || slot.dataset.objectUrl !== record.url
+      || state.decoded?.get(index) !== record || record.generation !== generation
+      || record.sourceVersion !== sourceVersion) return false;
+  const width = Number(image.naturalWidth);
+  const height = Number(image.naturalHeight);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return false;
+  record.width = width;
+  record.height = height;
+  state.dims.set(index, { width, height });
+  return true;
+}
+
 export function mountReader(root, photoId, query, options = {}) {
   const aid = query.get('aid') || '';
   const requestedPage = query.get('page');
@@ -84,6 +166,7 @@ export function mountReader(root, photoId, query, options = {}) {
   let imageGeneration = 0;
   let imageSourceVersion = 0;
   let activeDecodes = 0;
+  let prefetchSequence = 0;
   let sourceRefreshSeq = 0;
   let sourceRefreshPending = false;
   let activeImageShunt = ['1', '2', '3', '4'].includes(String(setting.shunt)) ? String(setting.shunt) : '1';
@@ -1018,17 +1101,13 @@ export function mountReader(root, photoId, query, options = {}) {
         state.dims.set(idx, { width, height });
         return rec;
       }
-      const bmp = typeof createImageBitmap === 'function'
-        ? await createImageBitmap(blob).catch(() => null)
-        : null;
-      const dims = bmp ? { width: bmp.width, height: bmp.height } : null;
-      bmp?.close();
       assertImageActive(generation, imageSignal);
       const url = URL.createObjectURL(blob);
-      const rec = { url, ...dims, generation, sourceVersion };
+      const rec = { url, generation, sourceVersion };
       retireDecoded(state.decoded.get(idx));
       state.decoded.set(idx, rec);
-      state.dims.set(idx, dims || {});
+      // 原图不为获取尺寸而预先完整解码；由最终挂载的 <img> 在 onload 后回填。
+      // raws LRU 重用时保留先前已验证的尺寸，避免占位比例再次跳动。
       return rec;
     } catch (e) {
       if (!state.destroyed && !signal.aborted && !imageSignal.aborted
@@ -1119,6 +1198,12 @@ export function mountReader(root, photoId, query, options = {}) {
     slot.dataset.objectUrl = rec.url;
     const image = h('img', {
       src: rec.url, alt: `第${idx + 1}页`, draggable: 'false',
+      onload: () => {
+        backfillReaderImageDimensions({
+          image, slot, index: idx, record: rec, state,
+          generation: imageGeneration, sourceVersion: imageSourceVersion,
+        });
+      },
       onerror: () => {
         // Blob 的 MIME 可能看似图片但内容已损坏；此时 <img> 才是最终校验点。
         // 只处理仍属于当前槽位的记录，避免快速翻页后的迟到 error 污染新页。
@@ -1185,28 +1270,43 @@ export function mountReader(root, photoId, query, options = {}) {
 
   function prefetchAround(idx) {
     if (state.destroyed || signal.aborted) return;
-    const n = Math.max(1, Math.min(12, Number(setting.prefetchCount) || 3));
-    const start = Math.max(0, idx - n - 2);
-    const end = Math.min(state.images.length - 1, idx + n + 2);
-    for (let i = start; i <= end; i++) {
-      ensureDecoded(i).then((rec) => {
-        if (!state.destroyed && rec && state.mode === 'scroll') mountSlot(i);
-      });
-    }
-    // 回收窗口外的解码结果
+    const n = Math.max(1, Math.min(12, Math.trunc(Number(setting.prefetchCount) || 3)));
+    const start = Math.max(0, idx - n);
+    const end = Math.min(state.images.length - 1, idx + n);
+    const order = readerPrefetchOrder(idx, state.images.length, n);
+    const generation = imageGeneration;
+    const sourceVersion = imageSourceVersion;
+    const sequence = ++prefetchSequence;
+    const isActive = () => !state.destroyed && !signal.aborted && sequence === prefetchSequence
+      && generation === imageGeneration && sourceVersion === imageSourceVersion && state.cur === idx;
+    scheduleReaderPrefetch(order, ensureDecoded, (i) => {
+      if (state.mode === 'scroll') mountSlot(i);
+    }, isActive, evictLatePrefetchResult);
+    // decoded/展示缓存严格限制在窗口内；raws 仍是独立的已下载 Blob LRU，
+    // 用于回看时避免重复网络请求，不会占用图片解码与 DOM 展示缓存。
     for (const [k, v] of state.decoded) {
-      if (k < start - 4 || k > end + 4) {
-        URL.revokeObjectURL(v.url);
-        state.decoded.delete(k);
-        const slot = pages.querySelector(`.slot[data-idx="${k}"]`);
-        if (slot) {
-          slot.dataset.mounted = '0';
-          delete slot.dataset.generation;
-          delete slot.dataset.objectUrl;
-          slot.replaceChildren(placeholderFor(k));
-        }
-      }
+      if (k < start || k > end) evictDecoded(k, v);
     }
+  }
+
+  function evictDecoded(idx, rec) {
+    if (!rec || state.decoded.get(idx) !== rec) return;
+    URL.revokeObjectURL(rec.url);
+    state.decoded.delete(idx);
+    const slot = pages.querySelector(`.slot[data-idx="${idx}"]`);
+    if (slot?.dataset.objectUrl === rec.url) {
+      slot.dataset.mounted = '0';
+      delete slot.dataset.generation;
+      delete slot.dataset.objectUrl;
+      slot.replaceChildren(placeholderFor(idx));
+    }
+  }
+
+  function evictLatePrefetchResult(idx, rec) {
+    // 已经发出的 fetch 无法可靠撤销而不影响同页复用；迟到结果仅在落到当前严格
+    // 窗口之外时回收。仍在 [cur-n, cur+n] 内的结果可供新窗口直接复用。
+    const radius = Math.max(1, Math.min(12, Math.trunc(Number(setting.prefetchCount) || 3)));
+    if (idx < state.cur - radius || idx > state.cur + radius) evictDecoded(idx, rec);
   }
 
   function placeholderFor(idx) {
@@ -1242,13 +1342,36 @@ export function mountReader(root, photoId, query, options = {}) {
     disconnectScrollObserver();
     scrollObserver = new IntersectionObserver((entries) => {
       if (state.destroyed || state.mode !== 'scroll') return;
-      for (const e of entries) {
-        if (!e.isIntersecting) continue;
-        const idx = Number(e.target.dataset.idx);
-        ensureDecoded(idx).then((rec) => {
-          if (!state.destroyed && state.mode === 'scroll' && rec) mountSlot(idx);
+      const current = state.cur;
+      const observed = filterReaderPrefetchWindow(entries.filter((entry) => entry.isIntersecting)
+        .map((entry) => Number(entry.target.dataset.idx))
+        .filter((index) => Number.isInteger(index)), current, state.images.length, setting.prefetchCount);
+      if (!observed.length) return;
+      const generation = imageGeneration;
+      const sourceVersion = imageSourceVersion;
+      // IntersectionObserver 也可能一次命中多页。复用同一条当前页任务做门闩，
+      // 避免它绕开 prefetchAround 而让邻页抢占当前页的网络/解码槽位。
+      ensureDecoded(current).then((rec) => {
+        if (state.destroyed || state.mode !== 'scroll' || state.cur !== current
+            || generation !== imageGeneration || sourceVersion !== imageSourceVersion) {
+          if (rec) evictLatePrefetchResult(current, rec);
+          return;
+        }
+        if (rec && observed.includes(current)) mountSlot(current);
+        observed.filter((index) => index !== current).sort((a, b) => {
+          const aNext = a > current;
+          const bNext = b > current;
+          if (aNext !== bNext) return aNext ? -1 : 1;
+          return Math.abs(a - current) - Math.abs(b - current);
+        }).forEach((index) => {
+          ensureDecoded(index).then((nextRec) => {
+            if (!nextRec) return;
+            if (!state.destroyed && state.mode === 'scroll' && state.cur === current
+                && generation === imageGeneration && sourceVersion === imageSourceVersion) mountSlot(index);
+            else evictLatePrefetchResult(index, nextRec);
+          });
         });
-      }
+      });
     }, { root: pages, rootMargin: '1000px 0px' });
     pages.querySelectorAll('.slot').forEach((s) => scrollObserver.observe(s));
 
