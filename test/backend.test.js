@@ -644,6 +644,123 @@ class MockServerResponse extends EventEmitter {
     assert.strictEqual(reloadedJar.favoriteFolders.find((x) => x.id === folder.id).name, '本周待读');
     assert.strictEqual(reloadedJar.favoriteFolderMap['123'], folder.id);
 
+    // 登录回归：JM 把认证态放在 data.s，且登录可能由备用 API origin 成功。
+    // 服务端必须把 s 写入该 origin 的 AVS、固定后续线路，并从响应/会话资料中
+    // 删除 s 与 jwttoken，随后收藏夹请求才能真正携带认证 Cookie。
+    const authHosts = ['https://auth-one.example', 'https://auth-two.example'];
+    const originalAuthHosts = settings.allDataSourceHosts();
+    const originalDohForAuth = features.dohLookup;
+    const authCalls = [];
+    try {
+      settings.setEnvApiHosts(authHosts);
+      features.dohLookup = publicDns;
+      response = await originalFetch(`http://127.0.0.1:${port}/api/config`);
+      assert.strictEqual(response.status, 200);
+      const loginSidCookie = (response.headers.get('set-cookie') || '').split(';', 1)[0];
+      assert.match(loginSidCookie, /^jmw_sid=[a-f0-9]{32}$/);
+      global.fetch = async (url, opts = {}) => {
+        const target = new URL(String(url));
+        authCalls.push({ target, opts });
+        if (target.pathname === '/login' && target.hostname === 'auth-one.example') {
+          throw Object.assign(new Error('connection refused'), { code: 'ECONNREFUSED' });
+        }
+        if (target.pathname === '/login') {
+          return encryptedResponse(opts.headers.token, {
+            uid: '9001', username: 'fallback-user', s: 'avs-from-login', jwttoken: 'jwt-must-not-persist',
+            album_favorites: 3,
+          });
+        }
+        if (target.pathname === '/favorite') {
+          if (target.hostname === 'auth-two.example' && (opts.headers.Cookie || '').includes('AVS=avs-from-login')) {
+            return encryptedResponse(opts.headers.token, { list: [{ id: '9001', name: '登录后收藏' }], total: 1 });
+          }
+          return new Response('', { status: 401 });
+        }
+        throw new Error(`unexpected auth upstream request: ${target.href}`);
+      };
+
+      response = await originalFetch(`http://127.0.0.1:${port}/api/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: loginSidCookie },
+        body: JSON.stringify({ username: 'fallback-user', password: 'not-recorded' }),
+      });
+      assert.strictEqual(response.status, 200);
+      const loginResult = await response.json();
+      assert.strictEqual(loginResult.data.username, 'fallback-user');
+      assert.ok(!JSON.stringify(loginResult).includes('avs-from-login'));
+      assert.ok(!JSON.stringify(loginResult).includes('jwt-must-not-persist'));
+      const loginSid = loginSidCookie.slice(loginSidCookie.indexOf('=') + 1);
+      const loginJar = sessions.loadJar(loginSid);
+      assert.strictEqual(loginJar.apiHost, authHosts[1]);
+      assert.strictEqual(loginJar.cookiesByOrigin[authHosts[1]].AVS, 'avs-from-login');
+      assert.ok(!loginJar.cookiesByOrigin[authHosts[0]] || !loginJar.cookiesByOrigin[authHosts[0]].AVS);
+      assert.ok(!Object.prototype.hasOwnProperty.call(loginJar.user, 's'));
+      assert.ok(!Object.prototype.hasOwnProperty.call(loginJar.user, 'jwttoken'));
+      sessions.flushAll();
+      const storedLogin = JSON.parse(fs.readFileSync(path.join(dataDir, 'sessions', `${loginSid}.json`), 'utf8'));
+      assert.ok(!JSON.stringify(storedLogin).includes('jwt-must-not-persist'));
+
+      response = await originalFetch(`http://127.0.0.1:${port}/api/me`, {
+        headers: { Cookie: loginSidCookie },
+      });
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual((await response.json()).user.username, 'fallback-user');
+
+      const loginCallCount = authCalls.length;
+      response = await originalFetch(`http://127.0.0.1:${port}/api/favorites?page=1&folder_id=0`, {
+        headers: { Cookie: loginSidCookie },
+      });
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual((await response.json()).data.list.map((x) => String(x.id)), ['9001']);
+      const favoriteCalls = authCalls.slice(loginCallCount).filter((x) => x.target.pathname === '/favorite');
+      assert.strictEqual(favoriteCalls.length, 1, '登录成功的 origin 应被固定为后续首选线路');
+      assert.strictEqual(favoriteCalls[0].target.origin, authHosts[1]);
+      assert.match(favoriteCalls[0].opts.headers.Cookie || '', /(?:^|; )AVS=avs-from-login(?:;|$)/);
+
+      // 若首选 origin 的 AVS 已失效，GET 收藏允许在另一个已有 AVS 的
+      // 受信 origin 重试；两条都失效时清除本地登录态并返回可操作提示。
+      loginJar.cookiesByOrigin[authHosts[0]] = { AVS: 'avs-other-origin' };
+      loginJar.apiHost = authHosts[0];
+      loginJar.user = { uid: '9001', username: 'fallback-user' };
+      sessions.saveJar(loginJar);
+      authCalls.length = 0;
+      global.fetch = async (url, opts = {}) => {
+        const target = new URL(String(url));
+        authCalls.push({ target, opts });
+        if (target.pathname === '/favorite' && target.hostname === 'auth-two.example' &&
+            (opts.headers.Cookie || '').includes('AVS=avs-from-login')) {
+          return encryptedResponse(opts.headers.token, { list: [] });
+        }
+        return new Response('', { status: 401 });
+      };
+      response = await originalFetch(`http://127.0.0.1:${port}/api/favorites`, {
+        headers: { Cookie: loginSidCookie },
+      });
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(authCalls.filter((x) => x.target.pathname === '/favorite').length, 2);
+      assert.strictEqual(authCalls[0].target.origin, authHosts[0]);
+      assert.strictEqual(authCalls[1].target.origin, authHosts[1]);
+
+      global.fetch = async (_url) => new Response('', { status: 401 });
+      response = await originalFetch(`http://127.0.0.1:${port}/api/favorites`, {
+        headers: { Cookie: loginSidCookie },
+      });
+      assert.strictEqual(response.status, 401);
+      assert.match((await response.json()).error, /登录会话已失效/);
+      assert.strictEqual(loginJar.user, null);
+      assert.deepStrictEqual(loginJar.cookiesByOrigin, {});
+      response = await originalFetch(`http://127.0.0.1:${port}/api/me`, {
+        headers: { Cookie: loginSidCookie },
+      });
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual((await response.json()).user, null);
+    } finally {
+      global.fetch = originalFetch;
+      features.dohLookup = originalDohForAuth;
+      settings.setEnvApiHosts([]);
+      assert.deepStrictEqual(settings.allDataSourceHosts(), originalAuthHosts);
+    }
+
     // 所有真实上游请求统一使用加密响应桩；同时记录 method/path/body 验证写操作。
     const originalDohLookup = features.dohLookup;
     features.dohLookup = publicDns;

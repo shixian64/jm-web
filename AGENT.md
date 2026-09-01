@@ -100,6 +100,8 @@ jm-web/
 - `ACCESS_PASSWORD` 是站点访问门禁；成功后签发 HttpOnly `jmw_auth`。
 - JM 账号登录使用 `jmw_sid` 定位服务端 Session/Cookie Jar。
 - 上游 Cookie 按精确 Origin 隔离，绝不能跨 Host 复制或发送到浏览器。
+- JM 登录响应 `data.s` 仅作为实际成功 Origin 的 `AVS` Cookie 写入；用户资料会脱敏，`s`/`jwttoken` 等认证字段不返回也不落盘。
+- 认证 GET 收到 401 时只在已有 AVS 的受信 Origin 间重试；全部失效后清除本地 JM 登录态，避免旧资料继续显示为已登录。
 - `/api/logout` 退出 JM 会话，不等于退出站点访问门禁。
 - 当前访问口令同时授予日志和全局 DoH 运维能力，因此只适合个人或完全互信用户，不是严格多租户 RBAC。
 
@@ -349,4 +351,3 @@ docker compose --env-file .env.example config --quiet
 - 鉴权、管理员边界、Cookie 或 CSRF 方案变化；
 - 发布制品白名单、候选验证或回滚流程变化；
 - 已知技术债完成整改并通过生产验收。
-

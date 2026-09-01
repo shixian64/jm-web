@@ -23,7 +23,10 @@ const crypto = require('crypto');
 const net = require('net');
 const { URL } = require('url');
 
-const { ApiError, upstreamRequest, assertPublicUrl, API_VERSION } = require('./lib/jm-api');
+const {
+  ApiError, upstreamRequest, assertPublicUrl, API_VERSION,
+  setOriginCookie,
+} = require('./lib/jm-api');
 const { parsePhotoHtml } = require('./lib/photo');
 const sessions = require('./lib/sessions');
 const settings = require('./lib/settings');
@@ -851,16 +854,52 @@ async function api(req, res, u, requestSignal) {
 
   // 数据源由浏览器设置选择，但只能是固定枚举；实际 origin 始终来自服务端白名单。
   const dataSource = settings.normalizeDataSource(String(req.headers['x-jmw-data-source'] || 'mixed'));
-  // 透传到上游的快捷封装（会话内 API 域名覆盖优先）
-  const call = (opts) => upstreamRequest({
-    hosts: settings.apiHostsForSource(dataSource, jar.apiHost),
-    cookieHosts: settings.allDataSourceHosts(),
-    jar,
-    dnsLookup: features.dohLookup,
-    fetchImpl: features.outboundFetch,
-    signal: requestSignal,
-    ...opts,
-  });
+  // 透传到上游的快捷封装（会话内 API 域名覆盖优先）。成功响应会记住
+  // 实际成功的精确 origin；登录可能走备用域名，后续请求必须继续使用同一
+  // origin，避免 Cookie 按域隔离后再次落到没有 AVS 的线路。
+  const call = (opts = {}) => {
+    const { onSuccess, ...rest } = opts;
+    return upstreamRequest({
+      hosts: settings.apiHostsForSource(dataSource, jar.apiHost),
+      cookieHosts: settings.allDataSourceHosts(),
+      jar,
+      dnsLookup: features.dohLookup,
+      fetchImpl: features.outboundFetch,
+      signal: requestSignal,
+      ...rest,
+      onSuccess: async (meta) => {
+        let changed = false;
+        const origin = settings.normalizeHost(meta && meta.origin);
+        if (origin && settings.isTrustedApiHost(origin) && jar.apiHost !== origin) {
+          jar.apiHost = origin;
+          changed = true;
+        }
+        if (typeof onSuccess === 'function') await onSuccess(meta);
+        if (changed) sessions.scheduleSave(jar);
+      },
+    });
+  };
+
+  // 401 说明当前 JM 会话已失效，而不是站点访问口令错误。认证 GET 可以
+  // 先在其它已有 AVS 的受信 origin 重试；全部失败后清除本地用户状态，
+  // 防止 /api/me 继续把已不能使用收藏的旧用户显示成“已登录”。
+  const callWithAuthRecovery = async (opts = {}) => {
+    const expectedUser = jar.user;
+    try {
+      return await call({
+        retryUnauthorized: opts.retryUnauthorized === undefined ? !!expectedUser : opts.retryUnauthorized,
+        ...opts,
+      });
+    } catch (error) {
+      if (error && error.authFailure && expectedUser && jar.user === expectedUser) {
+        sessions.clearUpstreamAuth(jar);
+        error.code = 401;
+        error.expose = true;
+        error.publicMessage = '登录会话已失效，请重新登录';
+      }
+      throw error;
+    }
+  };
 
   switch (route) {
     /* ---- 基础 ---- */
@@ -928,7 +967,9 @@ async function api(req, res, u, requestSignal) {
 
     /* ---- 用户 ---- */
     case '/me':
-      return sendJson(res, 200, { user: jar.user });
+      // 旧版本可能只保存了用户资料却没有按 origin 保存 AVS；这类状态
+      // 不能继续显示为“已登录”，否则收藏页会稳定收到上游 401。
+      return sendJson(res, 200, { user: sessions.hasUpstreamAuth(jar) ? jar.user : null });
 
     case '/login': {
       if (!rateLimit(`login:${clientIp(req)}`, 10, 5 * 60 * 1000)) {
@@ -938,17 +979,33 @@ async function api(req, res, u, requestSignal) {
       const username = String(body.username || '').trim();
       const password = String(body.password || '');
       if (!username || !password) return sendJson(res, 400, { error: '请输入用户名和密码' });
+      let loginOrigin = '';
       const out = await call({ method: 'POST', path: '/login', form: [
         { name: 'username', value: username },
         { name: 'password', value: password },
-      ] });
-      if (out && out.data) {
-        const safeUser = sessions.sanitizeUser(out.data);
-        if (!safeUser) throw new ApiError('上游返回的用户资料格式异常或过大', 502);
-        jar.user = safeUser;
-        sessions.scheduleSave(jar);
+      ], onSuccess: ({ origin }) => { loginOrigin = origin; } });
+      const rawUser = out && out.data;
+      if (!rawUser || typeof rawUser !== 'object' || Array.isArray(rawUser)) {
+        sessions.clearUpstreamAuth(jar);
+        throw new ApiError('上游返回的用户资料格式异常', 502);
       }
-      return sendJson(res, 200, out);
+      // JM API 将登录态放在响应 data.s；它不一定通过 Set-Cookie 返回，
+      // 因此必须在“实际成功 origin”上显式写入 AVS，而不能复制到其它域名。
+      const avs = typeof rawUser.s === 'string' ? rawUser.s.trim() : '';
+      if (!loginOrigin || !avs || !setOriginCookie(jar, loginOrigin, 'AVS', avs)) {
+        sessions.clearUpstreamAuth(jar);
+        throw new ApiError('上游登录成功但未返回有效会话凭证', 502);
+      }
+      const safeUser = sessions.sanitizeUser(rawUser);
+      if (!safeUser) {
+        sessions.clearUpstreamAuth(jar);
+        throw new ApiError('上游返回的用户资料格式异常或过大', 502);
+      }
+      jar.user = safeUser;
+      jar.apiHost = settings.normalizeHost(loginOrigin) || jar.apiHost;
+      sessions.scheduleSave(jar);
+      // 不把 s/jwttoken 等认证字段回传给浏览器；前端只需要展示资料。
+      return sendJson(res, 200, { ...out, data: safeUser });
     }
 
     case '/logout':
@@ -957,11 +1014,11 @@ async function api(req, res, u, requestSignal) {
       return sendJson(res, 200, { ok: true });
 
     case '/daily':
-      return sendJson(res, 200, await call({ path: '/daily', query: { user_id: q.get('user_id') } }));
+      return sendJson(res, 200, await callWithAuthRecovery({ path: '/daily', query: { user_id: q.get('user_id') } }));
 
     case '/daily_chk': {
       const body = await readJsonBody(req);
-      return sendJson(res, 200, await call({ method: 'POST', path: '/daily_chk', form: [
+      return sendJson(res, 200, await callWithAuthRecovery({ method: 'POST', path: '/daily_chk', form: [
         { name: 'user_id', value: String(body.user_id || '') },
         { name: 'daily_id', value: String(body.daily_id || '') },
       ] }));
@@ -1049,7 +1106,7 @@ async function api(req, res, u, requestSignal) {
       ] }));
 
     case '/favorite':
-      return sendJson(res, 200, await call({ method: 'POST', path: '/favorite', form: [
+      return sendJson(res, 200, await callWithAuthRecovery({ method: 'POST', path: '/favorite', form: [
         { name: 'aid', value: String(q.get('aid') || '') },
       ] }));
 
@@ -1084,7 +1141,7 @@ async function api(req, res, u, requestSignal) {
       // call() 继续使用同一个按 origin 隔离的 cookiesByOrigin jar，绝不跨域复制凭证。
       if (jar.user && !isSessionOperation) {
         try {
-          const out = await call({ method: 'POST', path: '/favorite_folder', form: [
+          const out = await callWithAuthRecovery({ method: 'POST', path: '/favorite_folder', form: [
             { name: 'type', value: type },
             { name: 'folder_id', value: type === 'add' ? '0' : folderId },
             { name: 'folder_name', value: folderName },
@@ -1146,7 +1203,7 @@ async function api(req, res, u, requestSignal) {
       const folderId = q.get('folder_id') || '0';
       const sessionFolders = Array.isArray(jar.favoriteFolders) ? jar.favoriteFolders : [];
       const isSessionFolder = folderId !== '0' && sessionFolders.some((folder) => folder.id === folderId);
-      const out = await call({ path: '/favorite', query: {
+      const out = await callWithAuthRecovery({ path: '/favorite', retryUnauthorized: true, query: {
         page: q.get('page') || '1',
         o: q.get('o') || 'mr',
         // 云端收藏夹直接由上游筛选；仅本会话收藏夹仍取总收藏后在本地分组。
@@ -1174,7 +1231,7 @@ async function api(req, res, u, requestSignal) {
     }
 
     case '/history': {
-      const out = await call({ path: '/watch_list', query: { page: q.get('page') || '1' } });
+      const out = await callWithAuthRecovery({ path: '/watch_list', query: { page: q.get('page') || '1' } });
       if (out && out.data && Array.isArray(out.data.list)) {
         out.data.source_count = out.data.list.length;
         const hidden = new Set(jar.hiddenHistory || []);
@@ -1191,7 +1248,7 @@ async function api(req, res, u, requestSignal) {
       let cloudError = null;
       if (jar.user) {
         try {
-          const out = await call({ method: 'POST', path: '/watch_list', form: [
+          const out = await callWithAuthRecovery({ method: 'POST', path: '/watch_list', form: [
             { name: 'id', value: id },
           ] });
           if (Array.isArray(jar.hiddenHistory) && jar.hiddenHistory.includes(id)) {
