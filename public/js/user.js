@@ -328,16 +328,33 @@ export function favoritesView(root, params) {
   const o = params.get('o') || 'mr';
   const folderId = params.get('folder') || params.get('folder_id') || '0';
   const page = h('div', { class: 'page collect-page' });
-  const scopeHint = h('div', { class: 'hint', style: 'margin:0 2px 8px' },
-    '登录后优先管理 JM 账号云端收藏夹；云端不可用时会明确降级为仅本会话。');
-  const folderWrap = h('div', { class: 'chips', style: 'margin-bottom:4px' });
+  const scopeText = h('span', null, '正在确认收藏同步状态…');
+  const scopeHint = h('div', { class: 'favorite-sync hint' }, icon('cloud', 14), scopeText);
+  const folderWrap = h('nav', { class: 'chips favorite-folders', 'aria-label': '收藏夹' });
   const localSearch = h('input', {
-    class: 'input', type: 'search', placeholder: '按名称、作者或标签筛选收藏…',
-    style: 'margin:8px 0 10px',
+    class: 'favorite-search-input', type: 'search', placeholder: '搜索名称、作者或标签',
+    'aria-label': '搜索收藏',
   });
-  const filterPanel = h('div', { class: 'card favorite-filter-panel', style: 'padding:12px;margin-bottom:10px' });
-  const manageBar = h('div', { class: 'action-bar', style: 'margin:4px 0 10px' });
-  const selectionBar = h('div', { class: 'card', style: 'padding:10px 12px;margin-bottom:10px;display:none;align-items:center;gap:8px;flex-wrap:wrap' });
+  const clearSearch = h('button', {
+    class: 'favorite-search-clear', type: 'button', 'aria-label': '清除搜索', hidden: true,
+    onclick: () => { localSearch.value = ''; clearSearch.hidden = true; filterCards(); localSearch.focus(); },
+  }, icon('x', 15));
+  const searchBox = h('label', { class: 'favorite-search' }, icon('search', 17), localSearch, clearSearch);
+  const filterPanel = h('section', { class: 'favorite-filter-panel', hidden: true, 'aria-label': '高级筛选' });
+  const filterToggle = h('button', {
+    class: 'btn favorite-filter-toggle', type: 'button', 'aria-expanded': 'false',
+    onclick: () => {
+      const expanded = filterToggle.getAttribute('aria-expanded') !== 'true';
+      filterToggle.setAttribute('aria-expanded', String(expanded));
+      filterPanel.hidden = !expanded;
+      filterToggle.classList.toggle('active', expanded);
+    },
+  }, icon('filter', 16), h('span', null, '筛选'), icon('chevron-down', 14));
+  const manageBar = h('div', { class: 'favorite-manage' });
+  const selectionBar = h('div', { class: 'favorite-selection-bar', role: 'status', 'aria-live': 'polite', hidden: true });
+  const libraryMeta = h('span', { class: 'favorite-library-meta' }, '正在加载收藏…');
+  const filterEmpty = h('div', { class: 'favorite-filter-empty', hidden: true },
+    icon('search', 24), h('strong', null, '没有匹配的收藏'), h('span', null, '换个关键词或重置筛选条件试试'));
   const selected = new Set();
   const cards = new Map();
   const selectedTags = new Set();
@@ -350,16 +367,47 @@ export function favoritesView(root, params) {
   let folders = [['0', '全部']];
   let sessionFolderIds = new Set();
 
+  const orderSwitch = h('div', { class: 'favorite-order', role: 'group', 'aria-label': '收藏排序' },
+    FAV_ORDERS.map(([v, l]) => h('a', {
+      class: v === o ? 'active' : '', href: `#/favorites?o=${v}&folder=${encodeURIComponent(folderId)}`,
+      'aria-current': v === o ? 'page' : null,
+    }, l)));
   page.append(
-    h('div', { class: 'list-head' }, h('h2', null, '我的收藏')),
-    scopeHint,
-    h('div', { class: 'chips' }, FAV_ORDERS.map(([v, l]) =>
-      h('a', { class: 'chip' + (v === o ? ' active' : ''), href: `#/favorites?o=${v}&folder=${encodeURIComponent(folderId)}` }, l))),
-    folderWrap,
-    manageBar,
-    localSearch,
-    filterPanel,
+    h('header', { class: 'favorite-header' },
+      h('div', { class: 'favorite-title-block' },
+        h('div', { class: 'favorite-kicker' }, icon('star', 13), '个人资料库'),
+        h('h1', null, '我的收藏'),
+        h('p', null, '整理想看的作品，快速回到下一次阅读。')),
+      h('div', { class: 'favorite-header-mark', 'aria-hidden': 'true' }, icon('star', 30))),
+    h('section', { class: 'favorite-workbench', 'aria-label': '收藏管理' },
+      h('div', { class: 'favorite-folder-row' },
+        h('div', { class: 'favorite-section-label' }, icon('folder', 15), h('span', null, '收藏夹')),
+        folderWrap,
+        manageBar),
+      scopeHint,
+      h('div', { class: 'favorite-toolbar' }, searchBox, orderSwitch, filterToggle),
+      filterPanel),
     selectionBar,
+    h('div', { class: 'favorite-library-head' },
+      h('div', null, h('h2', null, '全部作品'), libraryMeta),
+      h('button', {
+        class: 'favorite-select-visible', type: 'button',
+        onclick: () => {
+          const visibleCards = [...cards.values()].filter((card) => !card.hidden);
+          const shouldSelect = visibleCards.some((card) => !selected.has(card.dataset.favoriteId));
+          visibleCards.forEach((card) => {
+            const id = card.dataset.favoriteId;
+            const box = card.querySelector('input[data-select]');
+            if (!id || !box) return;
+            box.checked = shouldSelect;
+            card.classList.toggle('is-selected', shouldSelect);
+            if (shouldSelect) selected.add(id); else selected.delete(id);
+          });
+          updateSelectionBar();
+        },
+      }, icon('check-square', 15), '选择当前'),
+    ),
+    filterEmpty,
   );
   root.append(page);
 
@@ -371,10 +419,13 @@ export function favoritesView(root, params) {
     folderWrap.replaceChildren(...folders.map(([id, name]) => h('a', {
       class: 'chip' + (String(id) === String(folderId) ? ' active' : ''),
       href: `#/favorites?o=${encodeURIComponent(o)}&folder=${encodeURIComponent(id)}`,
+      'aria-current': String(id) === String(folderId) ? 'page' : null,
     }, sessionFolderIds.has(String(id)) ? `${name}（本会话）` : name)));
     const currentName = folders.find(([id]) => id === String(folderId))?.[1] || '收藏夹';
+    const libraryTitle = page.querySelector('.favorite-library-head h2');
+    if (libraryTitle) libraryTitle.textContent = currentName === '全部' ? '全部作品' : currentName;
     const create = h('button', {
-      class: 'btn', type: 'button',
+      class: 'favorite-folder-action primary', type: 'button', 'aria-label': '新建收藏夹', title: '新建收藏夹',
       onclick: async () => {
         const name = window.prompt('新收藏夹名称');
         if (!name || !name.trim()) return;
@@ -384,9 +435,9 @@ export function favoritesView(root, params) {
           refreshRoute('0');
         } catch (e) { if (!isAbort(e)) toast(e.message); }
       },
-    }, '＋ 新建收藏夹');
+    }, icon('folder-plus', 16), h('span', null, '新建'));
     const rename = h('button', {
-      class: 'btn', type: 'button', disabled: folderId === '0',
+      class: 'favorite-folder-action', type: 'button', disabled: folderId === '0', 'aria-label': '重命名收藏夹', title: '重命名收藏夹',
       onclick: async () => {
         const name = window.prompt('重命名收藏夹', currentName);
         if (!name || !name.trim() || name.trim() === currentName) return;
@@ -396,9 +447,9 @@ export function favoritesView(root, params) {
           refreshRoute();
         } catch (e) { if (!isAbort(e)) toast(e.message); }
       },
-    }, '重命名');
+    }, icon('edit-3', 15));
     const remove = h('button', {
-      class: 'btn', type: 'button', disabled: folderId === '0',
+      class: 'favorite-folder-action danger', type: 'button', disabled: folderId === '0', 'aria-label': '删除收藏夹', title: '删除收藏夹',
       onclick: async () => {
         if (!window.confirm(`删除“${currentName}”？其中漫画不会从总收藏中移除。`)) return;
         try {
@@ -407,17 +458,22 @@ export function favoritesView(root, params) {
           refreshRoute('0');
         } catch (e) { if (!isAbort(e)) toast(e.message); }
       },
-    }, '删除收藏夹');
+    }, icon('trash-2', 15));
     manageBar.replaceChildren(create, rename, remove);
   }
 
   function updateSelectionBar() {
     if (!selected.size) {
-      selectionBar.style.display = 'none';
+      selectionBar.hidden = true;
       selectionBar.replaceChildren();
+      cards.forEach((card) => {
+        card.classList.remove('is-selected');
+        const box = card.querySelector('input[data-select]');
+        if (box) box.checked = false;
+      });
       return;
     }
-    selectionBar.style.display = 'flex';
+    selectionBar.hidden = false;
     const move = h('button', {
       class: 'btn primary', type: 'button',
       onclick: async () => {
@@ -427,11 +483,13 @@ export function favoritesView(root, params) {
         let success = 0;
         let cloud = 0;
         let session = 0;
+        const movedIds = [];
         for (const id of [...selected]) {
           try {
             const result = await api.favoriteFolder('move', target[0], '', id);
             if (result?.scope === 'cloud') cloud++; else session++;
             success++;
+            movedIds.push(id);
           }
           catch (_) { /* 汇总提示，继续处理其他项 */ }
         }
@@ -440,12 +498,13 @@ export function favoritesView(root, params) {
           : (cloud ? '（已同步云端）' : '（仅本会话）');
         toast(`已移动 ${success}/${selected.size} 项到 ${target[1]}${scopeText}`);
         if (folderId !== '0') {
-          [...selected].forEach((id) => cards.get(id)?.remove());
+          movedIds.forEach(dropFavoriteCard);
         }
         selected.clear();
         updateSelectionBar();
+        filterCards();
       },
-    }, '移动到收藏夹');
+    }, icon('folder', 15), '移动到收藏夹');
     const unfavorite = h('button', {
       class: 'btn', type: 'button',
       onclick: async () => {
@@ -455,36 +514,50 @@ export function favoritesView(root, params) {
         for (const id of [...selected]) {
           try {
             await api.favorite(id);
-            cards.get(id)?.remove();
-            cards.delete(id);
+            dropFavoriteCard(id);
             success++;
           } catch (_) { /* 汇总提示 */ }
         }
         selected.clear();
         toast(`已取消收藏 ${success} 项`);
         updateSelectionBar();
+        filterCards();
       },
-    }, '取消收藏');
-    selectionBar.replaceChildren(h('strong', { style: 'flex:1;font-size:13px' }, `已选择 ${selected.size} 项`), move, unfavorite,
+    }, icon('trash-2', 15), '取消收藏');
+    selectionBar.replaceChildren(
+      h('div', { class: 'favorite-selection-count' }, icon('check-square', 17), h('strong', null, `已选择 ${selected.size} 项`)),
+      h('div', { class: 'favorite-selection-actions' }, move, unfavorite,
       h('button', {
         class: 'btn', type: 'button',
         onclick: () => {
           selected.clear();
-          cards.forEach((card) => { const box = card.querySelector('input[data-select]'); if (box) box.checked = false; });
+          cards.forEach((card) => {
+            const box = card.querySelector('input[data-select]');
+            if (box) box.checked = false;
+            card.classList.remove('is-selected');
+          });
           updateSelectionBar();
         },
-      }, '取消选择'));
+      }, '完成')));
   }
 
   function filterCards() {
     const query = localSearch.value.trim().toLocaleLowerCase();
+    let visible = 0;
     cards.forEach((card) => {
       const meta = card._favoriteMeta || { tags: [], authors: [] };
       const chosen = [...selectedTags].map((value) => meta.tags.includes(value))
         .concat([...selectedAuthors].map((value) => meta.authors.includes(value)));
       const facetMatch = !chosen.length || (filterLogic === 'and' ? chosen.every(Boolean) : chosen.some(Boolean));
       card.hidden = !(facetMatch && (!query || card.dataset.search.includes(query)));
+      if (!card.hidden) visible++;
     });
+    clearSearch.hidden = !query;
+    const hasFilters = !!query || selectedTags.size > 0 || selectedAuthors.size > 0;
+    filterEmpty.hidden = !(hasFilters && cards.size > 0 && visible === 0);
+    libraryMeta.textContent = hasFilters
+      ? `${visible} 个匹配结果 · 已加载 ${cards.size} 部`
+      : `已加载 ${cards.size} 部${cards.size ? ' · 向下滚动继续加载' : ''}`;
   }
 
   function facetChips(counts, selected, emptyText) {
@@ -503,22 +576,25 @@ export function favoritesView(root, params) {
       h('option', { value: 'or', selected: filterLogic === 'or' }, '任一满足'));
     logic.onchange = () => { filterLogic = logic.value; filterCards(); };
     filterPanel.replaceChildren(
-      h('div', { class: 'setting-row' }, h('strong', null, '收藏高级筛选'),
-        h('div', { style: 'display:flex;gap:7px;flex-wrap:wrap' }, logic,
+      h('div', { class: 'favorite-filter-head' },
+        h('div', null, h('strong', null, '精细筛选'), h('span', null, '组合标签和作者，快速缩小范围')),
+        h('div', { class: 'favorite-filter-actions' }, logic,
           h('button', { class: 'btn', type: 'button', onclick: async (event) => {
             const button = event.currentTarget; button.disabled = true; button.textContent = '正在加载全部收藏…';
             try { await list?.loadAll(500); button.textContent = '已加载完整收藏'; }
             catch (_) { button.textContent = '加载全部后筛选'; }
             finally { button.disabled = false; renderFacets(); filterCards(); }
-          } }, '加载全部后筛选'),
+          } }, '加载全部'),
           h('button', { class: 'btn ghost', type: 'button', onclick: () => {
             selectedTags.clear(); selectedAuthors.clear(); localSearch.value = ''; renderFacets(); filterCards();
           } }, '重置'))),
-      h('div', { class: 'hint', style: 'margin:8px 0 5px' }, '标签（可多选）'),
-      h('div', { class: 'chips favorite-facet-chips' }, facetChips(tagCounts, selectedTags, '加载收藏后显示标签计数')),
-      h('div', { class: 'hint', style: 'margin:8px 0 5px' }, '作者（可多选）'),
-      h('div', { class: 'chips favorite-facet-chips' }, facetChips(authorCounts, selectedAuthors, '加载收藏后显示作者计数')),
-      h('div', { class: 'hint' }, '滚动时持续纳入新页；点击“加载全部后筛选”可覆盖整个收藏库。'));
+      h('div', { class: 'favorite-facet' },
+        h('div', { class: 'favorite-facet-label' }, '标签', h('span', null, '可多选')),
+        h('div', { class: 'chips favorite-facet-chips' }, facetChips(tagCounts, selectedTags, '加载收藏后显示标签计数'))),
+      h('div', { class: 'favorite-facet' },
+        h('div', { class: 'favorite-facet-label' }, '作者', h('span', null, '可多选')),
+        h('div', { class: 'chips favorite-facet-chips' }, facetChips(authorCounts, selectedAuthors, '加载收藏后显示作者计数'))),
+      h('div', { class: 'favorite-filter-note' }, '筛选默认覆盖已加载内容；加载全部后可覆盖整个收藏库。'));
   }
 
   function scheduleFacetRender() {
@@ -527,22 +603,40 @@ export function favoritesView(root, params) {
     queueMicrotask(renderFacets);
   }
 
+  function dropFavoriteCard(id) {
+    const card = cards.get(String(id));
+    if (!card) return;
+    const meta = card._favoriteMeta || { tags: [], authors: [] };
+    meta.tags.forEach((value) => {
+      const next = (tagCounts.get(value) || 1) - 1;
+      if (next > 0) tagCounts.set(value, next); else tagCounts.delete(value);
+    });
+    meta.authors.forEach((value) => {
+      const next = (authorCounts.get(value) || 1) - 1;
+      if (next > 0) authorCounts.set(value, next); else authorCounts.delete(value);
+    });
+    card.remove();
+    cards.delete(String(id));
+    scheduleFacetRender();
+  }
+
   function decorateFavorite(item) {
     const id = String(item.id ?? item.aid ?? item.AID ?? '');
     const card = comicCard(item);
     card.dataset.favoriteCard = '1';
+    card.dataset.favoriteId = id;
     const authors = (Array.isArray(item.author) ? item.author : [item.author]).map((x) => String(x || '').trim()).filter(Boolean);
     const tags = (Array.isArray(item.tags) ? item.tags : []).map((x) => String(x || '').trim()).filter(Boolean);
     card.dataset.search = [item.name, ...authors, ...tags].filter(Boolean).join(' ').toLocaleLowerCase();
     card._favoriteMeta = { authors, tags };
-    card.style.position = 'relative';
     const checkbox = h('input', {
       type: 'checkbox', 'data-select': '1', 'aria-label': `选择${item.name || id}`,
-      style: 'position:absolute;z-index:3;left:8px;top:8px;width:20px;height:20px;accent-color:var(--primary)',
+      class: 'favorite-card-check',
       onclick: (e) => e.stopPropagation(),
       onkeydown: (e) => e.stopPropagation(),
       onchange: (e) => {
         if (e.target.checked) selected.add(id); else selected.delete(id);
+        card.classList.toggle('is-selected', e.target.checked);
         updateSelectionBar();
       },
     });
@@ -570,11 +664,13 @@ export function favoritesView(root, params) {
       foldersHydrated = true;
       sessionFolderIds = new Set((d.session_folder_ids || []).map(String));
       folders = folderEntries(d.folder_list).map(([id, name]) => [id, id === '0' ? '全部' : name]);
-      scopeHint.textContent = res.scope === 'cloud'
+      scopeHint.classList.toggle('is-local', res.scope !== 'cloud');
+      scopeHint.firstElementChild?.replaceWith(icon(res.scope === 'cloud' ? 'cloud' : 'cloud-off', 14));
+      scopeText.textContent = res.scope === 'cloud'
         ? (sessionFolderIds.size
-          ? '已连接 JM 账号云端收藏夹；标注“本会话”的分组来自云端失败后的本地降级。'
-          : '已连接 JM 账号云端收藏夹，收藏夹管理会同步到账号。')
-        : '当前收藏夹分组仅保存在本会话；登录且云端接口可用后会优先同步账号。';
+          ? '已连接云端；标注“本会话”的分组暂未同步'
+          : '已同步至 JM 账号')
+        : '收藏夹分组当前仅保存在本会话';
       renderFolders();
     }
     const source = filterComics(d.list || [], setting.blockedTagList || []);
@@ -583,6 +679,12 @@ export function favoritesView(root, params) {
       // 本地收藏夹映射按上游分页后过滤，当前页为空不代表后续页也为空。
       hasMore: Number(d.total) > p * 20 || Number(d.source_count) > 0,
     };
+  }, {
+    empty: () => h('div', { class: 'favorite-empty', style: { gridColumn: '1/-1' } },
+      h('div', { class: 'favorite-empty-icon' }, icon('star', 28)),
+      h('h3', null, '收藏夹还是空的'),
+      h('p', null, '遇到喜欢的作品时点一下收藏，之后就能在这里继续阅读。'),
+      h('a', { class: 'btn primary', href: '#/' }, '去首页看看', icon('arrow-right', 15))),
   });
   page.append(list.root);
   return list.destroy;

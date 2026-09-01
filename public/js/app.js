@@ -352,10 +352,11 @@ function render(navigation = {}) {
 }
 
 function highlightNav(path) {
-  const active = path === '/' ? '#/'
+  const desktopActive = path === '/' ? '#/'
     : path.startsWith('/category') ? '#/category'
     : path.startsWith('/week') ? '#/week'
-    : (path.startsWith('/user') || path.startsWith('/favorites') || path.startsWith('/settings')
+    : path.startsWith('/favorites') ? '#/favorites'
+    : (path.startsWith('/user') || path.startsWith('/settings')
       || path.startsWith('/signin') || path.startsWith('/watch-history')
       || path.startsWith('/my-comments') || path.startsWith('/local-history') || path.startsWith('/downloads')
       || path.startsWith('/advanced') || path.startsWith('/blocked-tags') || path.startsWith('/palette')
@@ -364,6 +365,8 @@ function highlightNav(path) {
       || path.startsWith('/extract') || path.startsWith('/cache') || path.startsWith('/about')) ? '#/user'
     : null;
   document.querySelectorAll('#topbar .nav-links a, #tabbar a').forEach((a) => {
+    // 桌面端有独立“收藏”入口；移动端仍将收藏归入“我的”主 Tab。
+    const active = a.closest('#tabbar') && desktopActive === '#/favorites' ? '#/user' : desktopActive;
     const isActive = a.dataset.nav === active;
     a.classList.toggle('active', isActive);
     if (isActive) a.setAttribute('aria-current', 'page');

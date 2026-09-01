@@ -199,7 +199,7 @@ import { imgSrc } from './api.js';
 function imgSrcOf(item) { return imgSrc(item); }
 
 /** 无限滚动列表容器：返回 { root, destroy }；路由离开时必须调用 destroy */
-export function infiniteList(loader) {
+export function infiniteList(loader, options = {}) {
   const grid = h('div', { class: 'grid' }, comicSkeletons());
   const sentinel = h('div');
   const root = h('div', null, grid, sentinel);
@@ -229,10 +229,13 @@ export function infiniteList(loader) {
       page = next;
       grid.querySelectorAll(':scope > .skeleton-card').forEach((node) => node.remove());
       if (!items.length && page === 1) {
-        grid.replaceChildren(h('div', { class: 'empty', style: { gridColumn: '1/-1' } },
-          h('div', { class: 'big' }, icon('inbox', 40)), '这里什么都没有'));
+        const customEmpty = typeof options.empty === 'function' ? options.empty() : null;
+        const empty = customEmpty || h('div', { class: 'empty', style: { gridColumn: '1/-1' } },
+          h('div', { class: 'big' }, icon('inbox', 40)), '这里什么都没有');
+        empty.dataset.listEmpty = '1';
+        grid.replaceChildren(empty);
       }
-      if (items.length) grid.querySelector(':scope > .empty')?.remove();
+      if (items.length) grid.querySelector(':scope > [data-list-empty]')?.remove();
       grid.append(...items);
       if (!hasMore) {
         finished = true;
