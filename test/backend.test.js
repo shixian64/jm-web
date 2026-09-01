@@ -761,6 +761,14 @@ class MockServerResponse extends EventEmitter {
       assert.deepStrictEqual(settings.allDataSourceHosts(), originalAuthHosts);
     }
 
+    // 未锁定环境变量时，成功的会话 origin 也必须优先于内置首线路；否则
+    // 浏览器的 builtin 数据源会先发一个没有 AVS 的请求，再浪费一次 401 重试。
+    const builtinHosts = settings.allDataSourceHosts();
+    assert.ok(builtinHosts.length > 1);
+    for (const source of ['builtin', 'network', 'mixed']) {
+      assert.strictEqual(settings.apiHostsForSource(source, builtinHosts[1])[0], builtinHosts[1], source);
+    }
+
     // 所有真实上游请求统一使用加密响应桩；同时记录 method/path/body 验证写操作。
     const originalDohLookup = features.dohLookup;
     features.dohLookup = publicDns;
