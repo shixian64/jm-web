@@ -1,5 +1,7 @@
 # JM Web —— 自部署网页版漫画阅读站
 
+[![LINUX DO](https://img.shields.io/badge/LINUX%20DO-%E7%A4%BE%E5%8C%BA%E8%AE%A4%E5%8F%AF-FFB003?style=for-the-badge&logo=discourse&logoColor=white)](https://linux.do/)
+
 参照 [jmcomic-next](https://github.com/HongShi2333/jmcomic-next) 与 [jm-mobile](https://github.com/Dedicatus546/jm-mobile)
 两个安卓客户端的通信协议，实现的**网页版本**。电脑、手机浏览器均可使用（响应式布局）。
 
