@@ -3,6 +3,26 @@ import { api } from './api.js';
 import { h } from './ui.js';
 import { icon } from './icons.js';
 
+/**
+ * 触屏浏览器进入口令页时不自动聚焦密码框。iOS 会把程序化聚焦当作编辑
+ * 会话并持续显示系统“粘贴”浮层；把初始焦点放到对话框本身，用户主动点
+ * 输入框后再正常唤起键盘。桌面端仍保留直接输入口令的便利性。
+ */
+export function shouldAutoFocusPasswordInput(targetWindow) {
+  const host = targetWindow || (typeof window !== 'undefined' ? window : null);
+  if (!host || typeof host.matchMedia !== 'function') return true;
+  try {
+    return !host.matchMedia('(pointer: coarse)').matches
+      && !host.matchMedia('(hover: none)').matches;
+  } catch (_) {
+    return true;
+  }
+}
+
+export function passwordGateInitialFocusTarget(input, overlay, targetWindow) {
+  return shouldAutoFocusPasswordInput(targetWindow) ? input : overlay;
+}
+
 export function passwordGate(onSuccess) {
   const titleId = 'password-gate-title';
   const inputId = 'password-gate-input';
@@ -20,7 +40,7 @@ export function passwordGate(onSuccess) {
   let focusRaf = 0;
 
   const overlay = h('div', {
-    role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': titleId,
+    role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': titleId, tabindex: '-1',
     style: 'position:fixed;inset:0;z-index:300;background:var(--bg);display:flex;align-items:center;justify-content:center;padding:20px',
     onkeydown: (e) => {
       if (e.key !== 'Tab') return;
@@ -28,7 +48,8 @@ export function passwordGate(onSuccess) {
       if (!focusable.length) return;
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
-      if (focusable.length === 1 || (e.shiftKey && document.activeElement === first)
+      if (document.activeElement === overlay || focusable.length === 1
+        || (e.shiftKey && document.activeElement === first)
         || (!e.shiftKey && document.activeElement === last)) {
         e.preventDefault();
         (e.shiftKey ? last : first).focus();
@@ -85,11 +106,12 @@ export function passwordGate(onSuccess) {
   // 先隔离后台，再把模态层接入 DOM；否则对脱离文档的 input 调用 focus 不会生效。
   if (appRoot) appRoot.setAttribute('inert', '');
   document.body.appendChild(overlay);
-  input.focus({ preventScroll: true });
+  const initialFocusTarget = passwordGateInitialFocusTarget(input, overlay);
+  initialFocusTarget.focus({ preventScroll: true });
   // 防止启动阶段已排队的页面聚焦 RAF 抢回焦点。
   focusRaf = requestAnimationFrame(() => {
     focusRaf = 0;
-    if (!cleaned && overlay.isConnected) input.focus({ preventScroll: true });
+    if (!cleaned && overlay.isConnected) initialFocusTarget.focus({ preventScroll: true });
   });
 
   return cleanup;
