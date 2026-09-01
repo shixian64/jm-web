@@ -1,6 +1,6 @@
 // 访问口令门控（服务器设置 ACCESS_PASSWORD 环境变量时启用）
 import { api } from './api.js';
-import { h } from './ui.js';
+import { h, shouldAutoFocusEditable } from './ui.js';
 import { icon } from './icons.js';
 
 /**
@@ -9,14 +9,7 @@ import { icon } from './icons.js';
  * 输入框后再正常唤起键盘。桌面端仍保留直接输入口令的便利性。
  */
 export function shouldAutoFocusPasswordInput(targetWindow) {
-  const host = targetWindow || (typeof window !== 'undefined' ? window : null);
-  if (!host || typeof host.matchMedia !== 'function') return true;
-  try {
-    return !host.matchMedia('(pointer: coarse)').matches
-      && !host.matchMedia('(hover: none)').matches;
-  } catch (_) {
-    return true;
-  }
+  return shouldAutoFocusEditable(targetWindow);
 }
 
 export function passwordGateInitialFocusTarget(input, overlay, targetWindow) {
@@ -97,7 +90,9 @@ export function passwordGate(onSuccess) {
       else appRoot.removeAttribute('inert');
       if ('inert' in appRoot) appRoot.inert = appWasInert;
     }
-    if (restoreFocus && previouslyFocused && previouslyFocused.isConnected
+    // 触屏端不把焦点恢复到门禁出现前可能已被搜索页聚焦的输入框，避免
+    // 验证完成后立即重新打开 iOS 编辑会话和“粘贴”菜单。
+    if (restoreFocus && shouldAutoFocusEditable() && previouslyFocused && previouslyFocused.isConnected
       && typeof previouslyFocused.focus === 'function') {
       previouslyFocused.focus({ preventScroll: true });
     }

@@ -2,6 +2,7 @@
 import { api, imgSrc } from './api.js';
 import {
   h, toast, comicCard, comicSkeletons, infiniteList, installPullToRefresh, errorBox, loadingBox,
+  shouldAutoFocusEditable,
 } from './ui.js';
 import { setting, getLocalHistory, getSearchHistory, addSearchHistory, clearSearchHistory } from './store.js';
 import { icon } from './icons.js';
@@ -341,7 +342,9 @@ export function searchView(root, params, ctx) {
     ...deserializeExcludedTags(params.get('exclude')),
   ]);
   const page = h('div', { class: 'page search-page' });
-  let autoFocusPending = !ctx || ctx.navigationType !== 'history';
+  // 手机端进入/恢复空搜索页时不由脚本打开编辑会话，避免 iOS WebKit
+  // 持续显示“粘贴”菜单；用户主动点输入框后仍可正常输入。
+  let autoFocusPending = (!ctx || ctx.navigationType !== 'history') && shouldAutoFocusEditable();
 
   const navigateSearch = (value, nextExcluded = excludedTags, order = o) => {
     const parsed = parseSearchSyntax(value);

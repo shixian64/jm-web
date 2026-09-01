@@ -1,6 +1,24 @@
 // UI 工具：元素构建、Toast、通用组件（封面卡片、分页、错误态）
 import { icon } from './icons.js';
 
+/**
+ * 是否允许页面在没有直接用户手势时自动聚焦可编辑控件。
+ *
+ * iOS/WebKit（包括 iPhone 上的 Edge）会把脚本触发的输入框聚焦视为编辑
+ * 会话，并可能持续展示系统“粘贴”菜单。触屏/无悬停设备因此只在用户主动
+ * 点击输入框后进入编辑态；桌面端继续保留自动聚焦的键盘效率。
+ */
+export function shouldAutoFocusEditable(targetWindow) {
+  const host = targetWindow || (typeof window !== 'undefined' ? window : null);
+  if (!host || typeof host.matchMedia !== 'function') return true;
+  try {
+    return !host.matchMedia('(pointer: coarse)').matches
+      && !host.matchMedia('(hover: none)').matches;
+  } catch (_) {
+    return true;
+  }
+}
+
 export function h(tag, attrs = {}, ...children) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {

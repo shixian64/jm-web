@@ -1,6 +1,6 @@
 // 高级功能：安全锁、备份、标签排除、主题调色、AI、DoH、日志与维护。
 import { api } from './api.js';
-import { h, toast, errorBox, loadingBox } from './ui.js';
+import { h, toast, errorBox, loadingBox, shouldAutoFocusEditable } from './ui.js';
 import { icon } from './icons.js';
 import {
   setting, updateSetting, getPersonas, savePersonas, getAiSessions, saveAiSessions,
@@ -172,7 +172,7 @@ export function advancedHubView(root) {
     h('div', { class: 'setting-group' },
       groupTitle('自动化与入口'),
       h('div', { class: 'setting-item' }, toggleRow('自动签到', 'autoSignInEnabled', '已登录时启动后检查当天状态并自动签到。')),
-      h('div', { class: 'setting-item' }, toggleRow('剪贴板编号检测', 'clipboardAutoDetectEnabled', '页面获得焦点时识别 JM 编号；浏览器会按权限策略询问。')),
+      h('div', { class: 'setting-item' }, toggleRow('剪贴板编号检测', 'clipboardAutoDetectEnabled', '粘贴文本时识别 JM 编号；不会在进入页面或切回前台时主动读取系统剪贴板。')),
       h('div', { class: 'setting-item' }, toggleRow('在“我的”显示 AI 入口', 'showAiEntry')),
       h('div', { class: 'setting-item' }, h('label', { class: 'setting-row toggle-row' },
         h('div', null, h('div', { class: 'lab' }, '首页偏好推荐'),
@@ -580,8 +580,12 @@ async function showLockGate({ forceRecovery = false } = {}) {
       return;
     }
     locked = true;
-    lockOverlay = h('div', { class: 'local-lock-overlay', role: 'dialog', 'aria-modal': 'true' },
-      h('div', { class: 'card local-lock-card' }, icon('lock', 36), h('h2', null, '应用锁凭据已损坏'),
+    lockOverlay = h('div', {
+      class: 'local-lock-overlay', role: 'dialog', 'aria-modal': 'true',
+      'aria-labelledby': 'local-lock-recovery-title',
+    },
+      h('div', { class: 'card local-lock-card' }, icon('lock', 36),
+        h('h2', { id: 'local-lock-recovery-title' }, '应用锁凭据已损坏'),
         h('div', { class: 'hint' }, '无法读取当前浏览器保存的锁凭据。灾难恢复会退出账号并永久清除当前浏览器的全部 JM Web 数据。'),
         h('button', { class: 'btn ghost block', type: 'button', style: 'color:var(--danger)', onclick: recoverLocalLock }, '清除本机全部数据、退出账号并重新开始')));
     document.body.append(lockOverlay);
@@ -665,8 +669,12 @@ async function showLockGate({ forceRecovery = false } = {}) {
       finally { unlocking = false; lockOverlay?.removeAttribute('aria-busy'); }
     },
   }, biometricReady ? '使用设备生物识别' : '设备生物识别当前不可用'));
-  lockOverlay = h('div', { class: 'local-lock-overlay', role: 'dialog', 'aria-modal': 'true' },
-    h('div', { class: 'card local-lock-card' }, icon('lock', 36), h('h2', null, 'JM Web 已锁定'),
+  lockOverlay = h('div', {
+    class: 'local-lock-overlay', role: 'dialog', 'aria-modal': 'true', tabindex: '-1',
+    'aria-labelledby': 'local-lock-title',
+  },
+    h('div', { class: 'card local-lock-card' }, icon('lock', 36),
+      h('h2', { id: 'local-lock-title' }, 'JM Web 已锁定'),
       setting.appLockUnlockRule === 'required'
         ? h('div', { class: 'hint' }, `需要完成 ${required.length} 种已选验证方式。`) : h('div', { class: 'hint' }, '任选一种已配置方式即可解锁。'),
       unavailable.length ? h('div', { class: 'hint', style: 'color:var(--danger)' }, '所需设备验证当前不可用；为避免降低锁定强度，不会自动切换为任一方式。') : null,
@@ -683,10 +691,17 @@ async function showLockGate({ forceRecovery = false } = {}) {
     const focusable = [...lockOverlay.querySelectorAll('button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])')];
     if (!focusable.length) return;
     const first = focusable[0], last = focusable[focusable.length - 1];
-    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
-    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    if (document.activeElement === lockOverlay || focusable.length === 1
+        || (event.shiftKey && document.activeElement === first)
+        || (!event.shiftKey && document.activeElement === last)) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus();
+    }
   });
-  queueMicrotask(() => (pinInput || lockOverlay.querySelector('.pattern-dot') || lockOverlay.querySelector('button'))?.focus());
+  const desktopFocusTarget = pinInput || lockOverlay.querySelector('.pattern-dot')
+    || lockOverlay.querySelector('button:not(:disabled)') || lockOverlay;
+  const initialFocusTarget = shouldAutoFocusEditable() ? desktopFocusTarget : lockOverlay;
+  queueMicrotask(() => initialFocusTarget?.focus({ preventScroll: true }));
 }
 
 export function isLocalAppLocked() { return locked; }
@@ -1605,19 +1620,32 @@ async function autoSignIn() {
   } catch (_) {}
 }
 
-async function inspectClipboard() {
-  if (locked || !setting.clipboardAutoDetectEnabled || !navigator.clipboard?.readText || document.visibilityState !== 'visible') return;
+export function clipboardAlbumIdFromText(value) {
+  if (typeof value !== 'string') return '';
+  const match = /(?:JM\s*|album\/|photo\/)(\d{3,10})/i.exec(value);
+  return match ? match[1] : '';
+}
+
+function handleClipboardPaste(event) {
+  // iOS 会把启动、focus 或 visibilitychange 中的 Clipboard.readText 视为
+  // 被动读取，并持续展示“粘贴/允许粘贴”系统浮层。这里只处理用户真实触发
+  // 的 paste 事件；“提取漫画编码”页的显式按钮仍可按用户手势读取剪贴板。
+  if (locked || !setting.clipboardAutoDetectEnabled || document.visibilityState !== 'visible'
+      || document.getElementById('password-gate-input')) return;
+  // 全局粘贴检测不得读取登录、应用锁或备份口令。先检查目标，再访问
+  // clipboardData，确保敏感字段内容不会进入模块状态或被误识别为漫画编号。
   try {
-    const value = await navigator.clipboard.readText(); if (!value || value === lastClipboardValue) return;
-    if (locked) return;
-    lastClipboardValue = value;
-    const match = /(?:JM\s*|album\/|photo\/)(\d{3,10})/i.exec(value); if (!match) return;
-    const id = match[1];
-    const notice = h('div', { class: 'clipboard-notice' }, `检测到 JM${id}`,
-      h('button', { class: 'btn primary', onclick: () => { notice.remove(); location.hash = `#/album/${id}`; } }, '打开'),
-      h('button', { class: 'btn', onclick: () => notice.remove() }, '忽略'));
-    document.body.append(notice); setTimeout(() => notice.remove(), 12000);
-  } catch (_) {}
+    if (event?.target?.closest?.('input[type="password"], [data-clipboard-private="true"]')) return;
+  } catch (_) { return; }
+  let value = '';
+  try { value = event?.clipboardData?.getData('text/plain') || ''; } catch (_) { return; }
+  if (!value || value === lastClipboardValue) return;
+  lastClipboardValue = value;
+  const id = clipboardAlbumIdFromText(value); if (!id) return;
+  const notice = h('div', { class: 'clipboard-notice' }, `检测到 JM${id}`,
+    h('button', { class: 'btn primary', onclick: () => { notice.remove(); location.hash = `#/album/${id}`; } }, '打开'),
+    h('button', { class: 'btn', onclick: () => notice.remove() }, '忽略'));
+  document.body.append(notice); setTimeout(() => notice.remove(), 12000);
 }
 
 function showOnboarding() {
@@ -1727,14 +1755,13 @@ export function installAdvancedRuntime() {
   showOnboarding();
   if (setting.appLockEnabled) showLockGate();
   runUnlockedTasks();
-  window.addEventListener('focus', inspectClipboard);
+  document.addEventListener('paste', handleClipboardPaste);
   window.addEventListener('blur', () => { if (setting.privacyMode) document.documentElement.classList.add('window-blurred'); });
   window.addEventListener('focus', () => document.documentElement.classList.remove('window-blurred'));
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden' && setting.appLockEnabled && setting.appLockOnHidden) locked = true;
     if (document.visibilityState === 'visible') {
       if (locked) showLockGate();
-      inspectClipboard();
     }
   });
 }
@@ -1742,5 +1769,4 @@ export function installAdvancedRuntime() {
 function runUnlockedTasks() {
   if (locked) return;
   autoSignIn();
-  inspectClipboard();
 }
