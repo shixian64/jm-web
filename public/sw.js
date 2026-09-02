@@ -4,7 +4,7 @@
 
 'use strict';
 
-const CACHE_VERSION = 'jmw-shell-v9';
+const CACHE_VERSION = 'jmw-shell-v10';
 const SHELL = [
   '/',
   '/index.html',
@@ -20,7 +20,9 @@ const SHELL = [
   '/js/app.js',
   '/js/content-actions.js',
   '/js/content-filter.js',
+  '/js/descramble-core.js',
   '/js/descramble.js',
+  '/js/descramble-worker.js',
   '/js/download-view.js',
   '/js/downloads.js',
   '/js/export.js',

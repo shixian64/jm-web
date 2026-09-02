@@ -1168,7 +1168,10 @@ export function mountReader(root, photoId, query, options = {}) {
           blob,
           Number(state.photoId),
           img.page,
-          { memoryOptimized: setting.readMemoryOptEnabled === true },
+          {
+            memoryOptimized: setting.readMemoryOptEnabled === true,
+            signal: imageSignal,
+          },
         );
         assertImageActive(generation, imageSignal);
         const url = URL.createObjectURL(out);

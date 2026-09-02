@@ -69,7 +69,9 @@ jm-web/
 │       ├── advanced.js       应用锁、备份、AI、DoH、日志等高级功能
 │       ├── gate.js           站点访问口令门禁
 │       ├── store.js          localStorage 设置与本地历史
-│       └── descramble.js     浏览器端漫画图片解扰
+│       ├── descramble-core.js 浏览器端图片解扰共享算法
+│       ├── descramble-worker.js 模块 Worker / OffscreenCanvas 解扰
+│       └── descramble.js     Worker 调度与主线程兼容回退
 ├── test/                     单元、后端、安全、移动端和部署回归
 ├── data/                     运行状态；不进入 Git 或普通发布制品
 ├── Dockerfile
@@ -93,7 +95,8 @@ jm-web/
 2. `lib/photo.js` 解析图片列表、图片 Host、解扰参数和章节元数据。
 3. `/api/img` 只代理受信 HTTPS Origin，逐跳校验重定向和 DNS。
 4. 后端只接受安全栅格 MIME，并执行大小、并发、背压和客户端取消控制。
-5. 需要解扰的正文图片由 `reader.js` / `descramble.js` 在浏览器 Canvas 中处理。
+5. 需要解扰的正文图片优先由 `descramble-worker.js` 在浏览器模块 Worker/
+   OffscreenCanvas 中处理；不支持时由 `descramble.js` 回退主线程 Canvas。
 
 ### 4.3 两层登录状态
 
@@ -138,8 +141,9 @@ test/backend.test.js 或 test/deployment.test.js
 ```
 
 当前图片相关默认保护为：单章节最多 2000 张、单文件 25 MiB、全局代理并发 12、
-单客户端代理并发 6。前端原图缓存按设备内存计算字节预算，解扰前还会检查像素、
-单轴尺寸与估算工作集；调整这些值时必须重新做移动端和长条图回归。
+单客户端代理并发 6。前端原图缓存按设备内存计算字节预算，解扰优先使用模块
+Worker/OffscreenCanvas，且申请画布前检查像素、单轴尺寸与估算工作集；调整这些值时
+必须重新做移动端和长条图回归。
 
 ## 6. 前端实现不变量
 
@@ -329,6 +333,7 @@ docker compose --env-file .env.example \
 - 首页一次创建大量卡片；原生 `loading=lazy` 仍可能提前发起较多封面，离页后继续占用网络和 `/api/img` 并发。
 - `app.js` 静态导入阅读器、下载、高级和用户模块，首屏模块图偏大；路由级动态导入需单独设计应用锁和 SW 升级兼容。
 - 长章节滚动定位会遍历页面槽位；预取应只在页码实际变化时触发。
+- 超过单张 Canvas 上限的超长条漫当前会保护性拒绝，尚未实现分块重排和分块展示。
 - 下载队列重启后的 `queued` 恢复策略需要明确，避免永久“等待中”或多标签重复下载。
 
 ### 后端与安全

@@ -987,7 +987,7 @@ export class DownloadManager extends EventTarget {
                 name: job.image.name || '',
               });
               if (scrambled && task.request.decode) {
-                const result = await decodeFromBlob(raw, Number(chapter.id), job.image.page);
+                const result = await decodeFromBlob(raw, Number(chapter.id), job.image.page, { signal });
                 blob = result.blob;
                 width = Number(result.width || 0);
                 height = Number(result.height || 0);

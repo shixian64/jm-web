@@ -307,13 +307,19 @@ class MockServerResponse extends EventEmitter {
     response = await originalFetch(`http://127.0.0.1:${port}/`);
     assert.strictEqual(response.status, 200);
     const csp = response.headers.get('content-security-policy') || '';
-    for (const directive of ["frame-ancestors 'none'", "base-uri 'self'", "object-src 'none'", "form-action 'self'"]) {
+    for (const directive of [
+      "frame-ancestors 'none'", "base-uri 'self'", "object-src 'none'", "form-action 'self'",
+      "worker-src 'self' blob:",
+    ]) {
       assert.ok(csp.includes(directive), directive);
     }
 
     // 静态资源和 SPA 回退的 HEAD 元数据应与 GET 一致，且绝不返回实体。
-    for (const pathname of ['/js/app.js', '/a-client-route']) {
+    for (const pathname of ['/js/app.js', '/js/descramble-worker.js', '/a-client-route']) {
       const get = await originalFetch(`http://127.0.0.1:${port}${pathname}`);
+      if (pathname.endsWith('.js')) {
+        assert.match(get.headers.get('content-type') || '', /^text\/javascript\b/i, pathname);
+      }
       const getBytes = (await get.arrayBuffer()).byteLength;
       const head = await originalFetch(`http://127.0.0.1:${port}${pathname}`, { method: 'HEAD' });
       assert.strictEqual(head.status, get.status, pathname);

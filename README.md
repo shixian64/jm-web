@@ -15,7 +15,7 @@
 - **漫画详情与社交**：封面、标签、简介、章节、相关漫画、复制 JM 号、点赞、收藏；评论、嵌套回复、点赞和发表评论。
 - **账号数据**：登录/自动登录、签到日历、收藏列表及浏览器本地收藏夹（新建、改名、删除、批量移动）、云端阅读历史、评论历史。
 - **完整阅读器**：连续滚动、正序/RTL 单页、点击翻页四种模式；前后预解码、章节跳转、进度恢复、页码、亮度、Wake Lock、1–4x 缩放、工具栏自动隐藏、点击区域、内存优化和解码并发设置；阅读中可热切换主题、图片线路和预加载，并提供一次性操作引导。
-- **图片还原**：使用与安卓客户端相同的扰乱规则在浏览器 Canvas 解码；下载时保存解扰后的图片。
+- **图片还原**：使用与安卓客户端相同的扰乱规则在浏览器模块 Worker + OffscreenCanvas 解码；不支持时自动回退主线程 Canvas，下载时保存解扰后的图片。
 - **下载与离线**：IndexedDB 离线资料库、可批量暂停/继续/重试/移除的持久下载队列、断点补页、完整性检查、存储统计/清理和离线阅读；恢复备份时可按原整本/选章意图重建下载任务。
 - **导出与 PWA**：整本/单章 ZIP、浏览器打印为 PDF、Service Worker、Web App Manifest 和可安装 PWA 外壳。
 - **外观与过滤**：浅色/深色/跟随系统、五套调色板与自定义四色、各页面网格列数、全局/首页标签过滤。
@@ -97,7 +97,7 @@ Compose 默认只将 `127.0.0.1:3210` 发布到宿主机，适合同机 Nginx/Ca
 
 单实例默认限制为 `1.0` CPU、`512m` 内存和 `256` 个进程，Docker `json-file` 日志按 `10m × 3` 轮转；图片代理默认最多同时处理 `12` 个请求，单个客户端最多 `6` 个。可通过 `.env` 中的 `JMW_CPU_LIMIT`、`JMW_MEMORY_LIMIT`、`JMW_PIDS_LIMIT`、`JMW_LOG_MAX_SIZE`、`JMW_LOG_MAX_FILE`、`JMW_MAX_IMAGE_CONCURRENCY`、`JMW_MAX_IMAGE_CONCURRENCY_PER_IP` 调整。调整前应基于容量测试确定水位，不能直接删除上限。
 
-图片代理只做白名单校验、并发控制和流式转发，不在服务端把整章下载到内存或执行解扰；解扰在浏览器中进行。阅读器会按设备内存以字节预算回收原图缓存，并在创建 Canvas 前拒绝超大或单轴过长的条漫图片。公网部署仍建议保持访问口令、反向代理和单实例资源上限，不要把它当作多人共享的无认证图片代理。
+图片代理只做白名单校验、并发控制和流式转发，不在服务端把整章下载到内存或执行解扰；解扰在浏览器中进行。支持的浏览器会把解扰放入模块 Worker/OffscreenCanvas，减少阅读器主线程卡顿；旧 Safari/WebView 自动回退主线程 Canvas。阅读器会按设备内存以字节预算回收原图缓存，并在创建 Canvas 前拒绝超大或单轴过长的条漫图片。公网部署仍建议保持访问口令、反向代理和单实例资源上限，不要把它当作多人共享的无认证图片代理。
 
 基础镜像默认固定 Node 与 Alpine 的补丁版本；生产发布还应将多架构 manifest digest 纳入制品清单。先用 `docker buildx imagetools inspect node:22.23.2-alpine3.24` 从可信仓库核验摘要，再把 `.env` 的 `JMW_NODE_IMAGE` 设置为 `node:22.23.2-alpine3.24@sha256:<核验得到的摘要>`。摘要与平台有关且会随版本升级，本仓库不写入未经当前构建环境验证的值。
 
@@ -230,9 +230,9 @@ JMW_TRUST_PROXY=172.18.0.5,172.19.0.0/24
 | 后端 | 零依赖 Node.js（≥20），`server.js` + `lib/` |
 | API 协议 | 与 jm-mobile 一致：`token` / `tokenparam` 请求头签名，响应 `data` 字段 AES-256-ECB 解密 |
 | 会话 | 每个浏览器一个 Cookie Jar（AVS 等），持久化到 `data/sessions/`，重启不丢登录态；空会话 7 天、登录会话 90 天自动清理 |
-| 图片 | 服务端按 HTTPS 域名白名单逐跳代理安全栅格图片，并限制大小/并发；解扰由浏览器 Canvas 完成 |
+| 图片 | 服务端按 HTTPS 域名白名单逐跳流式代理并限制大小/并发；解扰由浏览器 Worker/Canvas 完成 |
 | 前端 | 原生 ES Module 单页应用，无构建步骤；Hash 路由；响应式（手机底部 Tab + 桌面顶部导航） |
-| 图片还原 | `seed = seedMap[md5(id+page)]`，按漫画 ID 区间取模，纵向分片反序重排 |
+| 图片还原 | 浏览器模块 Worker/OffscreenCanvas（不支持时回退主线程 Canvas）；`seed = seedMap[md5(id+page)]`，按漫画 ID 区间取模，纵向分片反序重排 |
 
 ## 目录结构
 
@@ -248,7 +248,7 @@ jm-web/
 │   ├── index.html
 │   ├── css/app.css
 │   └── js/              app.js 路由外壳 / views.js 页面 / reader.js 阅读器
-│                        user.js 用户页 / descramble.js 图片解扰 / md5.js
+│                        user.js 用户页 / descramble*.js 图片解扰 / md5.js
 ├── data/                运行时生成（会话、设置，已被 Git/Docker 构建上下文排除）
 ├── test/                单元/后端回归测试与静态检查（npm test / npm run check）
 ├── .env.example         Docker Compose 环境变量安全示例
