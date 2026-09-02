@@ -43,11 +43,22 @@ const {
   fetchImageResponse,
   readRasterImage,
   imageCacheControl,
+  sendCachedImage,
   sendUpstreamImage,
   proxyEventStream,
   MAX_IMAGE_BYTES,
   MAX_IMAGE_CONCURRENCY,
   MAX_IMAGE_CONCURRENCY_PER_IP,
+  MAX_IMAGE_CACHE_BYTES,
+  MAX_IMAGE_CACHE_ENTRY_BYTES,
+  imageCacheKeyForPath,
+  imageCacheKeyForUrl,
+  cacheKeyForFetchedImage,
+  getImageCache,
+  setImageCache,
+  clearImageCache,
+  imageCacheStats,
+  waitForImageRequestSlot,
   acquireImageRequestSlot,
 } = require('../server');
 
@@ -294,6 +305,59 @@ class MockServerResponse extends EventEmitter {
     const reusableImageSlot = acquireImageRequestSlot('image-client-test');
     assert.strictEqual(typeof reusableImageSlot, 'function');
     reusableImageSlot();
+
+    // 封面缓存只接收安全的 albums/library/album/novels 路径；章节 photos
+    // 不进入缓存，且缓存响应应带长度和命中标记。
+    clearImageCache();
+    assert.match(imageCacheKeyForPath('/media/albums/123_3x4.jpg'), /^path:/);
+    assert.match(imageCacheKeyForPath('/media/library/album/x/thumb/album.jpg'), /^path:/);
+    assert.strictEqual(imageCacheKeyForPath('/media/photos/123/00001.jpg'), '');
+    assert.strictEqual(imageCacheKeyForPath('/media/albums/../photos/00001.jpg'), '');
+    assert.strictEqual(imageCacheKeyForPath('/media/albums/%2e%2e/photos/00001.jpg'), '');
+    assert.strictEqual(imageCacheKeyForUrl('https://cdn.example/media/photos/1.jpg'), '');
+    const cacheKey = imageCacheKeyForPath('/media/albums/cache-test.jpg');
+    const trustedImageHost = settings.imageHosts()[0];
+    assert.strictEqual(cacheKeyForFetchedImage(cacheKey, `${trustedImageHost}/media/albums/cache-test.jpg`), cacheKey);
+    assert.strictEqual(cacheKeyForFetchedImage(cacheKey, `${trustedImageHost}/media/photos/1.jpg`), '');
+    assert.ok(MAX_IMAGE_CACHE_BYTES >= MAX_IMAGE_CACHE_ENTRY_BYTES);
+    assert.strictEqual(setImageCache(cacheKey, { mime: 'image/jpeg', body: Buffer.from('cover-cache') }), true);
+    const cachedCover = getImageCache(cacheKey);
+    assert.ok(cachedCover && cachedCover.body.toString() === 'cover-cache');
+    const cachedRes = new MockServerResponse();
+    assert.strictEqual(sendCachedImage(cachedRes, cachedCover, 1), true);
+    assert.strictEqual(cachedRes.statusCode, 200);
+    assert.strictEqual(cachedRes.headers['X-JMW-Image-Cache'], 'HIT');
+    assert.strictEqual(Buffer.concat(cachedRes.chunks).toString(), 'cover-cache');
+
+    const streamedCoverKey = imageCacheKeyForPath('/media/albums/streamed-cover.jpg');
+    const streamedCover = new Response('streamed-cover', { headers: { 'Content-Type': 'image/jpeg' } });
+    const streamedCoverRes = new MockServerResponse();
+    await sendUpstreamImage(streamedCoverRes, streamedCover, 1, undefined, 1000, streamedCoverKey);
+    assert.strictEqual(getImageCache(streamedCoverKey).body.toString(), 'streamed-cover');
+    assert.ok(imageCacheStats().entries >= 2);
+    clearImageCache();
+
+    // 排队请求应在释放槽位后得到可复用的释放函数，而不是立即 503。
+    const heldImageSlots = [];
+    for (let i = 0; i < MAX_IMAGE_CONCURRENCY_PER_IP; i++) {
+      heldImageSlots.push(acquireImageRequestSlot('image-queue-test'));
+    }
+    const queuedSlotPromise = waitForImageRequestSlot('image-queue-test');
+    heldImageSlots[0]();
+    const queuedRelease = await queuedSlotPromise;
+    assert.strictEqual(typeof queuedRelease, 'function');
+    queuedRelease();
+    heldImageSlots.slice(1).forEach((release) => release());
+
+    const abortQueuedSlots = [];
+    for (let i = 0; i < MAX_IMAGE_CONCURRENCY_PER_IP; i++) {
+      abortQueuedSlots.push(acquireImageRequestSlot('image-abort-queue-test'));
+    }
+    const abortQueuedController = new AbortController();
+    const abortedQueuedPromise = waitForImageRequestSlot('image-abort-queue-test', abortQueuedController.signal);
+    abortQueuedController.abort();
+    assert.strictEqual(await abortedQueuedPromise, null);
+    abortQueuedSlots.forEach((release) => release());
 
     // 端到端：healthz、method allowlist 与畸形请求目标。
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -864,6 +928,54 @@ class MockServerResponse extends EventEmitter {
     assert.deepStrictEqual(folderResult.data.folder_list.map((x) => x.id), ['0']);
     response = await postJson('favorite_folder', { type: 'move', aid: '123', folder_id: folder.id });
     assert.strictEqual(response.status, 404, '已删除收藏夹不得继续接收漫画');
+    global.fetch = originalFetch;
+    features.dohLookup = originalDohLookup;
+
+    // 成功的封面响应应在服务端短期复用；第二次请求不再触发上游，
+    // 但章节 photos 路径仍保持原有流式行为（缓存键为空）。
+    clearImageCache();
+    let coverUpstreamCalls = 0;
+    global.fetch = async () => {
+      coverUpstreamCalls++;
+      return new Response('endpoint-cover', { headers: { 'Content-Type': 'image/jpeg' } });
+    };
+    features.dohLookup = publicDns;
+    const coverPath = '/media/albums/endpoint-cache.jpg';
+    const coverQuery = `?path=${encodeURIComponent(coverPath)}`;
+    response = await originalFetch(`http://127.0.0.1:${port}/api/img${coverQuery}`);
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(await response.text(), 'endpoint-cover');
+    response = await originalFetch(`http://127.0.0.1:${port}/api/img${coverQuery}`);
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(response.headers.get('x-jmw-image-cache'), 'HIT');
+    assert.strictEqual(await response.text(), 'endpoint-cover');
+    assert.strictEqual(coverUpstreamCalls, 1);
+
+    // 首次回源尚未结束时，相同封面请求应加入 single-flight，而不是再开一个上游连接。
+    clearImageCache();
+    coverUpstreamCalls = 0;
+    let releaseCoverUpstream;
+    const coverUpstreamReady = new Promise((resolve) => { releaseCoverUpstream = resolve; });
+    global.fetch = async () => {
+      coverUpstreamCalls++;
+      await coverUpstreamReady;
+      return new Response('single-flight-cover', { headers: { 'Content-Type': 'image/jpeg' } });
+    };
+    const firstCoverRequest = originalFetch(`http://127.0.0.1:${port}/api/img${coverQuery}`);
+    for (let i = 0; i < 20 && coverUpstreamCalls < 1; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const secondCoverRequest = originalFetch(`http://127.0.0.1:${port}/api/img${coverQuery}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.strictEqual(coverUpstreamCalls, 1);
+    releaseCoverUpstream();
+    const [firstCoverResponse, secondCoverResponse] = await Promise.all([firstCoverRequest, secondCoverRequest]);
+    assert.strictEqual(firstCoverResponse.status, 200);
+    assert.strictEqual(secondCoverResponse.status, 200);
+    assert.strictEqual(await firstCoverResponse.text(), 'single-flight-cover');
+    assert.strictEqual(await secondCoverResponse.text(), 'single-flight-cover');
+    assert.strictEqual(coverUpstreamCalls, 1);
+    clearImageCache();
     global.fetch = originalFetch;
     features.dohLookup = originalDohLookup;
 

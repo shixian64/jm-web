@@ -73,21 +73,27 @@ export const api = {
   deleteHistory: (id) => request('/history/delete', { method: 'POST', body: JSON.stringify({ id }) }),
 };
 
-/** 封面/头像等静态图地址：API 的 image 字段可能是绝对地址、//xx、/path 或文件名 */
+/** 封面/头像等静态图地址：兼容上游常见的 image/cover 字段和多种地址格式。 */
 export function imgSrc(item) {
   // 上游字段并非始终稳定：异常对象/数字不能直接调用 startsWith，
   // 否则任一列表卡片都会在渲染阶段中断。只接受字符串图片字段，
   // ID 回退也限制为十进制编号，避免把任意对象拼进代理路径。
-  const rawImage = item && typeof item === 'object' ? item.image : '';
+  const rawImage = item && typeof item === 'object'
+    ? [item.image, item.cover, item.cover_url, item.coverUrl]
+      .find((value) => typeof value === 'string' && value.trim())
+    : '';
   const img = typeof rawImage === 'string' ? rawImage.trim() : '';
   if (/^https?:\/\//i.test(img)) return '/api/img?u=' + encodeURIComponent(img);
   if (img.startsWith('//')) return '/api/img?u=' + encodeURIComponent('https:' + img);
+  // 本地阅读记录可能已经保存过服务端代理地址，直接复用以保留其
+  // 精确资源路径；它仍是同源 /api/img，会继续经过后端白名单校验。
+  if (img.startsWith('/api/img?')) return img;
   if (img.startsWith('/media/')) return '/api/img?path=' + encodeURIComponent(img);
   if (/^[\w.-]+\.(jpg|jpeg|png|webp|gif)$/i.test(img)) {
     return '/api/img?path=' + encodeURIComponent('/media/albums/' + img);
   }
   // 详情接口可能不带 image：使用规范封面路径
-  const rawId = item && typeof item === 'object' ? (item.id ?? item.aid) : '';
+  const rawId = item && typeof item === 'object' ? (item.id ?? item.aid ?? item.AID) : '';
   const id = /^\d{1,12}$/.test(String(rawId ?? '').trim()) ? String(rawId).trim() : '';
   return id ? `/api/img?path=${encodeURIComponent(`/media/albums/${id}_3x4.jpg`)}` : '';
 }

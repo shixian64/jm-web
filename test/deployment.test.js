@@ -55,6 +55,10 @@ for (const [pattern, message] of [
   [/target: \/app\/data/, 'Compose 必须持久化 /app/data'],
   [/^\s{10}create_host_path: false$/m, 'Compose 必须禁止以 root 静默创建宿主机数据目录'],
 ]) mustMatch(compose, pattern, message);
+for (const name of [
+  'JMW_IMAGE_CACHE_BYTES', 'JMW_IMAGE_CACHE_ENTRY_BYTES', 'JMW_IMAGE_CACHE_TTL',
+  'JMW_IMAGE_QUEUE_LIMIT', 'JMW_IMAGE_QUEUE_TIMEOUT',
+]) mustMatch(compose, new RegExp(`${name}:`), `Compose 必须传递 ${name}`);
 
 for (const name of [
   'JMW_NODE_IMAGE',
@@ -66,6 +70,11 @@ for (const name of [
   'JMW_MAX_CHAPTER_IMAGES',
   'JMW_MAX_IMAGE_CONCURRENCY',
   'JMW_MAX_IMAGE_CONCURRENCY_PER_IP',
+  'JMW_IMAGE_CACHE_BYTES',
+  'JMW_IMAGE_CACHE_ENTRY_BYTES',
+  'JMW_IMAGE_CACHE_TTL',
+  'JMW_IMAGE_QUEUE_LIMIT',
+  'JMW_IMAGE_QUEUE_TIMEOUT',
 ]) mustMatch(envExample, new RegExp(`^${name}=\\S+$`, 'm'), `.env.example 缺少 ${name}`);
 
 mustMatch(

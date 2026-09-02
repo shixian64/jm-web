@@ -95,9 +95,9 @@ Compose 默认只将 `127.0.0.1:3210` 发布到宿主机，适合同机 Nginx/Ca
 
 默认 Compose 配置以 uid/gid `1000:1000` 的非 root 用户运行，同时启用只读根文件系统、移除 Linux capabilities、禁止提权，并仅让 `/app/data` 持久化可写；运行数据不会写入镜像。为避免 Docker 用 root 身份静默创建目录，Compose 要求 `JMW_HOST_DATA_DIR` 在启动前已经存在；原生 Linux 上该目录必须可由 `1000:1000` 写入。它可以改为仓库外的绝对路径，目录及其备份应按敏感凭据管理。
 
-单实例默认限制为 `1.0` CPU、`512m` 内存和 `256` 个进程，Docker `json-file` 日志按 `10m × 3` 轮转；图片代理默认最多同时处理 `12` 个请求，单个客户端最多 `6` 个。可通过 `.env` 中的 `JMW_CPU_LIMIT`、`JMW_MEMORY_LIMIT`、`JMW_PIDS_LIMIT`、`JMW_LOG_MAX_SIZE`、`JMW_LOG_MAX_FILE`、`JMW_MAX_IMAGE_CONCURRENCY`、`JMW_MAX_IMAGE_CONCURRENCY_PER_IP` 调整。调整前应基于容量测试确定水位，不能直接删除上限。
+单实例默认限制为 `1.0` CPU、`512m` 内存和 `256` 个进程，Docker `json-file` 日志按 `10m × 3` 轮转；图片代理默认最多同时处理 `12` 个请求，单个客户端最多 `6` 个，另有 `96` 个等待队列（单请求最多等待 3 秒）。可通过 `.env` 中的 `JMW_CPU_LIMIT`、`JMW_MEMORY_LIMIT`、`JMW_PIDS_LIMIT`、`JMW_LOG_MAX_SIZE`、`JMW_LOG_MAX_FILE`、`JMW_MAX_IMAGE_CONCURRENCY`、`JMW_MAX_IMAGE_CONCURRENCY_PER_IP`、`JMW_IMAGE_QUEUE_LIMIT`、`JMW_IMAGE_QUEUE_TIMEOUT` 调整。调整前应基于容量测试确定水位，不能直接删除上限。
 
-图片代理只做白名单校验、并发控制和流式转发，不在服务端把整章下载到内存或执行解扰；解扰在浏览器中进行。支持的浏览器会把解扰放入模块 Worker/OffscreenCanvas，减少阅读器主线程卡顿；旧 Safari/WebView 自动回退主线程 Canvas。阅读器会按设备内存以字节预算回收原图缓存，并在创建 Canvas 前拒绝超大或单轴过长的条漫图片。公网部署仍建议保持访问口令、反向代理和单实例资源上限，不要把它当作多人共享的无认证图片代理。
+图片代理只做白名单校验、并发控制和流式转发，不在服务端把整章下载到内存或执行解扰；封面/缩略图会进入有界的进程内 LRU 缓存（默认总计 64 MiB、单张 2 MiB、保存 24 小时），章节正文仍保持流式转发，重启后缓存自动清空。上游暂时超时或 5xx 时，前端会以退避方式有限重试，后端也会短暂跳过故障线路。解扰在浏览器中进行。支持的浏览器会把解扰放入模块 Worker/OffscreenCanvas，减少阅读器主线程卡顿；旧 Safari/WebView 自动回退主线程 Canvas。阅读器会按设备内存以字节预算回收原图缓存，并在创建 Canvas 前拒绝超大或单轴过长的条漫图片。公网部署仍建议保持访问口令、反向代理和单实例资源上限，不要把它当作多人共享的无认证图片代理。
 
 基础镜像默认固定 Node 与 Alpine 的补丁版本；生产发布还应将多架构 manifest digest 纳入制品清单。先用 `docker buildx imagetools inspect node:22.23.2-alpine3.24` 从可信仓库核验摘要，再把 `.env` 的 `JMW_NODE_IMAGE` 设置为 `node:22.23.2-alpine3.24@sha256:<核验得到的摘要>`。摘要与平台有关且会随版本升级，本仓库不写入未经当前构建环境验证的值。
 
@@ -172,6 +172,11 @@ docker compose --env-file .env \
 | `JMW_MAX_IMAGE_BYTES` | `26214400` | 图片代理单文件大小上限（字节，范围 1–100 MiB） |
 | `JMW_MAX_IMAGE_CONCURRENCY` | `12` | 图片代理全局最大并发数（范围 1–100） |
 | `JMW_MAX_IMAGE_CONCURRENCY_PER_IP` | `6` | 单客户端图片代理最大并发数（范围 1–全局上限） |
+| `JMW_IMAGE_CACHE_BYTES` | `67108864` | 封面进程内缓存总上限（字节；设为 0 可关闭） |
+| `JMW_IMAGE_CACHE_ENTRY_BYTES` | `2097152` | 单张封面缓存上限（字节，代码上限 4 MiB；超过后仍正常流式转发） |
+| `JMW_IMAGE_CACHE_TTL` | `86400` | 封面缓存有效期（秒，最短 60 秒） |
+| `JMW_IMAGE_QUEUE_LIMIT` | `96` | 图片代理等待队列上限（范围 0–512） |
+| `JMW_IMAGE_QUEUE_TIMEOUT` | `3000` | 单个图片请求排队最长时间（毫秒） |
 | `JMW_MAX_API_RESPONSE_BYTES` | `16777216` | 上游 API 单响应大小上限（字节，范围 1–32 MiB） |
 | `JMW_MAX_AI_STREAM_BYTES` | `16777216` | 单次 AI 流式响应大小上限（字节，范围 1–64 MiB） |
 | `JMW_MAX_AI_CONCURRENCY` | `4` | AI 流式请求并发上限（范围 1–20） |

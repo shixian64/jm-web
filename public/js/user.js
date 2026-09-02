@@ -1,6 +1,8 @@
 // 用户与设置页面：登录 / 个人中心 / 签到 / 收藏 / 阅读历史 / 评论历史 / 本地记录 / 设置
 import { api, imgSrc } from './api.js';
-import { h, toast, comicCard, infiniteList, installPullToRefresh, errorBox, loadingBox } from './ui.js';
+import {
+  h, toast, comicCard, infiniteList, installPullToRefresh, errorBox, loadingBox, installImageRetry,
+} from './ui.js';
 import {
   setting, updateSetting, getLocalHistory, clearLocalHistory, removeLocalHistory,
 } from './store.js';
@@ -803,13 +805,15 @@ export function localHistoryView(root) {
       const aid = String(it.aid || '');
       const canOpen = /^\d+$/.test(photoId) && /^\d+$/.test(aid);
       const open = () => { if (canOpen) location.hash = it.offline ? `#/offline/${aid}/${photoId}` : `#/read/${photoId}?aid=${aid}`; };
+      const coverImage = h('img', { loading: 'lazy', alt: it.name || '漫画封面', fetchpriority: 'low' });
+      const coverHost = h('div', { class: 'avatar', style: 'border-radius:8px' }, coverImage);
+      installImageRetry(coverImage, imgSrc({ ...it, aid }), { lazy: true });
       const item = h('div', {
         class: 'comment-item',
         style: canOpen ? 'cursor:pointer' : '',
         ...(canOpen ? { role: 'button', tabindex: '0', 'aria-label': `继续阅读${it.name || '漫画'}`, onclick: open } : { 'aria-disabled': 'true' }),
       },
-        h('div', { class: 'avatar', style: 'border-radius:8px' },
-          h('img', { loading: 'lazy', alt: it.name || '漫画封面', src: it.cover || `/api/img?path=${encodeURIComponent(`/media/albums/${aid}_3x4.jpg`)}` })),
+        coverHost,
         h('div', { class: 'body' },
           h('div', { class: 'name' }, it.name || `漫画 ${aid}`),
           h('div', { class: 'foot' },

@@ -65,6 +65,127 @@ function asActivatable(el, onclick) {
   return el;
 }
 
+function retryImageUrl(source, attempt) {
+  const value = String(source || '');
+  const hashIndex = value.indexOf('#');
+  const head = hashIndex >= 0 ? value.slice(0, hashIndex) : value;
+  const hash = hashIndex >= 0 ? value.slice(hashIndex) : '';
+  const separator = head.includes('?') ? '&' : '?';
+  return `${head}${separator}_jmw_retry=${attempt}${hash}`;
+}
+
+let retryImageObserver = null;
+const retryImageStarts = new WeakMap();
+
+function getRetryImageObserver() {
+  if (retryImageObserver || typeof IntersectionObserver !== 'function') return retryImageObserver;
+  retryImageObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      const target = entry.target;
+      if (target.isConnected === false) {
+        retryImageObserver.unobserve(target);
+        retryImageStarts.delete(target);
+        continue;
+      }
+      if (!entry.isIntersecting && Number(entry.intersectionRatio || 0) <= 0) continue;
+      const start = retryImageStarts.get(target);
+      if (!start) continue;
+      retryImageStarts.delete(target);
+      retryImageObserver.unobserve(target);
+      start();
+    }
+  }, { rootMargin: '300px 200px' });
+  return retryImageObserver;
+}
+
+/**
+ * 封面等非关键图片的有限重试。图片代理可能因短暂 503/上游超时失败，
+ * 原生 <img> 不会读取 Retry-After，因此这里用指数退避再尝试几次；
+ * 只有耗尽次数后才显示“暂无封面”。返回清理函数供页面销毁时释放计时器。
+ */
+export function installImageRetry(image, source, options = {}) {
+  if (!image || typeof image.addEventListener !== 'function') return () => {};
+  options = options && typeof options === 'object' ? options : {};
+  const original = typeof source === 'string' ? source.trim() : '';
+  const configuredRetries = Number(options.maxRetries);
+  const maxRetries = Number.isFinite(configuredRetries)
+    ? Math.max(0, Math.min(4, Math.floor(configuredRetries))) : 3;
+  const delays = Array.isArray(options.delays) && options.delays.length
+    ? options.delays.map((value) => Math.max(100, Number(value) || 0))
+    : [450, 1000, 1800, 3000];
+  let attempts = 0;
+  let timer = null;
+  let finished = false;
+  let started = false;
+  let observer = null;
+
+  const clearTimer = () => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  const markBroken = () => {
+    if (finished) return;
+    finished = true;
+    clearTimer();
+    if (observer) observer.unobserve(image);
+    retryImageStarts.delete(image);
+    image.classList?.add('is-broken');
+    image.parentElement?.classList?.add('is-broken');
+    image.removeAttribute?.('src');
+    if (typeof options.onBroken === 'function') options.onBroken(image);
+  };
+  const onLoad = () => {
+    if (finished) return;
+    finished = true;
+    clearTimer();
+    if (observer) observer.unobserve(image);
+    retryImageStarts.delete(image);
+    image.classList?.remove('is-retrying');
+    if (typeof options.onLoad === 'function') options.onLoad(image);
+  };
+  const onError = () => {
+    if (finished) return;
+    if (!original || attempts >= maxRetries) {
+      markBroken();
+      return;
+    }
+    const retry = ++attempts;
+    image.classList?.add('is-retrying');
+    clearTimer();
+    timer = setTimeout(() => {
+      timer = null;
+      // 路由离开后节点可能已经脱离文档，不再制造新的网络请求。
+      if (finished || image.isConnected === false) return;
+      image.setAttribute('src', retryImageUrl(original, retry));
+    }, delays[Math.min(retry - 1, delays.length - 1)] || 1000);
+  };
+
+  const start = () => {
+    if (finished || started || !original) return;
+    started = true;
+    image.setAttribute('src', original);
+  };
+  image.addEventListener('load', onLoad);
+  image.addEventListener('error', onError);
+  if (original) {
+    observer = options.lazy ? getRetryImageObserver() : null;
+    if (observer) {
+      retryImageStarts.set(image, start);
+      observer.observe(image);
+    } else start();
+  } else markBroken();
+  return () => {
+    finished = true;
+    clearTimer();
+    if (observer) observer.unobserve(image);
+    retryImageStarts.delete(image);
+    image.removeEventListener?.('load', onLoad);
+    image.removeEventListener?.('error', onError);
+  };
+}
+
 /** 封面卡片（3:4 封面 + 两行标题） */
 export function comicCard(item) {
   item = item && typeof item === 'object' ? item : {};
@@ -76,14 +197,10 @@ export function comicCard(item) {
   const open = () => { location.hash = `#/album/${id}`; };
   const category = text(item.category_sub?.title || item.category?.title || item.category);
   const image = h('img', {
-    loading: 'lazy', decoding: 'async', src: imgSrcOf(item), alt: name,
-    onerror: (e) => {
-      e.currentTarget.classList.add('is-broken');
-      e.currentTarget.parentElement?.classList.add('is-broken');
-      e.currentTarget.removeAttribute('src');
-    },
+    loading: 'lazy', decoding: 'async', fetchpriority: 'low', alt: name,
   });
   const cover = h('div', { class: 'cover' }, image);
+  installImageRetry(image, imgSrcOf(item), { lazy: true });
   if (category) cover.append(h('span', { class: 'card-badge' }, category));
   if (canOpen) cover.append(h('span', { class: 'cover-action', 'aria-hidden': 'true' }, icon('arrow-up-right', 15)));
   const card = h('div', {

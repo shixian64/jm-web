@@ -72,15 +72,31 @@ function jsonResponse(body, status = 200) {
   const { normalizeChapterImages, normalizeReaderSeries } = await import(readerUrl);
   const { networkView, aboutView } = await import(advancedUrl);
   const { imgSrc, chapterImgSrc } = await import(apiUrl);
-  const { comicCard } = await import(uiUrl);
+  const { comicCard, installImageRetry } = await import(uiUrl);
 
   // 列表上游字段异常时，封面地址和卡片渲染都必须退化为安全空值，
   // 不能因对数字/对象调用 startsWith 或把对象直接 append 到 DOM 而中断整页。
   assert.strictEqual(imgSrc({ image: 123, id: { toString: () => 'secret' } }), '');
   assert.strictEqual(imgSrc({ image: '  /media/albums/a.jpg  ', id: '42' }), '/api/img?path=%2Fmedia%2Falbums%2Fa.jpg');
   assert.strictEqual(imgSrc({ image: '', id: 'not-an-id' }), '');
+  assert.strictEqual(imgSrc({ image: '', cover: '/media/albums/77.jpg', AID: '77' }), '/api/img?path=%2Fmedia%2Falbums%2F77.jpg');
+  assert.strictEqual(imgSrc({ cover: '/api/img?path=%2Fmedia%2Falbums%2F77.jpg', id: '77' }), '/api/img?path=%2Fmedia%2Falbums%2F77.jpg');
+  assert.strictEqual(imgSrc({ image: '', AID: '88' }), '/api/img?path=%2Fmedia%2Falbums%2F88_3x4.jpg');
   assert.strictEqual(chapterImgSrc({ url: 'https://evil.example' }), '');
   assert.doesNotThrow(() => comicCard({ image: { nested: true }, name: { bad: true }, author: { bad: true }, id: 101 }));
+
+  // 短暂图片代理失败不应一次 onerror 就永久变成占位图；耗尽重试后才移除 src。
+  const retryImage = new FakeElement('img');
+  const stopRetry = installImageRetry(retryImage, '/api/img?path=%2Fmedia%2Falbums%2F77.jpg', {
+    maxRetries: 1, delays: [100],
+  });
+  assert.strictEqual(retryImage.attributes.src, '/api/img?path=%2Fmedia%2Falbums%2F77.jpg');
+  retryImage.onerror();
+  await new Promise((resolve) => setTimeout(resolve, 130));
+  assert.match(retryImage.attributes.src, /_jmw_retry=1/);
+  retryImage.onerror();
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(retryImage.attributes, 'src'), false);
+  stopRetry();
 
   assert.deepStrictEqual(normalizeChapterImages(null), []);
   assert.deepStrictEqual(normalizeChapterImages({}), []);

@@ -15,6 +15,11 @@
  *  JMW_MAX_CHAPTER_IMAGES 单章节图片数量上限（默认 2000）
  *  JMW_MAX_IMAGE_CONCURRENCY 图片代理全局并发（默认 12）
  *  JMW_MAX_IMAGE_CONCURRENCY_PER_IP 单客户端图片代理并发（默认 6）
+ *  JMW_IMAGE_CACHE_BYTES 图片成功响应内存缓存总上限（默认 64 MiB）
+ *  JMW_IMAGE_CACHE_ENTRY_BYTES 单张图片内存缓存上限（默认 2 MiB）
+ *  JMW_IMAGE_CACHE_TTL 图片内存缓存有效期秒数（默认 86400）
+ *  JMW_IMAGE_QUEUE_LIMIT 图片代理等待队列上限（默认 96）
+ *  JMW_IMAGE_QUEUE_TIMEOUT 图片代理排队最长等待毫秒（默认 3000）
  *  JMW_TRUST_PROXY 可信反代 IP/CIDR（逗号分隔；环回默认可信）
  *  JMW_DATA_DIR    数据目录（默认 ./data）
  */
@@ -61,10 +66,45 @@ const MAX_IMAGE_CONCURRENCY_PER_IP = Math.min(
   MAX_IMAGE_CONCURRENCY,
   Math.max(1, Number(process.env.JMW_MAX_IMAGE_CONCURRENCY_PER_IP) || 6),
 );
+const MAX_IMAGE_CACHE_BYTES = Math.min(
+  256 * 1024 * 1024,
+  Math.max(0, Number.isFinite(Number(process.env.JMW_IMAGE_CACHE_BYTES))
+    ? Number(process.env.JMW_IMAGE_CACHE_BYTES) : 64 * 1024 * 1024),
+);
+const MAX_IMAGE_CACHE_ENTRY_BYTES = Math.min(
+  4 * 1024 * 1024,
+  MAX_IMAGE_CACHE_BYTES || 0,
+  Math.max(0, Number.isFinite(Number(process.env.JMW_IMAGE_CACHE_ENTRY_BYTES))
+    ? Number(process.env.JMW_IMAGE_CACHE_ENTRY_BYTES) : 2 * 1024 * 1024),
+);
+const IMAGE_CACHE_TTL_MS = Math.min(
+  7 * 24 * 60 * 60 * 1000,
+  Math.max(60 * 1000, (Number.isFinite(Number(process.env.JMW_IMAGE_CACHE_TTL))
+    ? Number(process.env.JMW_IMAGE_CACHE_TTL) : 24 * 60 * 60) * 1000),
+);
+const IMAGE_QUEUE_LIMIT = Math.min(
+  512,
+  Math.max(0, Number.isFinite(Number(process.env.JMW_IMAGE_QUEUE_LIMIT))
+    ? Math.floor(Number(process.env.JMW_IMAGE_QUEUE_LIMIT)) : 96),
+);
+const IMAGE_QUEUE_TIMEOUT = Math.min(
+  30 * 1000,
+  Math.max(100, Number.isFinite(Number(process.env.JMW_IMAGE_QUEUE_TIMEOUT))
+    ? Math.floor(Number(process.env.JMW_IMAGE_QUEUE_TIMEOUT)) : 3000),
+);
 const IMAGE_DRAIN_TIMEOUT = 15000;
 const IMAGE_PATH_TOTAL_TIMEOUT = 30000;
 let activeImageRequests = 0;
 const imageRequestsByClient = new Map();
+// 只缓存成功的封面/缩略图，按字节和 TTL 双重限制；章节原图通常走流式转发，
+// 不会因为开启缓存而把大图长期留在 Node 堆中。
+const imageCache = new Map();
+let imageCacheBytes = 0;
+// 同一封面在首屏突发请求期间只允许一个请求回源，其余请求等待该响应
+// 完成后复用缓存；非缓存正文不会进入此表。
+const imageCacheFlights = new Map();
+const imageWaitQueue = [];
+const imageWaitersByClient = new Map();
 const MAX_AI_CONCURRENCY = Math.min(20, Math.max(1, Number(process.env.JMW_MAX_AI_CONCURRENCY) || 4));
 const MAX_SEARCH_CONCURRENCY = Math.min(40, Math.max(1, Number(process.env.JMW_MAX_SEARCH_CONCURRENCY) || 8));
 const MAX_AI_STREAM_BYTES = Math.min(
@@ -489,6 +529,171 @@ function acquireImageRequestSlot(clientKey) {
     const remaining = (imageRequestsByClient.get(key) || 1) - 1;
     if (remaining > 0) imageRequestsByClient.set(key, remaining);
     else imageRequestsByClient.delete(key);
+    pumpImageWaitQueue();
+  };
+}
+
+/**
+ * 图片请求短队列：上游线路偶发慢时，先让少量请求排队，避免浏览器收到
+ * 一次性 503 后把 <img> 永久判定为损坏。队列仍有硬上限和超时，不会把
+ * 全部章节图片堆在内存或连接表里。
+ */
+function removeImageWaiter(waiter) {
+  const index = imageWaitQueue.indexOf(waiter);
+  if (index >= 0) imageWaitQueue.splice(index, 1);
+}
+
+function finishImageWaiter(waiter, release) {
+  if (!waiter || waiter.done) return;
+  waiter.done = true;
+  if (waiter.timer) clearTimeout(waiter.timer);
+  if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener('abort', waiter.onAbort);
+  const count = (imageWaitersByClient.get(waiter.key) || 1) - 1;
+  if (count > 0) imageWaitersByClient.set(waiter.key, count);
+  else imageWaitersByClient.delete(waiter.key);
+  waiter.resolve(release || null);
+}
+
+function pumpImageWaitQueue() {
+  if (!imageWaitQueue.length || activeImageRequests >= MAX_IMAGE_CONCURRENCY) return;
+  // 每轮最多扫描当前队列长度，避免单个达到单客户端上限的请求阻塞其他客户。
+  let scans = imageWaitQueue.length;
+  while (scans > 0 && imageWaitQueue.length && activeImageRequests < MAX_IMAGE_CONCURRENCY) {
+    scans--;
+    const waiter = imageWaitQueue.shift();
+    if (!waiter || waiter.done) continue;
+    if (waiter.signal && waiter.signal.aborted) {
+      finishImageWaiter(waiter, null);
+      continue;
+    }
+    const release = acquireImageRequestSlot(waiter.key);
+    if (release) finishImageWaiter(waiter, release);
+    else imageWaitQueue.push(waiter);
+  }
+}
+
+/** 等待图片槽位，超时/队列已满时返回 null。 */
+function waitForImageRequestSlot(clientKey, signal) {
+  const key = String(clientKey || 'unknown');
+  if (signal && signal.aborted) return Promise.resolve(null);
+  const immediate = acquireImageRequestSlot(key);
+  if (immediate || IMAGE_QUEUE_LIMIT <= 0) {
+    return Promise.resolve(immediate);
+  }
+  const clientQueued = imageWaitersByClient.get(key) || 0;
+  // 单个客户端最多占用总等待队列的四分之一，避免一个标签页饿死其他请求。
+  const perClientLimit = Math.max(1, Math.ceil(IMAGE_QUEUE_LIMIT / 4));
+  if (imageWaitQueue.length >= IMAGE_QUEUE_LIMIT || clientQueued >= perClientLimit) {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    const waiter = { key, signal, resolve, timer: null, onAbort: null, done: false };
+    waiter.onAbort = () => {
+      removeImageWaiter(waiter);
+      finishImageWaiter(waiter, null);
+    };
+    imageWaitersByClient.set(key, clientQueued + 1);
+    imageWaitQueue.push(waiter);
+    if (signal) signal.addEventListener('abort', waiter.onAbort, { once: true });
+    waiter.timer = setTimeout(() => {
+      removeImageWaiter(waiter);
+      finishImageWaiter(waiter, null);
+    }, IMAGE_QUEUE_TIMEOUT);
+    // 队列计时器不应阻止进程优雅退出。
+    waiter.timer.unref?.();
+    pumpImageWaitQueue();
+  });
+}
+
+function pruneImageCache(now = Date.now()) {
+  for (const [key, entry] of imageCache) {
+    if (!entry || entry.expiresAt <= now || !entry.body?.length) {
+      imageCache.delete(key);
+      imageCacheBytes = Math.max(0, imageCacheBytes - Number(entry?.size || entry?.body?.length || 0));
+    }
+  }
+  while (imageCacheBytes > MAX_IMAGE_CACHE_BYTES && imageCache.size) {
+    const oldestKey = imageCache.keys().next().value;
+    const oldest = imageCache.get(oldestKey);
+    imageCache.delete(oldestKey);
+    imageCacheBytes = Math.max(0, imageCacheBytes - Number(oldest?.size || oldest?.body?.length || 0));
+  }
+}
+
+/** 获取成功图片缓存；Map 顺序同时充当轻量 LRU。 */
+function getImageCache(key) {
+  if (!key || MAX_IMAGE_CACHE_BYTES <= 0) return null;
+  const entry = imageCache.get(String(key));
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now() || !entry.body?.length) {
+    imageCache.delete(String(key));
+    imageCacheBytes = Math.max(0, imageCacheBytes - Number(entry.size || entry.body?.length || 0));
+    return null;
+  }
+  imageCache.delete(String(key));
+  imageCache.set(String(key), entry);
+  return entry;
+}
+
+/** 写入成功图片缓存；只接受有界 Buffer，避免缓存异常对象或超大正文。 */
+function setImageCache(key, value) {
+  if (!key || MAX_IMAGE_CACHE_BYTES <= 0 || MAX_IMAGE_CACHE_ENTRY_BYTES <= 0) return false;
+  const body = Buffer.isBuffer(value?.body) ? value.body : null;
+  const mime = typeof value?.mime === 'string' ? value.mime : '';
+  if (!body || !body.length || body.length > MAX_IMAGE_CACHE_ENTRY_BYTES || !SAFE_RASTER_MIME.has(mime)) return false;
+  const normalizedKey = String(key);
+  const previous = imageCache.get(normalizedKey);
+  if (previous) {
+    imageCacheBytes = Math.max(0, imageCacheBytes - Number(previous.size || previous.body?.length || 0));
+    imageCache.delete(normalizedKey);
+  }
+  const entry = {
+    body,
+    mime,
+    size: body.length,
+    expiresAt: Date.now() + IMAGE_CACHE_TTL_MS,
+  };
+  imageCache.set(normalizedKey, entry);
+  imageCacheBytes += entry.size;
+  pruneImageCache();
+  return imageCache.has(normalizedKey);
+}
+
+function clearImageCache() {
+  imageCache.clear();
+  imageCacheBytes = 0;
+}
+
+function claimImageCacheFlight(key) {
+  if (!key || MAX_IMAGE_CACHE_BYTES <= 0 || MAX_IMAGE_CACHE_ENTRY_BYTES <= 0) {
+    return { owner: false, flight: null };
+  }
+  const normalizedKey = String(key);
+  const existing = imageCacheFlights.get(normalizedKey);
+  if (existing) return { owner: false, flight: existing };
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  const flight = { promise, resolve };
+  imageCacheFlights.set(normalizedKey, flight);
+  return { owner: true, flight };
+}
+
+function finishImageCacheFlight(key, flight, entry = null) {
+  if (!flight) return;
+  const normalizedKey = String(key || '');
+  if (normalizedKey && imageCacheFlights.get(normalizedKey) === flight) {
+    imageCacheFlights.delete(normalizedKey);
+  }
+  flight.resolve(entry || null);
+}
+
+function imageCacheStats() {
+  pruneImageCache();
+  return {
+    entries: imageCache.size,
+    bytes: imageCacheBytes,
+    maxBytes: MAX_IMAGE_CACHE_BYTES,
+    maxEntryBytes: MAX_IMAGE_CACHE_ENTRY_BYTES,
   };
 }
 
@@ -553,6 +758,88 @@ function validateImageUrl(url) {
   }
   u.hash = '';
   return u;
+}
+
+/**
+ * 封面请求通常来自 albums/library/album/novels 路径；章节正文位于 photos，
+ * 不纳入进程缓存，避免一章数百张原图把内存预算吃满。
+ */
+function isCoverImagePath(pathname) {
+  const value = String(pathname || '');
+  if (!value.startsWith('/') || value.includes('\\')) return false;
+  // URL 规范化会折叠点段；缓存分类前先拒绝原始/编码后的点段，避免把
+  // /media/albums/../photos 下的正文误放进封面缓存。
+  for (const segment of value.split('?', 1)[0].split('/')) {
+    let decoded;
+    try { decoded = decodeURIComponent(segment); } catch (_) { return false; }
+    if (decoded === '.' || decoded === '..' || decoded.includes('/') || decoded.includes('\\') || decoded.includes('\0')) return false;
+  }
+  return /^\/media\/(?:albums|library\/album|novels)\//i.test(value);
+}
+
+function imageCacheKeyForPath(value) {
+  const raw = String(value || '');
+  const p = raw.startsWith('/') ? raw : `/${raw}`;
+  const pathname = p.split('?', 1)[0];
+  return isCoverImagePath(pathname) ? `path:${p}` : '';
+}
+
+function imageCacheKeyForUrl(value) {
+  try {
+    const url = validateImageUrl(value);
+    return isCoverImagePath(url.pathname) ? `url:${url.href}` : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function cacheKeyForFetchedImage(requestedKey, finalUrl) {
+  if (!requestedKey || !finalUrl) return '';
+  try {
+    const url = validateImageUrl(finalUrl);
+    return isCoverImagePath(url.pathname) ? requestedKey : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function sendCachedImage(res, entry, cacheDays) {
+  if (!entry || res.destroyed) return false;
+  res.writeHead(200, baseHeaders({
+    'Cache-Control': imageCacheControl(cacheDays),
+    'Content-Type': entry.mime,
+    'Content-Length': entry.body.length,
+    'X-JMW-Image-Cache': 'HIT',
+  }));
+  res.end(entry.body);
+  return true;
+}
+
+async function waitForImageCacheFlight(flight, signal) {
+  if (!flight) return null;
+  if (!signal) return flight.promise;
+  if (signal.aborted) return null;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      resolve(value || null);
+    };
+    const onAbort = () => finish(null);
+    signal.addEventListener('abort', onAbort, { once: true });
+    flight.promise.then(finish, () => finish(null));
+  });
+}
+
+async function serveImageCacheFlight(res, key, cacheDays, signal) {
+  if (!key) return false;
+  const flight = imageCacheFlights.get(String(key));
+  if (!flight) return false;
+  const entry = await waitForImageCacheFlight(flight, signal);
+  if (!entry || (signal && signal.aborted) || res.destroyed) return false;
+  return sendCachedImage(res, entry, cacheDays);
 }
 
 /** 手动跟随重定向，每一跳都重新验证 HTTPS 与精确 origin 白名单。 */
@@ -680,10 +967,20 @@ function imageCacheControl(cacheDays, accessProtected = !!ACCESS_PASSWORD) {
   return `${accessProtected ? 'private' : 'public'}, max-age=${cacheDays * 86400}, immutable`;
 }
 
-async function sendUpstreamImage(res, response, cacheDays, requestSignal, drainTimeoutMs = IMAGE_DRAIN_TIMEOUT) {
+async function sendUpstreamImage(
+  res,
+  response,
+  cacheDays,
+  requestSignal,
+  drainTimeoutMs = IMAGE_DRAIN_TIMEOUT,
+  cacheKey = '',
+) {
   const { mime } = await rasterResponseInfo(response);
   const reader = response.body.getReader();
   let total = 0;
+  let cacheable = !!(cacheKey && MAX_IMAGE_CACHE_BYTES > 0 && MAX_IMAGE_CACHE_ENTRY_BYTES > 0);
+  const cacheChunks = [];
+  let cacheTotal = 0;
   let clientClosed = res.destroyed || isClientDisconnectError(requestSignal && requestSignal.reason);
   const onClose = () => {
     if (res.writableEnded) return;
@@ -718,11 +1015,23 @@ async function sendUpstreamImage(res, response, cacheDays, requestSignal, drainT
     res.writeHead(200, baseHeaders({
       'Cache-Control': imageCacheControl(cacheDays),
       'Content-Type': mime,
+      'X-JMW-Image-Cache': cacheKey ? 'MISS' : 'BYPASS',
       // fetch 可能已解压响应体，不能直接转发上游 Content-Length。
     }));
 
     while (!part.done) {
-      if (!res.write(Buffer.from(part.value))) await waitForDrain(res, requestSignal, drainTimeoutMs);
+      const chunk = Buffer.from(part.value);
+      if (cacheable) {
+        cacheTotal += chunk.length;
+        if (cacheTotal <= MAX_IMAGE_CACHE_ENTRY_BYTES) cacheChunks.push(chunk);
+        else {
+          // 超过单项缓存预算后立即释放已收集的块；正文仍按流式方式转发。
+          cacheable = false;
+          cacheChunks.length = 0;
+          cacheTotal = 0;
+        }
+      }
+      if (!res.write(chunk)) await waitForDrain(res, requestSignal, drainTimeoutMs);
       part = await reader.read();
       throwIfAborted(requestSignal);
       if (clientClosed) return;
@@ -734,7 +1043,12 @@ async function sendUpstreamImage(res, response, cacheDays, requestSignal, drainT
         }
       }
     }
-    if (!res.destroyed) res.end();
+    if (!res.destroyed) {
+      res.end();
+      if (cacheable && cacheChunks.length && cacheTotal > 0) {
+        setImageCache(cacheKey, { mime, body: Buffer.concat(cacheChunks, cacheTotal) });
+      }
+    }
   } catch (e) {
     try { await reader.cancel(); } catch (_) {}
     if (clientClosed) return;
@@ -758,6 +1072,25 @@ function publicErrorMessage(error, fallback) {
 }
 
 async function proxyImage(res, urlStr, cacheDays = 7, clientSignal) {
+  const cacheKey = imageCacheKeyForUrl(urlStr);
+  const cached = getImageCache(cacheKey);
+  if (cached) {
+    sendCachedImage(res, cached, cacheDays);
+    return;
+  }
+  if (await serveImageCacheFlight(res, cacheKey, cacheDays, clientSignal)) return;
+  let cacheFlight = null;
+  if (cacheKey) {
+    const claim = claimImageCacheFlight(cacheKey);
+    if (!claim.owner) {
+      if (await serveImageCacheFlight(res, cacheKey, cacheDays, clientSignal)) return;
+      // 前一个请求未能缓存（例如图片超过单项预算），当前请求接管回源。
+      const retryClaim = claimImageCacheFlight(cacheKey);
+      if (retryClaim.owner) cacheFlight = retryClaim.flight;
+    } else {
+      cacheFlight = claim.flight;
+    }
+  }
   let fetched;
   try {
     fetched = await fetchImageResponse(urlStr, 30000, undefined, clientSignal);
@@ -766,7 +1099,10 @@ async function proxyImage(res, urlStr, cacheDays = 7, clientSignal) {
       await cancelBody(response);
       return sendJson(res, 502, { error: `图片获取失败（HTTP ${response.status}）` });
     }
-    await sendUpstreamImage(res, response, cacheDays, fetched.signal);
+    await sendUpstreamImage(
+      res, response, cacheDays, fetched.signal, IMAGE_DRAIN_TIMEOUT,
+      cacheKeyForFetchedImage(cacheKey, fetched.finalUrl),
+    );
   } catch (e) {
     if ((clientSignal && clientSignal.aborted) || isClientDisconnectError(e) || res.destroyed) return;
     if (!(e instanceof ApiError) || e.expose !== true) console.error('[image] 内部错误:', e);
@@ -776,68 +1112,108 @@ async function proxyImage(res, urlStr, cacheDays = 7, clientSignal) {
     else res.destroy();
   } finally {
     if (fetched) fetched.cleanup();
+    if (cacheFlight) finishImageCacheFlight(cacheKey, cacheFlight, getImageCache(cacheKey));
   }
 }
 
-// 图片路径代理：按域名列表依次尝试，失败域名 60 秒内跳过（负缓存）
+// 图片路径代理：按域名列表依次尝试，临时失败域名短时间跳过（负缓存）
 const imageHostFailedUntil = new Map();
+
+function isTransientImageFailure(errorOrStatus) {
+  const status = typeof errorOrStatus === 'number'
+    ? errorOrStatus
+    : imageErrorStatus(errorOrStatus);
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function markImageHostFailed(host, errorOrStatus, ttlMs = 30 * 1000) {
+  if (!isTransientImageFailure(errorOrStatus)) return;
+  imageHostFailedUntil.set(host, Date.now() + Math.max(1000, ttlMs));
+}
 
 /** path 形式：在图片域名列表中依次尝试（记住成功的域名） */
 async function proxyImagePath(res, p, clientSignal) {
   if (!/^\/media\//.test(p)) return sendJson(res, 400, { error: '非法路径' });
-  const hosts = settings.imageHosts();
-  const now = Date.now();
-  const deadline = now + IMAGE_PATH_TOTAL_TIMEOUT;
-  let lastError = '所有图片域名均无法获取该资源';
-  let lastStatus = 502;
-  for (const host of hosts) {
-    if (clientSignal && clientSignal.aborted) return;
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) {
-      lastError = '图片获取总时间已超限';
-      lastStatus = 504;
-      break;
-    }
-    const failedAt = imageHostFailedUntil.get(host);
-    if (failedAt && now < failedAt) continue;
-    let fetched;
-    try {
-      const target = host.replace(/\/+$/, '') + p;
-      fetched = await fetchImageResponse(target, Math.min(8000, remaining), undefined, clientSignal);
-      const { response } = fetched;
-      if (!response.ok || !response.body) {
-        lastError = `HTTP ${response.status}`;
-        await cancelBody(response);
-        continue;
-      }
-      await sendUpstreamImage(res, response, 1, fetched.signal);
-      imageHostFailedUntil.delete(host);
-      settings.setPreferredImageHost(host);
-      return;
-    } catch (e) {
-      if ((clientSignal && clientSignal.aborted) || isClientDisconnectError(e) || res.destroyed) return;
-      // 流式转发已发出 200 后无法再切换域名或改写 JSON 错误。
-      if (res.headersSent) {
-        if (!res.destroyed) res.destroy();
-        return;
-      }
-      if (!(e instanceof ApiError) || e.expose !== true) {
-        console.error('[image] 内部错误:', e);
-        lastError = '图片获取失败';
-      } else {
-        lastError = publicErrorMessage(e, lastError);
-      }
-      lastStatus = imageErrorStatus(e);
-      // 只对网络层故障做负缓存；MIME/重定向安全拒绝不污染域名健康状态。
-      if (!(e instanceof ApiError)) imageHostFailedUntil.set(host, now + 60000);
-      /* 尝试下一个域名 */
-    } finally {
-      if (fetched) fetched.cleanup();
+  const cacheKey = imageCacheKeyForPath(p);
+  const cached = getImageCache(cacheKey);
+  if (cached) {
+    sendCachedImage(res, cached, 1);
+    return;
+  }
+  if (await serveImageCacheFlight(res, cacheKey, 1, clientSignal)) return;
+  let cacheFlight = null;
+  if (cacheKey) {
+    const claim = claimImageCacheFlight(cacheKey);
+    if (!claim.owner) {
+      if (await serveImageCacheFlight(res, cacheKey, 1, clientSignal)) return;
+      const retryClaim = claimImageCacheFlight(cacheKey);
+      if (retryClaim.owner) cacheFlight = retryClaim.flight;
+    } else {
+      cacheFlight = claim.flight;
     }
   }
-  if ((clientSignal && clientSignal.aborted) || res.destroyed) return;
-  if (imageHostFailedUntil.size > 200) imageHostFailedUntil.clear();
-  sendJson(res, lastStatus, { error: lastError });
+  try {
+    const hosts = settings.imageHosts();
+    const now = Date.now();
+    const deadline = now + IMAGE_PATH_TOTAL_TIMEOUT;
+    let lastError = '所有图片域名均无法获取该资源';
+    let lastStatus = 502;
+    for (const host of hosts) {
+      if (clientSignal && clientSignal.aborted) return;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        lastError = '图片获取总时间已超限';
+        lastStatus = 504;
+        break;
+      }
+      const failedAt = imageHostFailedUntil.get(host);
+      if (failedAt && Date.now() < failedAt) continue;
+      let fetched;
+      try {
+        const target = host.replace(/\/+$/, '') + p;
+        fetched = await fetchImageResponse(target, Math.min(8000, remaining), undefined, clientSignal);
+        const { response } = fetched;
+        if (!response.ok || !response.body) {
+          lastError = `HTTP ${response.status}`;
+          await cancelBody(response);
+          markImageHostFailed(host, response.status, response.status === 429 ? 45 * 1000 : 20 * 1000);
+          continue;
+        }
+        await sendUpstreamImage(
+          res, response, 1, fetched.signal, IMAGE_DRAIN_TIMEOUT,
+          cacheKeyForFetchedImage(cacheKey, fetched.finalUrl),
+        );
+        imageHostFailedUntil.delete(host);
+        settings.setPreferredImageHost(host);
+        return;
+      } catch (e) {
+        if ((clientSignal && clientSignal.aborted) || isClientDisconnectError(e) || res.destroyed) return;
+        // 流式转发已发出 200 后无法再切换域名或改写 JSON 错误。
+        if (res.headersSent) {
+          if (!res.destroyed) res.destroy();
+          return;
+        }
+        if (!(e instanceof ApiError) || e.expose !== true) {
+          console.error('[image] 内部错误:', e);
+          lastError = '图片获取失败';
+        } else {
+          lastError = publicErrorMessage(e, lastError);
+        }
+        lastStatus = imageErrorStatus(e);
+        // 网络、超时、上游 5xx/429 才进入短负缓存；MIME/重定向安全拒绝
+        // 不污染域名健康状态，避免误伤其他正常资源。
+        markImageHostFailed(host, e);
+        /* 尝试下一个域名 */
+      } finally {
+        if (fetched) fetched.cleanup();
+      }
+    }
+    if ((clientSignal && clientSignal.aborted) || res.destroyed) return;
+    if (imageHostFailedUntil.size > 200) imageHostFailedUntil.clear();
+    sendJson(res, lastStatus, { error: lastError });
+  } finally {
+    if (cacheFlight) finishImageCacheFlight(cacheKey, cacheFlight, getImageCache(cacheKey));
+  }
 }
 
 /* ----------------------------- API 路由 ----------------------------- */
@@ -1333,8 +1709,16 @@ async function api(req, res, u, requestSignal) {
       const upath = q.get('path');
       const abs = q.get('u');
       if (!abs && !upath) return sendJson(res, 400, { error: '缺少 path 或 u 参数' });
-      const releaseImageSlot = acquireImageRequestSlot(clientIp(req));
+      // 缓存命中不占用上游槽位；这对首页刷新、返回列表和多标签页尤其重要。
+      const cacheKey = abs ? imageCacheKeyForUrl(abs) : imageCacheKeyForPath(upath);
+      const cached = getImageCache(cacheKey);
+      if (cached) {
+        sendCachedImage(res, cached, abs ? 30 : 1);
+        return;
+      }
+      const releaseImageSlot = await waitForImageRequestSlot(clientIp(req), requestSignal);
       if (!releaseImageSlot) {
+        if (requestSignal.aborted || res.destroyed) return;
         return sendJson(res, 503, { error: '图片代理并发请求过多，请稍后重试' }, { 'Retry-After': '1' });
       }
       try {
@@ -1646,11 +2030,27 @@ module.exports = {
   fetchImageResponse,
   readRasterImage,
   imageCacheControl,
+  sendCachedImage,
   sendUpstreamImage,
   proxyEventStream,
   MAX_IMAGE_BYTES,
   MAX_IMAGE_CONCURRENCY,
   MAX_IMAGE_CONCURRENCY_PER_IP,
+  MAX_IMAGE_CACHE_BYTES,
+  MAX_IMAGE_CACHE_ENTRY_BYTES,
+  IMAGE_CACHE_TTL_MS,
+  IMAGE_QUEUE_LIMIT,
+  IMAGE_QUEUE_TIMEOUT,
   acquireImageRequestSlot,
+  waitForImageRequestSlot,
+  imageCacheKeyForPath,
+  imageCacheKeyForUrl,
+  cacheKeyForFetchedImage,
+  getImageCache,
+  setImageCache,
+  clearImageCache,
+  imageCacheStats,
+  isTransientImageFailure,
+  markImageHostFailed,
   SAFE_RASTER_MIME,
 };

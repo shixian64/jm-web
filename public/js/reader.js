@@ -907,7 +907,13 @@ export function mountReader(root, photoId, query, options = {}) {
     if (state.destroyed) return;
     if (album && album.data && typeof album.data === 'object' && !Array.isArray(album.data)) {
       state.albumName = String(album.data.name || '');
-      state.cover = imgSrc({ id: state.aid, image: album.data.image });
+      state.cover = imgSrc({
+        id: state.aid,
+        image: album.data.image,
+        cover: album.data.cover,
+        cover_url: album.data.cover_url,
+        coverUrl: album.data.coverUrl,
+      });
       const series = normalizeReaderSeries(album.data.series);
       if (series.length > 1 || (series.length === 1 && album.data.series_id && album.data.series_id !== '0')) {
         series.sort((a, b) => a.sort - b.sort);

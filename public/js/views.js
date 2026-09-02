@@ -2,6 +2,7 @@
 import { api, imgSrc } from './api.js';
 import {
   h, toast, comicCard, comicSkeletons, infiniteList, installPullToRefresh, errorBox, loadingBox,
+  installImageRetry,
   shouldAutoFocusEditable,
 } from './ui.js';
 import { setting, getLocalHistory, getSearchHistory, addSearchHistory, clearSearchHistory } from './store.js';
@@ -79,6 +80,12 @@ export function homeView(root, ctx) {
       const continueHref = it.offline
         ? `#/offline/${it.aid}/${photoId}`
         : `#/read/${photoId}?aid=${it.aid}`;
+      const continueCover = h('img', {
+        loading: 'lazy', decoding: 'async', fetchpriority: 'low', alt: it.name || '漫画封面',
+      });
+      const continueCoverHost = h('div', { class: 'cover' }, continueCover,
+        h('span', { class: 'cover-action', 'aria-hidden': 'true' }, icon('play', 14)));
+      installImageRetry(continueCover, imgSrc(it), { lazy: true });
       strip.append(h('div', {
         class: 'comic-card continue-card',
         role: 'button',
@@ -87,13 +94,7 @@ export function homeView(root, ctx) {
         onclick: () => { location.hash = continueHref; },
         onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); location.hash = continueHref; } },
       },
-        h('div', { class: 'cover' },
-          h('img', {
-            loading: 'lazy', decoding: 'async', alt: it.name || '漫画封面',
-            src: it.cover || `/api/img?path=${encodeURIComponent(`/media/albums/${it.aid}_3x4.jpg`)}`,
-          }),
-          h('span', { class: 'cover-action', 'aria-hidden': 'true' }, icon('play', 14)),
-        ),
+        continueCoverHost,
         h('div', { class: 'card-copy' },
           h('div', { class: 'name' }, it.name || `漫画 ${it.aid}`),
           h('div', { class: 'card-meta' }, total ? `第 ${pageNo + 1} / ${total} 页` : '继续阅读'),
@@ -240,7 +241,7 @@ export function buildSwiper(items, cleanups = [], contextTitle = '') {
   const featuredItems = items.slice(0, 6);
   const slideImages = featuredItems.map((item) => imgSrc(item));
   const slides = featuredItems.map((it, i) => {
-    const id = String((it && (it.id ?? it.aid)) || '');
+    const id = String((it && (it.id ?? it.aid ?? it.AID)) || '');
     const canOpen = /^\d+$/.test(id);
     const open = () => { if (canOpen) location.hash = `#/album/${id}`; };
     const category = String(it?.category_sub?.title || it?.category?.title || '').trim();
@@ -839,11 +840,22 @@ export async function albumView(root, id, ctx) {
   const relatedList = (Array.isArray(data.related_list) ? data.related_list : [])
     .filter((item) => item && typeof item === 'object' && !Array.isArray(item));
 
-  const coverSrc = imgSrc({ id, image: typeof data.image === 'string' ? data.image : '' });
+  const coverSrc = imgSrc({
+    id,
+    image: data.image,
+    cover: data.cover,
+    cover_url: data.cover_url,
+    coverUrl: data.coverUrl,
+  });
   const hero = h('div', { class: 'album-hero' },
     h('div', { class: 'bg', style: { backgroundImage: `url("${coverSrc}")` } }),
     h('div', { class: 'wrap' },
-      h('div', { class: 'cover' }, h('img', { src: coverSrc, alt: albumName || '封面' })),
+      (() => {
+        const coverImage = h('img', { alt: albumName || '封面', fetchpriority: 'high' });
+        const coverHost = h('div', { class: 'cover' }, coverImage);
+        installImageRetry(coverImage, coverSrc, { maxRetries: 2 });
+        return coverHost;
+      })(),
       h('div', { class: 'info' },
         h('div', { class: 'hero-kicker' }, category || '漫画详情'),
         h('h1', null, albumName),
