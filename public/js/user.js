@@ -16,6 +16,100 @@ function isInactive(ctx) {
   return !!(ctx && (ctx.signal?.aborted || (typeof ctx.isActive === 'function' && !ctx.isActive())));
 }
 
+// JM 的收藏/历史接口通常按 20 条一页，但部分线路会缺少 total，甚至在
+// 到达末页后重复返回同一页。列表不能只依赖 total 或“本页有数据”判断，
+// 否则无限列表会持续请求并追加相同卡片。
+export const USER_LIST_PAGE_SIZE = 20;
+
+function keyText(value) {
+  if (Array.isArray(value)) return value.map(keyText).filter(Boolean).join(',');
+  if (value && typeof value === 'object') {
+    return keyText(value.name ?? value.title ?? value.slug);
+  }
+  if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') return '';
+  return String(value).trim();
+}
+
+function itemIdText(item) {
+  if (!item || typeof item !== 'object') return '';
+  return keyText(item.id) || keyText(item.aid) || keyText(item.AID);
+}
+
+/** 生成跨页稳定身份；优先使用 JM 号，异常响应才退化到封面/名称组合。 */
+export function userListItemKey(item) {
+  if (!item || typeof item !== 'object') {
+    const value = keyText(item);
+    return value ? `value:${value}` : '';
+  }
+  const id = itemIdText(item);
+  if (id) return `id:${id}`;
+  const parts = [
+    item.name, item.title, item.image, item.cover, item.cover_url, item.coverUrl, item.author,
+  ].map(keyText);
+  if (parts.some(Boolean)) return `meta:${parts.join('\u001f').toLocaleLowerCase()}`;
+  try {
+    const raw = JSON.stringify(item);
+    return raw && raw !== '{}' ? `raw:${raw.slice(0, 1024)}` : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+/** 对一页原始数据去重，并记录已见项；调用方可据 hasNew 检测重复末页。 */
+export function dedupeUserListPage(items, seen = new Set()) {
+  const unique = [];
+  let hasNew = false;
+  for (const item of Array.isArray(items) ? items : []) {
+    const key = userListItemKey(item);
+    // 没有任何可用身份时保留原项，避免误吞掉上游数据；正常 JM 列表都有 ID。
+    if (!key) {
+      unique.push(item);
+      hasNew = true;
+      continue;
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(item);
+    hasNew = true;
+  }
+  return { items: unique, hasNew };
+}
+
+function finiteNonNegative(value) {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+/** 统一收藏/历史分页边界；repeated 用于拦截上游循环返回的同一页。 */
+export function userListPageHasMore({
+  total, page, sourceCount, pageSize = USER_LIST_PAGE_SIZE, repeated = false,
+} = {}) {
+  if (repeated) return false;
+  const currentPage = Math.max(1, Number(page) || 1);
+  const size = Math.max(1, Number(pageSize) || USER_LIST_PAGE_SIZE);
+  const count = finiteNonNegative(sourceCount);
+  // 空页或短页已经是可靠的末页信号，即使上游返回了错误的 total 也停止。
+  if (count === 0 || (count !== null && count < size)) return false;
+  const knownTotal = finiteNonNegative(total);
+  if (knownTotal !== null && knownTotal > 0) return knownTotal > currentPage * size;
+  return count !== null && count >= size;
+}
+
+function sourcePageMarker(data, items) {
+  const supplied = keyText(data?.source_page_key);
+  if (supplied) return `server:${supplied}`;
+  const keys = (Array.isArray(items) ? items : []).map(userListItemKey).filter(Boolean);
+  return keys.length ? `items:${keys.join('|')}` : '';
+}
+
+function rememberSourcePage(marker, seenPages) {
+  if (!marker) return false;
+  const repeated = seenPages.has(marker);
+  seenPages.add(marker);
+  return repeated;
+}
+
 /* ============================== 我的 / 登录 ============================== */
 
 export function userView(root, ctx) {
@@ -368,6 +462,8 @@ export function favoritesView(root, params) {
   let facetRenderQueued = false;
   let folders = [['0', '全部']];
   let sessionFolderIds = new Set();
+  const seenFavoriteItems = new Set();
+  const seenFavoritePages = new Set();
 
   const orderSwitch = h('div', { class: 'favorite-order', role: 'group', 'aria-label': '收藏排序' },
     FAV_ORDERS.map(([v, l]) => h('a', {
@@ -623,7 +719,12 @@ export function favoritesView(root, params) {
   }
 
   function decorateFavorite(item) {
-    const id = String(item.id ?? item.aid ?? item.AID ?? '');
+    item = item && typeof item === 'object' ? item : {};
+    const id = itemIdText(item);
+    const mapKey = id || userListItemKey(item);
+    // 即使上游在同一页内重复返回记录，也不能把同一个 DOM 节点再次追加到
+    // 网格（append 已存在节点会把它移动到末尾，表现为“重复加载”）。
+    if (mapKey && cards.has(mapKey)) return null;
     const card = comicCard(item);
     card.dataset.favoriteCard = '1';
     card.dataset.favoriteId = id;
@@ -632,7 +733,8 @@ export function favoritesView(root, params) {
     card.dataset.search = [item.name, ...authors, ...tags].filter(Boolean).join(' ').toLocaleLowerCase();
     card._favoriteMeta = { authors, tags };
     const checkbox = h('input', {
-      type: 'checkbox', 'data-select': '1', 'aria-label': `选择${item.name || id}`,
+      type: 'checkbox', 'data-select': '1', disabled: !id,
+      'aria-label': `选择${item.name || id || '该作品'}`,
       class: 'favorite-card-check',
       onclick: (e) => e.stopPropagation(),
       onkeydown: (e) => e.stopPropagation(),
@@ -643,8 +745,8 @@ export function favoritesView(root, params) {
       },
     });
     card.append(checkbox);
-    if (id && !cards.has(id)) {
-      cards.set(id, card);
+    if (mapKey) {
+      cards.set(mapKey, card);
       tags.forEach((value) => tagCounts.set(value, (tagCounts.get(value) || 0) + 1));
       authors.forEach((value) => authorCounts.set(value, (authorCounts.get(value) || 0) + 1));
       scheduleFacetRender();
@@ -662,6 +764,17 @@ export function favoritesView(root, params) {
   list = infiniteList(async (p, signal) => {
     const res = await api.favorites(o, p, folderId, signal);
     const d = res.data || {};
+    if (p === 1) {
+      // infiniteList.refresh() 会把页码重置为 0；同步清空跨页状态，避免
+      // 刷新后的第一页被误判为旧页而不再显示。
+      seenFavoriteItems.clear();
+      seenFavoritePages.clear();
+      cards.clear();
+      selected.clear();
+      tagCounts.clear();
+      authorCounts.clear();
+      updateSelectionBar();
+    }
     if (!foldersHydrated) {
       foldersHydrated = true;
       sessionFolderIds = new Set((d.session_folder_ids || []).map(String));
@@ -675,11 +788,24 @@ export function favoritesView(root, params) {
         : '收藏夹分组当前仅保存在本会话';
       renderFolders();
     }
-    const source = filterComics(d.list || [], setting.blockedTagList || []);
+    const rawList = Array.isArray(d.list) ? d.list : [];
+    // 服务端在本地收藏夹筛选前记录 source_count/source_page_key，因此即使
+    // 当前页没有命中该分组，也能继续读取后续页；重复页则立即收口。
+    const repeatedPage = rememberSourcePage(sourcePageMarker(d, rawList), seenFavoritePages);
+    const deduped = dedupeUserListPage(rawList, seenFavoriteItems);
+    const source = filterComics(deduped.items, setting.blockedTagList || []);
+    const declaredCount = finiteNonNegative(d.source_count);
+    const sourceCount = Math.max(rawList.length, declaredCount ?? 0);
     return {
-      items: source.map(decorateFavorite),
-      // 本地收藏夹映射按上游分页后过滤，当前页为空不代表后续页也为空。
-      hasMore: Number(d.total) > p * 20 || Number(d.source_count) > 0,
+      items: source.map(decorateFavorite).filter(Boolean),
+      // 本地收藏夹映射按上游分页后过滤，当前页为空不代表后续页也为空；
+      // 但整页均为已见内容或上游重复末页时必须停止，防止无限请求。
+      hasMore: userListPageHasMore({
+        total: d.total,
+        page: p,
+        sourceCount,
+        repeated: repeatedPage || (rawList.length > 0 && !deduped.hasNew),
+      }),
     };
   }, {
     empty: () => h('div', { class: 'favorite-empty', style: { gridColumn: '1/-1' } },
@@ -697,6 +823,8 @@ export function favoritesView(root, params) {
 export function watchHistoryView(root) {
   const page = h('div', { class: 'page history-page' });
   const loaded = new Map();
+  const seenHistoryItems = new Set();
+  const seenHistoryPages = new Set();
   const scopeHint = h('div', { class: 'hint', style: 'margin:0 2px 8px' },
     '登录后优先删除 JM 账号云端历史；云端不可用时只会在本会话隐藏。');
   const clearLoaded = h('button', {
@@ -731,7 +859,12 @@ export function watchHistoryView(root) {
   root.append(page);
 
   function decorateHistory(item) {
-    const id = String(item.id ?? item.aid ?? item.AID ?? '');
+    item = item && typeof item === 'object' ? item : {};
+    const id = itemIdText(item);
+    // 历史删除接口只接受 JM 数字 ID；异常条目仍可展示，但不能把不可删除
+    // 的 fallback key 放进“清空已加载”集合里反复提交 400 请求。
+    const mapKey = id;
+    if (mapKey && loaded.has(mapKey)) return null;
     const card = comicCard(item);
     card.style.position = 'relative';
     const remove = h('button', {
@@ -755,7 +888,7 @@ export function watchHistoryView(root) {
       onkeydown: (e) => e.stopPropagation(),
     }, icon('trash-2', 14));
     card.append(remove);
-    if (id) loaded.set(id, card);
+    if (mapKey) loaded.set(mapKey, card);
     clearLoaded.disabled = loaded.size === 0;
     return card;
   }
@@ -767,11 +900,25 @@ export function watchHistoryView(root) {
       scopeHint.textContent = res.scope === 'cloud'
         ? '正在显示 JM 账号云端历史；删除成功时会同步到账号。'
         : '当前未连接账号云端；删除操作只会在本会话隐藏记录。';
+      loaded.clear();
+      clearLoaded.disabled = true;
+      seenHistoryItems.clear();
+      seenHistoryPages.clear();
     }
-    const source = filterComics(d.list || [], setting.blockedTagList || []);
+    const rawList = Array.isArray(d.list) ? d.list : [];
+    const repeatedPage = rememberSourcePage(sourcePageMarker(d, rawList), seenHistoryPages);
+    const deduped = dedupeUserListPage(rawList, seenHistoryItems);
+    const source = filterComics(deduped.items, setting.blockedTagList || []);
+    const declaredCount = finiteNonNegative(d.source_count);
+    const sourceCount = Math.max(rawList.length, declaredCount ?? 0);
     return {
-      items: source.map(decorateHistory),
-      hasMore: Number(d.total) > p * 20 || Number(d.source_count) > 0,
+      items: source.map(decorateHistory).filter(Boolean),
+      hasMore: userListPageHasMore({
+        total: d.total,
+        page: p,
+        sourceCount,
+        repeated: repeatedPage || (rawList.length > 0 && !deduped.hasNew),
+      }),
     };
   });
   page.append(list.root);

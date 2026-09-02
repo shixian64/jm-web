@@ -218,6 +218,43 @@ function sendJson(res, status, obj, extraHeaders = {}) {
   res.end(body);
 }
 
+// 收藏夹/历史可能在本地分组或隐藏记录过滤后变成空页，前端仍需要知道
+// 上游是否重复返回了同一页。只发送稳定指纹，不把未展示的条目内容额外
+// 暴露给浏览器；优先使用 JM 号，异常条目才退化到少量展示字段。
+function sourceKeyText(value) {
+  if (Array.isArray(value)) return value.map(sourceKeyText).filter(Boolean).join(',');
+  if (value && typeof value === 'object') return sourceKeyText(value.name ?? value.title ?? value.slug);
+  if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') return '';
+  return String(value).trim();
+}
+
+function sourceItemId(item) {
+  if (!item || typeof item !== 'object') return '';
+  return sourceKeyText(item.id) || sourceKeyText(item.aid) || sourceKeyText(item.AID);
+}
+
+function sourceItemKey(item) {
+  if (!item || typeof item !== 'object') return sourceKeyText(item);
+  const id = sourceItemId(item);
+  if (id) return `id:${id}`;
+  const parts = [
+    item.name, item.title, item.image, item.cover, item.cover_url, item.coverUrl, item.author,
+  ].map(sourceKeyText);
+  if (parts.some(Boolean)) return `meta:${parts.join('\u001f').toLocaleLowerCase()}`;
+  try {
+    const raw = JSON.stringify(item);
+    return raw && raw !== '{}' ? `raw:${raw.slice(0, 1024)}` : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function sourcePageKey(items) {
+  const keys = (Array.isArray(items) ? items : []).map(sourceItemKey).filter(Boolean).sort();
+  if (!keys.length) return '';
+  return crypto.createHash('sha256').update(JSON.stringify(keys)).digest('hex').slice(0, 32);
+}
+
 function readBody(req, limit = 1 << 20) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -1621,6 +1658,7 @@ async function api(req, res, u, requestSignal) {
       if (out && out.data) {
         const list = Array.isArray(out.data.list) ? out.data.list : [];
         out.data.source_count = list.length;
+        out.data.source_page_key = sourcePageKey(list);
         if (isSessionFolder) out.data.list = list.filter((item) => jar.favoriteFolderMap[String(item.id || item.aid || item.AID || '')] === folderId);
         // 保留上游真实 folder_list，并附加曾经降级创建的会话收藏夹。
         const upstreamFolders = out.data.folder_list;
@@ -1643,6 +1681,7 @@ async function api(req, res, u, requestSignal) {
       const out = await callWithAuthRecovery({ path: '/watch_list', query: { page: q.get('page') || '1' } });
       if (out && out.data && Array.isArray(out.data.list)) {
         out.data.source_count = out.data.list.length;
+        out.data.source_page_key = sourcePageKey(out.data.list);
         const hidden = new Set(jar.hiddenHistory || []);
         out.data.list = out.data.list.filter((item) => !hidden.has(String(item.id || item.aid || item.AID || '')));
       }

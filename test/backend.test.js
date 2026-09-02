@@ -889,6 +889,7 @@ class MockServerResponse extends EventEmitter {
     let favorites = await response.json();
     assert.deepStrictEqual(favorites.data.list.map((x) => String(x.id || x.aid)), ['123']);
     assert.strictEqual(favorites.data.local_folder_map['123'], folder.id);
+    assert.match(favorites.data.source_page_key, /^[0-9a-f]{32}$/);
     assert.strictEqual(
       endpointCalls.find((x) => x.target.pathname === '/favorite').target.searchParams.get('folder_id'),
       '0'
@@ -919,6 +920,7 @@ class MockServerResponse extends EventEmitter {
     assert.strictEqual(response.status, 200);
     const history = await response.json();
     assert.deepStrictEqual(history.data.list.map((x) => String(x.id || x.aid)), ['123']);
+    assert.match(history.data.source_page_key, /^[0-9a-f]{32}$/);
     response = await postJson('history/delete', { id: '../456' });
     assert.strictEqual(response.status, 400);
 
