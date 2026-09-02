@@ -107,11 +107,47 @@ docker volume create jm-web-data
 docker run -d --name jm-web --restart unless-stopped --user 1000:1000 --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m --cap-drop=ALL --security-opt=no-new-privileges=true --cpus=1 --memory=512m --pids-limit=256 --log-opt max-size=10m --log-opt max-file=3 -p 127.0.0.1:3210:3210 --mount type=volume,source=jm-web-data,target=/app/data --env-file .env -e PORT=3210 -e HOST=0.0.0.0 -e JMW_DATA_DIR=/app/data jm-web
 ```
 
+#### 使用 GitHub Actions 发布的预构建镜像
+
+仓库内的 `.github/workflows/docker-publish.yml` 会在测试通过后，使用 GitHub Actions
+构建并发布 `linux/amd64`（x86_64）和 `linux/arm64`（64 位 ARM）镜像到 GHCR，
+不需要维护者准备 ARM 机器。推送 `v1.2.3` 这样的版本标签时会生成 `latest`、
+`1.2.3`、`1.2` 和 `1` 标签；`main` 分支会生成 `latest` 与 `edge`，其中 `edge`
+适合测试最新代码。生产环境建议在版本标签生成后固定到具体版本或 digest。
+
+维护者首次发布后，需要在 GitHub 的 **Packages → jm-web → Package settings** 中将
+包设为 Public（首次由 `GITHUB_TOKEN` 推送的包通常默认为 Private）。生产环境建议
+使用具体版本或 digest，而不是长期跟随 `latest`。
+
+只部署镜像的用户可以先准备配置和持久化目录，再用 Compose 覆盖文件跳过本地构建
+（需要 Docker Compose v2.24 或更高版本，以支持 `!reset`）：
+
+```bash
+git clone https://github.com/shixian64/jm-web.git
+cd jm-web
+cp .env.example .env
+mkdir -p data
+sudo chown -R 1000:1000 data
+# 编辑 .env，至少设置高强度 ACCESS_PASSWORD
+
+docker compose --env-file .env \
+  -f docker-compose.yml -f docker-compose.ghcr.yml config --quiet
+docker compose --env-file .env \
+  -f docker-compose.yml -f docker-compose.ghcr.yml up -d --pull always --no-build
+```
+
+`docker-compose.ghcr.yml` 默认使用 `ghcr.io/shixian64/jm-web:latest`；Fork 本仓库或
+使用自己的构建时，在 `.env` 中设置 `JMW_IMAGE=ghcr.io/<owner>/jm-web:<tag>`。
+公开包无需登录 GHCR；私有包则先执行 `docker login ghcr.io`。升级时重复执行
+`up -d --pull always --no-build` 即可，`data/` 目录不要删除。Compose 的安全限制、
+端口发布和反向代理要求与本地构建方式相同。
+
 ### 环境变量
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `JMW_NODE_IMAGE` | `node:22.23.2-alpine3.24` | 仅容器构建：固定基础镜像；正式制品建议附加已核验的 manifest digest |
+| `JMW_IMAGE` | （GHCR 覆盖文件默认为 `ghcr.io/shixian64/jm-web:latest`） | 仅 `docker-compose.ghcr.yml`：预构建镜像地址，可指定版本或 digest |
 | `JMW_CPU_LIMIT` | `1.0` | 仅 Compose：容器 CPU 上限 |
 | `JMW_MEMORY_LIMIT` | `512m` | 仅 Compose：容器内存上限 |
 | `JMW_PIDS_LIMIT` | `256` | 仅 Compose：容器进程数上限 |
@@ -210,7 +246,8 @@ jm-web/
 ├── data/                运行时生成（会话、设置，已被 Git/Docker 构建上下文排除）
 ├── test/                单元/后端回归测试与静态检查（npm test / npm run check）
 ├── .env.example         Docker Compose 环境变量安全示例
-├── Dockerfile / docker-compose.yml
+├── .github/workflows/   GitHub Actions 多架构镜像发布
+├── Dockerfile / docker-compose*.yml
 ├── LICENSE
 └── README.md
 ```
@@ -223,6 +260,8 @@ npm run check
 node test/deployment.test.js
 docker compose config --quiet
 docker compose --env-file .env.example config --quiet
+docker compose --env-file .env.example \
+  -f docker-compose.yml -f docker-compose.ghcr.yml config --quiet
 ```
 
 ## License

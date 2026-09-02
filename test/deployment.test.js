@@ -8,6 +8,8 @@ const root = path.join(__dirname, '..');
 const read = (name) => fs.readFileSync(path.join(root, name), 'utf8');
 const dockerfile = read('Dockerfile');
 const compose = read('docker-compose.yml');
+const ghcrCompose = read('docker-compose.ghcr.yml');
+const workflow = read(path.join('.github', 'workflows', 'docker-publish.yml'));
 const envExample = read('.env.example');
 const server = read('server.js');
 const readme = read('README.md');
@@ -61,5 +63,16 @@ for (const name of [
   'JMW_LOG_MAX_SIZE',
   'JMW_LOG_MAX_FILE',
 ]) mustMatch(envExample, new RegExp(`^${name}=\\S+$`, 'm'), `.env.example 缺少 ${name}`);
+
+mustMatch(
+  ghcrCompose,
+  /image: "\$\{JMW_IMAGE:-ghcr\.io\/shixian64\/jm-web:latest\}"/,
+  'GHCR Compose 覆盖必须提供默认预构建镜像地址',
+);
+mustMatch(ghcrCompose, /build: !reset null/, 'GHCR Compose 覆盖必须禁用本地构建');
+mustMatch(workflow, /linux\/amd64,linux\/arm64/, '镜像 workflow 必须发布 x86_64 和 arm64');
+mustMatch(workflow, /packages:\s*write/, '镜像 workflow 必须允许写入 GHCR');
+mustMatch(workflow, /docker\/build-push-action@v6/, '镜像 workflow 必须使用 Buildx 发布');
+mustMatch(workflow, /if: github\.event_name != 'pull_request'/, 'Pull Request 不得发布镜像');
 
 console.log('deployment hardening checks pass');

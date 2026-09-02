@@ -1,0 +1,8 @@
+# 使用 GitHub Container Registry 中的预构建镜像。
+# 与主 Compose 文件一起使用：
+# docker compose -f docker-compose.yml -f docker-compose.ghcr.yml --env-file .env up -d --pull always
+services:
+  jm-web:
+    image: "${JMW_IMAGE:-ghcr.io/shixian64/jm-web:latest}"
+    # 覆盖主文件的 build，避免部署预构建镜像时需要源码和本地构建工具。
+    build: !reset null
