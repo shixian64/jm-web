@@ -95,7 +95,9 @@ Compose 默认只将 `127.0.0.1:3210` 发布到宿主机，适合同机 Nginx/Ca
 
 默认 Compose 配置以 uid/gid `1000:1000` 的非 root 用户运行，同时启用只读根文件系统、移除 Linux capabilities、禁止提权，并仅让 `/app/data` 持久化可写；运行数据不会写入镜像。为避免 Docker 用 root 身份静默创建目录，Compose 要求 `JMW_HOST_DATA_DIR` 在启动前已经存在；原生 Linux 上该目录必须可由 `1000:1000` 写入。它可以改为仓库外的绝对路径，目录及其备份应按敏感凭据管理。
 
-单实例默认限制为 `1.0` CPU、`512m` 内存和 `256` 个进程，Docker `json-file` 日志按 `10m × 3` 轮转；可通过 `.env` 中的 `JMW_CPU_LIMIT`、`JMW_MEMORY_LIMIT`、`JMW_PIDS_LIMIT`、`JMW_LOG_MAX_SIZE`、`JMW_LOG_MAX_FILE` 调整。调整前应基于容量测试确定水位，不能直接删除上限。
+单实例默认限制为 `1.0` CPU、`512m` 内存和 `256` 个进程，Docker `json-file` 日志按 `10m × 3` 轮转；图片代理默认最多同时处理 `12` 个请求，单个客户端最多 `6` 个。可通过 `.env` 中的 `JMW_CPU_LIMIT`、`JMW_MEMORY_LIMIT`、`JMW_PIDS_LIMIT`、`JMW_LOG_MAX_SIZE`、`JMW_LOG_MAX_FILE`、`JMW_MAX_IMAGE_CONCURRENCY`、`JMW_MAX_IMAGE_CONCURRENCY_PER_IP` 调整。调整前应基于容量测试确定水位，不能直接删除上限。
+
+图片代理只做白名单校验、并发控制和流式转发，不在服务端把整章下载到内存或执行解扰；解扰在浏览器中进行。阅读器会按设备内存以字节预算回收原图缓存，并在创建 Canvas 前拒绝超大或单轴过长的条漫图片。公网部署仍建议保持访问口令、反向代理和单实例资源上限，不要把它当作多人共享的无认证图片代理。
 
 基础镜像默认固定 Node 与 Alpine 的补丁版本；生产发布还应将多架构 manifest digest 纳入制品清单。先用 `docker buildx imagetools inspect node:22.23.2-alpine3.24` 从可信仓库核验摘要，再把 `.env` 的 `JMW_NODE_IMAGE` 设置为 `node:22.23.2-alpine3.24@sha256:<核验得到的摘要>`。摘要与平台有关且会随版本升级，本仓库不写入未经当前构建环境验证的值。
 
@@ -115,8 +117,10 @@ docker run -d --name jm-web --restart unless-stopped --user 1000:1000 --read-onl
 `1.2.3`、`1.2` 和 `1` 标签；`main` 分支会生成 `latest` 与 `edge`，其中 `edge`
 适合测试最新代码。生产环境建议在版本标签生成后固定到具体版本或 digest。
 
-维护者首次发布后，需要在 GitHub 的 **Packages → jm-web → Package settings** 中将
-包设为 Public（首次由 `GITHUB_TOKEN` 推送的包通常默认为 Private）。生产环境建议
+维护者首次发布后，需要在 GitHub 的 **Packages → jm-web → Package settings** 中确认包的
+可见性。个人或小范围部署建议保持 **Private**，只向需要部署的账号授予 read:packages；
+公开包虽然部署最方便，但镜像层仍包含 `server.js`、`lib/` 和前端资源，能拉取镜像的人
+可以解出这些文件，不能把“公开镜像”当作源码保密方案。无论可见性如何，生产环境都应
 使用具体版本或 digest，而不是长期跟随 `latest`。
 
 只部署镜像的用户可以先准备配置和持久化目录，再用 Compose 覆盖文件跳过本地构建
@@ -164,8 +168,10 @@ docker compose --env-file .env \
 | `JM_TOTAL_TIMEOUT` | `35000` | 上游全部域名轮询总时间预算（毫秒） |
 | `JMW_DATA_DIR` | `./data` | 会话与设置持久化目录；Compose 内固定为 `/app/data` |
 | `JMW_HOST_DATA_DIR` | `./data` | 仅 Compose：挂载到 `/app/data` 的已存在宿主机目录；原生 Linux 上须可由 `1000:1000` 写入 |
+| `JMW_MAX_CHAPTER_IMAGES` | `2000` | 单章节允许解析的图片数量上限（范围 1–10000，防止异常响应耗尽浏览器/内存） |
 | `JMW_MAX_IMAGE_BYTES` | `26214400` | 图片代理单文件大小上限（字节，范围 1–100 MiB） |
-| `JMW_MAX_IMAGE_CONCURRENCY` | `24` | 图片代理最大并发数（范围 1–100） |
+| `JMW_MAX_IMAGE_CONCURRENCY` | `12` | 图片代理全局最大并发数（范围 1–100） |
+| `JMW_MAX_IMAGE_CONCURRENCY_PER_IP` | `6` | 单客户端图片代理最大并发数（范围 1–全局上限） |
 | `JMW_MAX_API_RESPONSE_BYTES` | `16777216` | 上游 API 单响应大小上限（字节，范围 1–32 MiB） |
 | `JMW_MAX_AI_STREAM_BYTES` | `16777216` | 单次 AI 流式响应大小上限（字节，范围 1–64 MiB） |
 | `JMW_MAX_AI_CONCURRENCY` | `4` | AI 流式请求并发上限（范围 1–20） |

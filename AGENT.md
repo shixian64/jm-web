@@ -137,6 +137,10 @@ README.md
 test/backend.test.js 或 test/deployment.test.js
 ```
 
+当前图片相关默认保护为：单章节最多 2000 张、单文件 25 MiB、全局代理并发 12、
+单客户端代理并发 6。前端原图缓存按设备内存计算字节预算，解扰前还会检查像素、
+单轴尺寸与估算工作集；调整这些值时必须重新做移动端和长条图回归。
+
 ## 6. 前端实现不变量
 
 - 来自上游、用户或存储的数据必须使用 `textContent`/安全 DOM 构造，禁止直接拼接到 `innerHTML`。
@@ -232,12 +236,13 @@ docker compose --project-name jm-web \
 9. **生产验收**：分别验证笔记本直连、入口代理和公网域名。
 10. **失败回滚**：恢复原 `current` 和旧镜像；不得覆盖或回滚生产数据，除非有独立的数据恢复方案。
 
-### GHCR 预构建镜像（公开分发，可选）
+### GHCR 预构建镜像（可选）
 
 - `.github/workflows/docker-publish.yml` 只在测试通过后发布 `linux/amd64` 与
   `linux/arm64`；Pull Request 只构建校验，不推送镜像。
 - `vX.Y.Z` 版本标签生成版本标签和 `latest`；默认分支生成 `latest` 与 `edge`。GHCR 首次发布后，
-  维护者须确认包的可见性，再把公开镜像地址写入部署说明。
+  维护者须确认包的可见性；个人/小范围部署建议保持 Private，并在部署说明中明确拉取权限。
+- 公开镜像会包含运行所需的 `server.js`、`lib/` 与前端资源；镜像可解包并不等于源码保密。
 - `docker-compose.ghcr.yml` 只用于使用预构建镜像的外部部署，不替代生产 Release 的
   候选构建、校验、原子切换和回滚流程。生产仍须记录镜像 digest，并保留独立数据目录。
 - 发布或升级后用 `docker buildx imagetools inspect <image>:<tag>` 确认两个平台都存在；

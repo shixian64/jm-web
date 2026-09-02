@@ -11,9 +11,43 @@ import {
   listOfflineChapters, listOfflineImages,
 } from './offline.js';
 
-const RAW_CACHE_LIMIT = 24;
+const MIB = 1024 * 1024;
+const RAW_CACHE_DEFAULT_BYTES = 64 * MIB;
+const RAW_CACHE_MEMORY_OPT_BYTES = 32 * MIB;
 const READER_TUTORIAL_KEY = 'jmw_reader_tutorial_dismissed_v1';
 const SAFE_IMAGE_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']);
+
+/**
+ * 计算原图 Blob 缓存预算。按设备内存自适应，且在“内存优化”开启时
+ * 使用更保守的固定预算；未知 deviceMemory 的浏览器取 64 MiB。
+ * 该预算只约束浏览器缓存，不会改变服务端的图片代理上限。
+ */
+export function readerRawCacheBytes({ deviceMemory, memoryOptimized = false } = {}) {
+  if (memoryOptimized === true) return RAW_CACHE_MEMORY_OPT_BYTES;
+  const dm = Number(deviceMemory);
+  if (Number.isFinite(dm) && dm > 0) {
+    if (dm <= 1) return 48 * MIB;
+    if (dm <= 2) return 64 * MIB;
+    if (dm >= 8) return 128 * MIB;
+    return 96 * MIB;
+  }
+  return RAW_CACHE_DEFAULT_BYTES;
+}
+
+export function blobByteSize(value) {
+  const size = Number(value?.size);
+  return Number.isFinite(size) && size > 0 ? size : 0;
+}
+
+export function recommendedDecodeConcurrency({ deviceMemory, memoryOptimized = false, configured = 2 } = {}) {
+  if (memoryOptimized === true) return Math.max(1, Math.min(4, Number(configured) || 2));
+  const dm = Number(deviceMemory);
+  if (Number.isFinite(dm) && dm > 0) {
+    if (dm <= 1) return 1;
+    if (dm <= 2) return 2;
+  }
+  return 3;
+}
 
 export function normalizeChapterImages(value) {
   if (!Array.isArray(value)) return [];
@@ -155,7 +189,8 @@ export function mountReader(root, photoId, query, options = {}) {
     panX: 0,
     panY: 0,
     decoded: new Map(),  // idx -> { url, width, height }
-    raws: new Map(),     // idx -> blob（原始图缓存，LRU，解扰与原图共用）
+    raws: new Map(),     // idx -> blob（原始图缓存，按字节预算的 LRU）
+    rawBytes: 0,
     dims: new Map(),     // idx -> {width, height}
     destroyed: false,
   };
@@ -182,6 +217,46 @@ export function mountReader(root, photoId, query, options = {}) {
   let tutorialEl = null;
   let wakeLock = null;
   let explicitStartPending = requestedPage != null;
+  const deviceMemory = typeof navigator !== 'undefined' ? navigator.deviceMemory : undefined;
+
+  function rawCacheLimitBytes() {
+    return readerRawCacheBytes({
+      deviceMemory,
+      memoryOptimized: setting.readMemoryOptEnabled === true,
+    });
+  }
+
+  function dropRaw(index) {
+    const old = state.raws.get(index);
+    if (!old) return false;
+    state.raws.delete(index);
+    state.rawBytes = Math.max(0, state.rawBytes - blobByteSize(old));
+    return true;
+  }
+
+  function clearRawCache() {
+    state.raws.clear();
+    state.rawBytes = 0;
+  }
+
+  function cacheRaw(index, blob) {
+    const size = blobByteSize(blob);
+    dropRaw(index);
+    // 单张图超过预算时仍返回给当前页，但不留在 LRU，避免下一次请求
+    // 又立刻触发一次大对象驻留/淘汰循环。
+    if (!size || size > rawCacheLimitBytes()) return;
+    state.raws.set(index, blob);
+    state.rawBytes += size;
+    trimRawCache();
+  }
+
+  function trimRawCache() {
+    const budget = rawCacheLimitBytes();
+    while (state.rawBytes > budget && state.raws.size) {
+      const firstKey = state.raws.keys().next().value;
+      dropRaw(firstKey);
+    }
+  }
   const colorSchemeMedia = typeof window.matchMedia === 'function'
     ? window.matchMedia('(prefers-color-scheme: dark)') : null;
   const onColorSchemeChange = () => {
@@ -484,6 +559,7 @@ export function mountReader(root, photoId, query, options = {}) {
       refreshModeBtns();
     }
     if (key === 'supportZoom' && value === false) resetZoom();
+    if (key === 'readMemoryOptEnabled') trimRawCache();
     if (key === 'keepAwake') syncWakeLock(true);
     if (key === 'prefetchCount' && Number(previous) !== Number(value)) refreshPrefetchWindow();
     if (key === 'shunt' && String(previous) !== value && !offline && state.images.length) {
@@ -740,7 +816,7 @@ export function mountReader(root, photoId, query, options = {}) {
     for (const url of retiredObjectUrls) URL.revokeObjectURL(url);
     retiredObjectUrls.clear();
     state.decoded.clear();
-    state.raws.clear();
+    clearRawCache();
     state.dims.clear();
     container.remove();
   }
@@ -921,7 +997,7 @@ export function mountReader(root, photoId, query, options = {}) {
     } else {
       // 分流变更后 URL/解扰参数可能改变，原始响应绝不能跨线路复用。
       imageSourceVersion++;
-      state.raws.clear();
+      clearRawCache();
     }
   }
 
@@ -1038,11 +1114,7 @@ export function mountReader(root, photoId, query, options = {}) {
       if (!SAFE_IMAGE_MIME.has(blobMime)) throw new Error(`图片 ${idx + 1} 返回了无效图片内容`);
     }
     assertImageActive(generation, imageSignal);
-    state.raws.set(idx, blob);
-    while (state.raws.size > RAW_CACHE_LIMIT) {
-      const firstKey = state.raws.keys().next().value;
-      state.raws.delete(firstKey);
-    }
+    cacheRaw(idx, blob);
     return blob;
   }
 
@@ -1092,7 +1164,12 @@ export function mountReader(root, photoId, query, options = {}) {
       // 原图统一走 raws LRU：解扰页重看时也能复用已下载的 blob
       const blob = await getRawBlob(idx, generation, imageSignal);
       if (!isRaw(idx)) {
-        const { blob: out, width, height } = await decodeFromBlob(blob, Number(state.photoId), img.page);
+        const { blob: out, width, height } = await decodeFromBlob(
+          blob,
+          Number(state.photoId),
+          img.page,
+          { memoryOptimized: setting.readMemoryOptEnabled === true },
+        );
         assertImageActive(generation, imageSignal);
         const url = URL.createObjectURL(out);
         const rec = { url, width, height, generation, sourceVersion };
@@ -1139,10 +1216,11 @@ export function mountReader(root, photoId, query, options = {}) {
   }
 
   function decodeConcurrency() {
-    if (setting.readMemoryOptEnabled === true) {
-      return Math.max(1, Math.min(4, Number(setting.readDecodeConcurrency) || 2));
-    }
-    return 3;
+    return recommendedDecodeConcurrency({
+      deviceMemory,
+      memoryOptimized: setting.readMemoryOptEnabled === true,
+      configured: setting.readDecodeConcurrency,
+    });
   }
 
   function markError(idx, msg) {
@@ -1171,7 +1249,7 @@ export function mountReader(root, photoId, query, options = {}) {
       onclick: () => {
         const currentSlot = pages.querySelector(`.slot[data-idx="${idx}"]`);
         if (!currentSlot || state.destroyed) return;
-        state.raws.delete(idx); // 解码失败时不要反复复用同一份损坏缓存。
+        dropRaw(idx); // 解码失败时不要反复复用同一份损坏缓存。
         currentSlot.dataset.mounted = '0';
         currentSlot.replaceChildren(placeholderFor(idx));
         ensureDecoded(idx).then((rec) => { if (rec) mountSlot(idx); });
@@ -1211,7 +1289,7 @@ export function mountReader(root, photoId, query, options = {}) {
             || state.decoded.get(idx) !== rec) return;
         URL.revokeObjectURL(rec.url);
         state.decoded.delete(idx);
-        state.raws.delete(idx);
+        dropRaw(idx);
         state.dims.delete(idx);
         slot.dataset.mounted = '0';
         delete slot.dataset.generation;

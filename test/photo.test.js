@@ -3,7 +3,7 @@ const assert = require('assert');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { parsePhotoHtml, extractObject, lenientParse } = require('../lib/photo');
+const { parsePhotoHtml, extractObject, lenientParse, MAX_CHAPTER_IMAGES } = require('../lib/photo');
 
 // 1) 常规格式
 const html1 = "<html><script>const result = { images: ['00001.webp', '00002.webp', '00003.gif'] };\nconst config = { jmid: '340972', imghost: 'https://cdn-msp.example.com', cache: '?v=1' };\nvar aid = 340972; var scramble_id = 220980; var speed = '';</script></html>";
@@ -43,12 +43,23 @@ const r5 = parsePhotoHtml("<script>const result = { images: ['1.webp'] }; const 
 assert.strictEqual(r5.speed, '1');
 console.log('case5 OK');
 
-// 6) 前端 md5 与 Node crypto 一致（含多字节字符）
+// 章节图片也兼容部分线路返回的 {name/path} 对象，并拒绝异常超长列表。
+const objectImageHtml = "const result = { images: [{name: 'a.webp'}, {path: 'b.webp'}] }; const config = { jmid: '1', imghost: 'https://x.example' };";
+const objectImages = parsePhotoHtml(objectImageHtml);
+assert.deepStrictEqual(objectImages.images.map((image) => image.name), ['a.webp', 'b.webp']);
+const tooManyImages = JSON.stringify(Array.from({ length: MAX_CHAPTER_IMAGES + 1 }, (_, i) => `${i}.webp`));
+assert.throws(
+  () => parsePhotoHtml(`const result = { images: ${tooManyImages} }; const config = { jmid: '1', imghost: 'https://x.example' };`),
+  /图片数量超过/,
+);
+console.log('case6 OK (chapter image budget)');
+
+// 7) 前端 md5 与 Node crypto 一致（含多字节字符）
 const md5Src = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'md5.js'), 'utf8');
 const md5Module = new Function(md5Src.replace('export function md5', 'function md5') + '; return md5;')();
 for (const s of ['34097200001', 'hello', '', '中文测试123', 'a'.repeat(1000)]) {
   assert.strictEqual(md5Module(s), crypto.createHash('md5').update(s, 'utf8').digest('hex'), 'md5 mismatch for ' + JSON.stringify(s));
 }
-console.log('case6 OK (md5)');
+console.log('case7 OK (md5)');
 
 console.log('photo/md5 all pass');

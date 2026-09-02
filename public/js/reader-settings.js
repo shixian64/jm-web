@@ -212,7 +212,7 @@ export function createReaderSettings(options) {
           ),
           prefetchSelect,
         ),
-        switchRow('内存优化', '限制同时解码数，适合内存较小的设备', memoryOpt),
+        switchRow('内存优化', '限制同时解码数和缓存，适合内存较小的设备', memoryOpt),
         h('label', { class: 'r-setting-row' },
           h('span', { class: 'r-setting-copy' },
             h('span', { class: 'r-setting-label' }, '解码并发'),

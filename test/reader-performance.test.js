@@ -25,7 +25,43 @@ function deferred() {
     filterReaderPrefetchWindow,
     scheduleReaderPrefetch,
     backfillReaderImageDimensions,
+    readerRawCacheBytes,
+    blobByteSize,
+    recommendedDecodeConcurrency,
   } = await import(readerUrl);
+  const descrambleUrl = pathToFileURL(path.resolve(__dirname, '..', 'public', 'js', 'descramble.js')).href;
+  const { validateDecodeDimensions } = await import(descrambleUrl);
+
+  assert.strictEqual(blobByteSize({ size: 1024 }), 1024);
+  assert.strictEqual(blobByteSize({ size: 0 }), 0);
+  assert.strictEqual(readerRawCacheBytes({ memoryOptimized: true }), 32 * 1024 * 1024);
+  assert.strictEqual(readerRawCacheBytes({ deviceMemory: 1 }), 48 * 1024 * 1024);
+  assert.strictEqual(readerRawCacheBytes({ deviceMemory: 8 }), 128 * 1024 * 1024);
+  assert.strictEqual(recommendedDecodeConcurrency({ deviceMemory: 0.5 }), 1);
+  assert.strictEqual(recommendedDecodeConcurrency({ deviceMemory: 2 }), 2);
+  assert.strictEqual(recommendedDecodeConcurrency({ deviceMemory: 8 }), 3);
+  assert.strictEqual(recommendedDecodeConcurrency({ memoryOptimized: true, configured: 4 }), 4);
+  assert.throws(
+    () => validateDecodeDimensions(4000, 10000),
+    /图片过大/,
+    '超大长条图必须在创建 Canvas 前被拒绝',
+  );
+  assert.throws(
+    () => validateDecodeDimensions(500, 40000),
+    /图片过大/,
+    '单轴超过浏览器 Canvas 上限的长条图必须被拒绝',
+  );
+  assert.throws(
+    () => validateDecodeDimensions(5000, 5000, { memoryOptimized: true }),
+    /图片过大/,
+    '内存优化模式应使用更低的解码预算',
+  );
+  assert.deepStrictEqual(validateDecodeDimensions(1200, 2000), {
+    width: 1200,
+    height: 2000,
+    pixels: 2400000,
+    estimatedBytes: 19200000,
+  });
 
   // 半径 2 的窗口只能覆盖 current ± 2，不能再隐式扩大为 n + 2。
   // 顺序对齐客户端：当前页完成后先后续页，再前序页，而不是交替调度。

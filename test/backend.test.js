@@ -46,6 +46,9 @@ const {
   sendUpstreamImage,
   proxyEventStream,
   MAX_IMAGE_BYTES,
+  MAX_IMAGE_CONCURRENCY,
+  MAX_IMAGE_CONCURRENCY_PER_IP,
+  acquireImageRequestSlot,
 } = require('../server');
 
 const publicDns = async () => [{ address: '93.184.216.34', family: 4 }];
@@ -277,6 +280,20 @@ class MockServerResponse extends EventEmitter {
     assert.strictEqual(requestIsSecure({
       socket: { remoteAddress: '10.1.2.3' }, headers: { 'x-forwarded-proto': 'https, http' },
     }), false, '拒绝含歧义链的 X-Forwarded-Proto');
+
+    // 图片代理同时受全局与单客户端并发上限约束，释放后槽位必须可复用。
+    assert.ok(MAX_IMAGE_CONCURRENCY_PER_IP <= MAX_IMAGE_CONCURRENCY);
+    const imageSlotReleases = [];
+    for (let i = 0; i < MAX_IMAGE_CONCURRENCY_PER_IP; i++) {
+      const release = acquireImageRequestSlot('image-client-test');
+      assert.strictEqual(typeof release, 'function');
+      imageSlotReleases.push(release);
+    }
+    assert.strictEqual(acquireImageRequestSlot('image-client-test'), null);
+    imageSlotReleases.forEach((release) => release());
+    const reusableImageSlot = acquireImageRequestSlot('image-client-test');
+    assert.strictEqual(typeof reusableImageSlot, 'function');
+    reusableImageSlot();
 
     // 端到端：healthz、method allowlist 与畸形请求目标。
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));

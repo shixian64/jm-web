@@ -50,6 +50,7 @@ for (const [pattern, message] of [
   [/^\s{6}driver: json-file$/m, 'Compose 必须显式声明容器日志驱动'],
   [/^\s{8}max-size: /m, 'Compose 必须限制单个日志文件大小'],
   [/^\s{8}max-file: /m, 'Compose 必须限制日志文件数量'],
+  [/JMW_MAX_IMAGE_CONCURRENCY_PER_IP:/, 'Compose 必须传递单客户端图片并发上限'],
   [/host_ip: "\$\{JMW_PUBLISH_HOST:-127\.0\.0\.1\}"/, '默认发布地址必须保持为回环接口'],
   [/target: \/app\/data/, 'Compose 必须持久化 /app/data'],
   [/^\s{10}create_host_path: false$/m, 'Compose 必须禁止以 root 静默创建宿主机数据目录'],
@@ -62,6 +63,9 @@ for (const name of [
   'JMW_PIDS_LIMIT',
   'JMW_LOG_MAX_SIZE',
   'JMW_LOG_MAX_FILE',
+  'JMW_MAX_CHAPTER_IMAGES',
+  'JMW_MAX_IMAGE_CONCURRENCY',
+  'JMW_MAX_IMAGE_CONCURRENCY_PER_IP',
 ]) mustMatch(envExample, new RegExp(`^${name}=\\S+$`, 'm'), `.env.example 缺少 ${name}`);
 
 mustMatch(

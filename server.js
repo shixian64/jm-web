@@ -12,6 +12,9 @@
  *  JM_UA           上游 UA（默认 okhttp/4.9.3）
  *  JM_TIMEOUT      上游单域名超时 ms（默认 20000）
  *  JM_TOTAL_TIMEOUT 上游全部域名总时间预算 ms（默认 35000）
+ *  JMW_MAX_CHAPTER_IMAGES 单章节图片数量上限（默认 2000）
+ *  JMW_MAX_IMAGE_CONCURRENCY 图片代理全局并发（默认 12）
+ *  JMW_MAX_IMAGE_CONCURRENCY_PER_IP 单客户端图片代理并发（默认 6）
  *  JMW_TRUST_PROXY 可信反代 IP/CIDR（逗号分隔；环回默认可信）
  *  JMW_DATA_DIR    数据目录（默认 ./data）
  */
@@ -51,10 +54,17 @@ const trustedProxyBlockList = new net.BlockList();
 const SAFE_RASTER_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']);
 const MAX_IMAGE_BYTES = Math.min(100 * 1024 * 1024, Math.max(1024 * 1024, Number(process.env.JMW_MAX_IMAGE_BYTES) || 25 * 1024 * 1024));
 const MAX_IMAGE_REDIRECTS = 4;
-const MAX_IMAGE_CONCURRENCY = Math.min(100, Math.max(1, Number(process.env.JMW_MAX_IMAGE_CONCURRENCY) || 24));
+// 图片代理是最容易被预加载/多标签页放大的资源。全局上限保护实例，
+// 每客户端上限避免单个浏览器占满全部连接；两者都可由部署者按容量测试调整。
+const MAX_IMAGE_CONCURRENCY = Math.min(100, Math.max(1, Number(process.env.JMW_MAX_IMAGE_CONCURRENCY) || 12));
+const MAX_IMAGE_CONCURRENCY_PER_IP = Math.min(
+  MAX_IMAGE_CONCURRENCY,
+  Math.max(1, Number(process.env.JMW_MAX_IMAGE_CONCURRENCY_PER_IP) || 6),
+);
 const IMAGE_DRAIN_TIMEOUT = 15000;
 const IMAGE_PATH_TOTAL_TIMEOUT = 30000;
 let activeImageRequests = 0;
+const imageRequestsByClient = new Map();
 const MAX_AI_CONCURRENCY = Math.min(20, Math.max(1, Number(process.env.JMW_MAX_AI_CONCURRENCY) || 4));
 const MAX_SEARCH_CONCURRENCY = Math.min(40, Math.max(1, Number(process.env.JMW_MAX_SEARCH_CONCURRENCY) || 8));
 const MAX_AI_STREAM_BYTES = Math.min(
@@ -457,6 +467,29 @@ function isClientDisconnectError(error) {
 function throwIfAborted(signal) {
   if (!signal || !signal.aborted) return;
   throw signal.reason instanceof Error ? signal.reason : clientDisconnectError();
+}
+
+/**
+ * 申请图片代理槽位。返回释放函数，失败时返回 null。
+ * 计数按请求生命周期维护，客户端断开也会在路由 finally 中释放，
+ * 因而不会把短暂的 IP 列表留在内存里。
+ */
+function acquireImageRequestSlot(clientKey) {
+  if (activeImageRequests >= MAX_IMAGE_CONCURRENCY) return null;
+  const key = String(clientKey || 'unknown');
+  const current = imageRequestsByClient.get(key) || 0;
+  if (current >= MAX_IMAGE_CONCURRENCY_PER_IP) return null;
+  activeImageRequests++;
+  imageRequestsByClient.set(key, current + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    activeImageRequests = Math.max(0, activeImageRequests - 1);
+    const remaining = (imageRequestsByClient.get(key) || 1) - 1;
+    if (remaining > 0) imageRequestsByClient.set(key, remaining);
+    else imageRequestsByClient.delete(key);
+  };
 }
 
 /** 从请求入口开始监听客户端断开，便于取消 DNS、fetch 和响应体读取。 */
@@ -1300,15 +1333,15 @@ async function api(req, res, u, requestSignal) {
       const upath = q.get('path');
       const abs = q.get('u');
       if (!abs && !upath) return sendJson(res, 400, { error: '缺少 path 或 u 参数' });
-      if (activeImageRequests >= MAX_IMAGE_CONCURRENCY) {
+      const releaseImageSlot = acquireImageRequestSlot(clientIp(req));
+      if (!releaseImageSlot) {
         return sendJson(res, 503, { error: '图片代理并发请求过多，请稍后重试' }, { 'Retry-After': '1' });
       }
-      activeImageRequests++;
       try {
         if (abs) return await proxyImage(res, abs, 30, requestSignal);
         return await proxyImagePath(res, upath.startsWith('/') ? upath : '/' + upath, requestSignal);
       } finally {
-        activeImageRequests--;
+        releaseImageSlot();
       }
     }
 
@@ -1616,5 +1649,8 @@ module.exports = {
   sendUpstreamImage,
   proxyEventStream,
   MAX_IMAGE_BYTES,
+  MAX_IMAGE_CONCURRENCY,
+  MAX_IMAGE_CONCURRENCY_PER_IP,
+  acquireImageRequestSlot,
   SAFE_RASTER_MIME,
 };
