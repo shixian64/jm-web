@@ -1,5 +1,5 @@
 // 用户与设置页面：登录 / 个人中心 / 签到 / 收藏 / 阅读历史 / 评论历史 / 本地记录 / 设置
-import { api, imgSrc } from './api.js';
+import { api, imgSrc, commentContentText, commentPageHasMore } from './api.js';
 import {
   h, toast, comicCard, infiniteList, installPullToRefresh, errorBox, loadingBox, installImageRetry,
 } from './ui.js';
@@ -33,6 +33,67 @@ function keyText(value) {
 function itemIdText(item) {
   if (!item || typeof item !== 'object') return '';
   return keyText(item.id) || keyText(item.aid) || keyText(item.AID);
+}
+
+function finiteNonNegative(value) {
+  try {
+    if (value === null || value === undefined || String(value).trim() === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * 返回收藏接口中的实时总数。
+ *
+ * 登录资料里的 album_favorites 是登录时的快照，收藏操作后可能仍然是旧值。
+ * 收藏列表接口的 total 才是当前账号的数量；count 在部分版本只是页大小。
+ * 不同 JM 线路会把数字编码成字符串，因此这里统一做有限、非负的数值解析。没有可靠总数时返回 null，
+ * 调用方应继续显示资料快照而不是把资料页判定为加载失败。
+ */
+export function parseFavoriteCount(payload) {
+  const data = payload && typeof payload === 'object' && !Array.isArray(payload.data)
+    && payload.data && typeof payload.data === 'object' ? payload.data : payload;
+  const list = Array.isArray(data?.list) ? data.list : null;
+  const listLength = list?.length || 0;
+  const firstNumber = (values) => {
+    for (const value of values) {
+      const number = finiteNonNegative(value);
+      if (number !== null) return number;
+    }
+    return null;
+  };
+
+  // JM 的 total 是总收藏数；count 在不少版本中只是当前页大小（例如
+  // total=87、count=20），所以必须先取 total，不能在候选值之间盲目取最大值。
+  const total = firstNumber([data?.total, payload?.total]);
+  if (total !== null) return Math.floor(Math.max(total, listLength));
+
+  const exact = firstNumber([
+    data?.album_favorites, data?.favorite_count,
+    payload?.album_favorites, payload?.favorite_count,
+  ]);
+  if (exact !== null) return Math.floor(Math.max(exact, listLength));
+
+  // 老线路可能完全不返回 total。第一页是短页时，列表长度就是准确总数；
+  // 满页只能说明“至少一页”，不能把 count=20 误当成总收藏数。
+  const sourceCount = finiteNonNegative(data?.source_count);
+  if (sourceCount !== null && sourceCount < USER_LIST_PAGE_SIZE) return Math.floor(sourceCount);
+  if (list && list.length < USER_LIST_PAGE_SIZE) return list.length;
+  const count = firstNumber([data?.count, payload?.count]);
+  if (count !== null && (!list || count !== USER_LIST_PAGE_SIZE)) {
+    return Math.floor(Math.max(count, listLength));
+  }
+  return null;
+}
+
+/** 历史条目统一使用安全的漫画详情路由；阅读器章节由详情页的“继续阅读”进入。 */
+export function localHistoryHref(item) {
+  const aid = item && typeof item === 'object'
+    ? (keyText(item.aid) || keyText(item.AID)) : '';
+  return /^\d+$/.test(aid) ? `#/album/${aid}` : '';
 }
 
 /** 生成跨页稳定身份；优先使用 JM 号，异常响应才退化到封面/名称组合。 */
@@ -75,10 +136,122 @@ export function dedupeUserListPage(items, seen = new Set()) {
   return { items: unique, hasNew };
 }
 
-function finiteNonNegative(value) {
-  if (value === null || value === undefined || String(value).trim() === '') return null;
-  const number = Number(value);
-  return Number.isFinite(number) && number >= 0 ? number : null;
+const HISTORY_TITLE_FIELDS = [
+  'name', 'title', 'album_name', 'albumName', 'album_title', 'albumTitle',
+  'comic_name', 'comicName', 'comic_title', 'comicTitle',
+];
+const HISTORY_AUTHOR_FIELDS = ['author', 'authors', 'artist', 'artists', 'creator', 'writer'];
+
+function historyFieldText(item, fields) {
+  if (!item || typeof item !== 'object') return '';
+  for (const field of fields) {
+    const value = keyText(item[field]);
+    if (value) return value;
+  }
+  return '';
+}
+
+function historyAuthorKey(item) {
+  return historyFieldText(item, HISTORY_AUTHOR_FIELDS)
+    .normalize('NFKC')
+    .replace(/[、，,／/|]+/gu, ',')
+    .split(',')
+    .map((value) => value.replace(/\s+/gu, ' ').trim().toLocaleLowerCase())
+    .filter(Boolean)
+    .sort()
+    .join(',');
+}
+
+function historyExplicitSeriesId(item) {
+  if (!item || typeof item !== 'object') return '';
+  const values = [
+    item.series_id?.id, item.seriesId?.id, item.album_id?.id, item.albumId?.id,
+    item.series?.id, item.series?.aid, item.album?.id, item.album?.aid,
+    item.series_id?.aid, item.seriesId?.aid, item.album_id?.aid, item.albumId?.aid,
+    item.series, item.album,
+    item.series_id, item.seriesId, item.seriesID,
+    item.album_id, item.albumId, item.albumID,
+  ];
+  for (const value of values) {
+    let text = '';
+    try {
+      text = value && typeof value === 'object'
+        ? (keyText(value.id) || keyText(value.aid) || keyText(value.ID) || keyText(value.AID))
+        : keyText(value);
+    } catch (_) {
+      continue;
+    }
+    // 0 是 JM 在单话作品上使用的“无系列”占位值，不能把所有单话记录
+    // 错误地归并到同一组。
+    if (text && text !== '0' && text.toLocaleLowerCase() !== 'null') return text;
+  }
+  return '';
+}
+
+const HISTORY_CHAPTER_SUFFIX_RE = /(?:[\s\-—–_＿:：|·,，、]*[（(【\[]?\s*(?:第\s*(?:\d+|[零〇一二三四五六七八九十百千万两]+)\s*(?:话|話|章|回|卷|节|節|集|篇)|(?:chapter|chap|ch|episode|ep|vol|volume)\.?\s*\d+|\d+\s*(?:话|話|章|回|卷|节|節|集|篇))\s*[）)】\]]?)\s*$/iu;
+const HISTORY_TRAILING_SEPARATOR_RE = /[\s\-—–_＿:：|·,，、]+$/u;
+
+/** 去掉常见章节后缀，但保留作品本名和作者信息用于安全归并。 */
+export function normalizeHistoryTitle(value) {
+  let title = keyText(value).normalize('NFKC').replace(/\s+/gu, ' ').trim();
+  if (!title) return '';
+  // 某些线路会连续附加“第 1 章 · 第 2 话”之类标记，最多迭代几次，
+  // 避免异常标题触发无界循环。
+  for (let i = 0; i < 4; i++) {
+    const next = title.replace(HISTORY_CHAPTER_SUFFIX_RE, '')
+      .replace(HISTORY_TRAILING_SEPARATOR_RE, '').trim();
+    if (next === title) break;
+    title = next;
+  }
+  return title;
+}
+
+/**
+ * 生成历史“作品”身份：显式系列/专辑 ID 最可靠；没有时才使用去章节后的
+ * 标题和作者组合。不要单独按标题合并，以免同名不同作者的作品互相吞并。
+ */
+export function canonicalHistoryKey(item) {
+  const explicit = historyExplicitSeriesId(item);
+  if (explicit) return `series:${explicit}`;
+  const title = normalizeHistoryTitle(historyFieldText(item, HISTORY_TITLE_FIELDS));
+  const author = historyAuthorKey(item);
+  if (title) return `title:${title.toLocaleLowerCase()}${author ? `\u001f${author}` : ''}`;
+  const id = itemIdText(item);
+  if (id) return `id:${id}`;
+  return userListItemKey(item);
+}
+
+function historyItemIds(item) {
+  const values = item && typeof item === 'object' && Array.isArray(item._historyIds)
+    ? item._historyIds : [itemIdText(item)];
+  return [...new Set(values.map(keyText).filter((id) => /^\d+$/.test(id)))];
+}
+
+/**
+ * 将一页已按 ID 去重的历史条目归并为作品组。groups 用 Map 保存跨页状态；
+ * 每个代表项的 _historyIds 会累积该作品下所有可删除的云端记录 ID。
+ */
+export function dedupeHistoryItems(items, groups = new Map()) {
+  const state = groups instanceof Map ? groups : new Map();
+  const unique = [];
+  for (const raw of Array.isArray(items) ? items : []) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    // 没有任何稳定字段的异常对象不能共享同一个“unknown”键，否则会把
+    // 多条异常记录吞掉；在当前页内用索引做最后的隔离。
+    const key = canonicalHistoryKey(raw) || `unknown:${state.size}:${unique.length}`;
+    let representative = state.get(key);
+    const ids = historyItemIds(raw);
+    if (representative) {
+      const merged = new Set(historyItemIds(representative));
+      ids.forEach((id) => merged.add(id));
+      representative._historyIds = [...merged];
+      continue;
+    }
+    representative = { ...raw, _historyKey: key, _historyIds: ids };
+    state.set(key, representative);
+    unique.push(representative);
+  }
+  return { items: unique, groups: state };
 }
 
 /** 统一收藏/历史分页边界；repeated 用于拦截上游循环返回的同一页。 */
@@ -120,10 +293,35 @@ export function userView(root, ctx) {
   let destroyed = false;
   let loadSeq = 0;
   let loadController = null;
+  let favoriteController = null;
+
+  const cancelFavoriteRefresh = () => {
+    favoriteController?.abort();
+    favoriteController = null;
+  };
+
+  const refreshFavoriteCount = async (profile, seq) => {
+    const controller = new AbortController();
+    cancelFavoriteRefresh();
+    favoriteController = controller;
+    try {
+      const result = await api.favorites('mr', 1, 0, controller.signal);
+      const count = parseFavoriteCount(result);
+      if (count === null || destroyed || isInactive(ctx) || controller.signal.aborted || seq !== loadSeq) return;
+      profile?.updateFavoriteCount?.(count);
+    } catch (_) {
+      // 收藏列表只是资料页的补充校准；网络/上游失败时保留登录资料快照，
+      // 不能让个人页从可用状态退化成错误页。
+      /* 保留资料页已经渲染的快照 */
+    } finally {
+      if (favoriteController === controller) favoriteController = null;
+    }
+  };
 
   const load = async () => {
     const seq = ++loadSeq;
     loadController?.abort();
+    cancelFavoriteRefresh();
     const controller = new AbortController();
     loadController = controller;
     content.replaceChildren(profileSkeleton());
@@ -131,7 +329,12 @@ export function userView(root, ctx) {
       const me = (await api.me(controller.signal)).user;
       if (destroyed || isInactive(ctx) || controller.signal.aborted || seq !== loadSeq) return;
       if (!me) renderLogin(content, ctx, load);
-      else renderProfile(content, me, ctx, load);
+      else {
+        const profile = renderProfile(content, me, ctx, load, cancelFavoriteRefresh);
+        // 先用 /api/me 的资料快照快速绘制页面，再在后台用第一页收藏数据
+        // 校准容量。这样慢线路不会阻塞个人页，也不会覆盖其它资料字段。
+        void refreshFavoriteCount(profile, seq);
+      }
     } catch (e) {
       if (destroyed || isInactive(ctx) || controller.signal.aborted || isAbort(e) || seq !== loadSeq) return;
       content.replaceChildren(errorBox(e.message, load));
@@ -148,6 +351,7 @@ export function userView(root, ctx) {
     loadSeq++;
     loadController?.abort();
     loadController = null;
+    cancelFavoriteRefresh();
     removePullRefresh();
   };
 }
@@ -163,9 +367,9 @@ function profileSkeleton() {
           h('div', { class: 'skeleton-line wide' }),
           h('div', { class: 'skeleton-line short' }),
           h('div', { class: 'skeleton-line wide' })))),
-    h('div', { class: 'stat-row' }, [1, 2, 3].map(() => h('div', { class: 'cell', 'aria-hidden': 'true' },
+    h('div', { class: 'stat-row' }, h('div', { class: 'cell', 'aria-hidden': 'true' },
       h('div', { class: 'skeleton-line wide', style: 'margin:6px auto' }),
-      h('div', { class: 'skeleton-line short', style: 'margin:8px auto 2px' })))),
+      h('div', { class: 'skeleton-line short', style: 'margin:8px auto 2px' }))),
     h('div', { class: 'menu-list' }, menuRows));
 }
 
@@ -215,7 +419,7 @@ function renderLogin(page, ctx, reload) {
   );
 }
 
-function renderProfile(page, me, ctx, reload) {
+function renderProfile(page, me, ctx, reload, beforeReplace) {
   const avatarSrc = me.photo
     ? (/^https?:/i.test(me.photo) ? `/api/img?u=${encodeURIComponent(me.photo)}` : `/api/img?path=${encodeURIComponent(me.photo.startsWith('/') ? me.photo : '/' + me.photo)}`)
     : '';
@@ -228,6 +432,12 @@ function renderProfile(page, me, ctx, reload) {
   const exp = Number(me.exp) || 0;
   const next = Number(me.nextLevelExp) || 1;
   const pct = Math.min(100, Math.round((Number(me.expPercent) || (exp / next) * 100)));
+  const initialFavoriteCount = finiteNonNegative(me.album_favorites);
+  const favoriteMax = finiteNonNegative(me.album_favorites_max);
+  const favoriteCapacity = statCell(
+    `${initialFavoriteCount === null ? 0 : Math.floor(initialFavoriteCount)}/${favoriteMax === null ? 0 : Math.floor(favoriteMax)}`,
+    '收藏容量',
+  );
 
   page.replaceChildren(
     h('div', { class: 'card profile-card' },
@@ -243,11 +453,7 @@ function renderProfile(page, me, ctx, reload) {
         ),
       ),
     ),
-    h('div', { class: 'stat-row' },
-      statCell(`${me.album_favorites ?? 0}/${me.album_favorites_max ?? 0}`, '收藏容量'),
-      statCell(icon('star', 18), '我的收藏', () => { location.hash = '#/favorites'; }),
-      statCell(icon('history', 18), '阅读历史', () => { location.hash = '#/watch-history'; }),
-    ),
+    h('div', { class: 'stat-row' }, favoriteCapacity),
     h('div', { class: 'menu-list' },
       menuItem('calendar-days', '每日签到', '#/signin'),
       menuItem('star', '我的收藏', '#/favorites'),
@@ -269,6 +475,7 @@ function renderProfile(page, me, ctx, reload) {
           await api.logout();
           if (isInactive(ctx)) return;
           toast('已退出登录');
+          beforeReplace?.();
           window.dispatchEvent(new CustomEvent('jmw-auth-changed'));
           renderLogin(page, ctx, reload);
         } catch (e) {
@@ -282,17 +489,29 @@ function renderProfile(page, me, ctx, reload) {
       },
     }, '退出登录'),
   );
+
+  return {
+    updateFavoriteCount: (count) => {
+      const normalized = finiteNonNegative(count);
+      if (normalized === null || favoriteCapacity.isConnected === false) return;
+      favoriteCapacity._statValue.textContent = `${Math.floor(normalized)}/${favoriteMax === null ? 0 : Math.floor(favoriteMax)}`;
+    },
+  };
 }
 
 function statCell(val, label, onclick) {
-  return h('div', {
+  const valueNode = h('b', null, val);
+  const cell = h('div', {
     class: 'cell',
     style: onclick ? 'cursor:pointer' : '',
     ...(onclick ? {
       role: 'button', tabindex: '0', 'aria-label': label, onclick,
       onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onclick(); } },
     } : {}),
-  }, h('b', null, val), h('span', null, label));
+  }, valueNode, h('span', null, label));
+  // 仅供个人页后台校准使用，避免通过 querySelector 依赖测试/旧浏览器 DOM 实现。
+  cell._statValue = valueNode;
+  return cell;
 }
 
 function menuItem(ic, label, href) {
@@ -823,32 +1042,38 @@ export function favoritesView(root, params) {
 export function watchHistoryView(root) {
   const page = h('div', { class: 'page history-page' });
   const loaded = new Map();
+  // canonicalHistoryKey -> 代表条目。代表条目的 _historyIds 会收集同一作品
+  // 下的多个章节记录，删除时一次性处理，避免刷新后“重复”回来。
+  const historyGroups = new Map();
   const seenHistoryItems = new Set();
   const seenHistoryPages = new Set();
+  let bulkDeleting = false;
   const scopeHint = h('div', { class: 'hint', style: 'margin:0 2px 8px' },
     '登录后优先删除 JM 账号云端历史；云端不可用时只会在本会话隐藏。');
   const clearLoaded = h('button', {
     class: 'btn', type: 'button', disabled: true,
     onclick: async () => {
-      if (!loaded.size || !window.confirm(`删除当前已加载的 ${loaded.size} 条账号历史？云端失败时将仅在本会话隐藏。`)) return;
+      if (bulkDeleting || !loaded.size || !window.confirm(`删除当前已加载的 ${loaded.size} 部作品历史？云端失败时将仅在本会话隐藏。`)) return;
+      bulkDeleting = true;
       clearLoaded.disabled = true;
-      let success = 0;
-      let cloud = 0;
-      let session = 0;
-      for (const [id, card] of [...loaded]) {
-        try {
-          const result = await api.deleteHistory(id);
-          if (result?.scope === 'cloud') cloud++; else session++;
-          card.remove();
-          loaded.delete(id);
-          success++;
-        } catch (_) { /* 继续删除其余项 */ }
+      try {
+        let success = 0;
+        let cloud = 0;
+        let session = 0;
+        for (const record of [...loaded.values()]) {
+          const result = await deleteHistoryGroup(record);
+          success += result.success;
+          cloud += result.cloud;
+          session += result.session;
+        }
+        const scopeText = cloud && session
+          ? `（云端 ${cloud}，仅本会话隐藏 ${session}）`
+          : (cloud ? '（已从云端删除）' : '（仅本会话隐藏）');
+        toast(`已处理 ${success} 条历史记录${scopeText}`);
+      } finally {
+        bulkDeleting = false;
+        updateClearLoaded();
       }
-      const scopeText = cloud && session
-        ? `（云端 ${cloud}，仅本会话隐藏 ${session}）`
-        : (cloud ? '（已从云端删除）' : '（仅本会话隐藏）');
-      toast(`已处理 ${success} 条历史${scopeText}`);
-      clearLoaded.disabled = loaded.size === 0;
     },
   }, '清空已加载');
   page.append(
@@ -858,38 +1083,90 @@ export function watchHistoryView(root) {
   );
   root.append(page);
 
+  function updateClearLoaded() {
+    clearLoaded.disabled = bulkDeleting || loaded.size === 0;
+  }
+
+  async function deleteHistoryGroup(record) {
+    if (!record || record.deleting) return { success: 0, cloud: 0, session: 0 };
+    const ids = historyItemIds(record.item);
+    if (!ids.length) {
+      loaded.delete(record.key);
+      record.card?.remove();
+      updateClearLoaded();
+      return { success: 0, cloud: 0, session: 0 };
+    }
+    record.deleting = true;
+    const failed = [];
+    let success = 0;
+    let cloud = 0;
+    let session = 0;
+    for (const id of ids) {
+      try {
+        const result = await api.deleteHistory(id);
+        if (result?.scope === 'cloud') cloud++; else session++;
+        success++;
+      } catch (_) {
+        failed.push(id);
+      }
+    }
+    record.item._historyIds = failed;
+    record.deleting = false;
+    if (!failed.length) {
+      record.card?.remove();
+      loaded.delete(record.key);
+    }
+    if (!bulkDeleting) updateClearLoaded();
+    return { success, cloud, session, failed };
+  }
+
   function decorateHistory(item) {
     item = item && typeof item === 'object' ? item : {};
-    const id = itemIdText(item);
+    const key = item._historyKey || canonicalHistoryKey(item);
+    const ids = historyItemIds(item);
     // 历史删除接口只接受 JM 数字 ID；异常条目仍可展示，但不能把不可删除
     // 的 fallback key 放进“清空已加载”集合里反复提交 400 请求。
-    const mapKey = id;
-    if (mapKey && loaded.has(mapKey)) return null;
+    const existing = loaded.get(key);
+    if (existing) {
+      const merged = new Set(historyItemIds(existing.item));
+      ids.forEach((id) => merged.add(id));
+      existing.item._historyIds = [...merged];
+      return null;
+    }
     const card = comicCard(item);
     card.style.position = 'relative';
+    const record = { key, item, card, deleting: false };
     const remove = h('button', {
-      class: 'chip', type: 'button', title: '删除这条历史', 'aria-label': `删除${item.name || id}的历史`,
+      class: 'chip', type: 'button', title: '删除这条历史',
+      'aria-label': `删除${item.name || ids[0] || '该作品'}的历史`,
       style: 'position:absolute;z-index:3;right:7px;top:7px;padding:5px 7px;background:var(--card)',
       onclick: async (e) => {
         e.stopPropagation();
-        if (!window.confirm(`删除“${item.name || id}”的账号阅读历史？云端失败时将仅在本会话隐藏。`)) return;
+        if (bulkDeleting || record.deleting) return;
+        if (!window.confirm(`删除“${item.name || '该作品'}”的账号阅读历史？云端失败时将仅在本会话隐藏。`)) return;
         remove.disabled = true;
         try {
-          const result = await api.deleteHistory(id);
-          card.remove();
-          loaded.delete(id);
-          clearLoaded.disabled = loaded.size === 0;
-          toast(result?.scope === 'cloud' ? '历史记录已从云端删除' : '历史记录仅在本会话隐藏');
+          const result = await deleteHistoryGroup(record);
+          if (result.failed?.length) {
+            toast(`有 ${result.failed.length} 条历史删除失败，请稍后重试`);
+          } else {
+            const scope = result.cloud && result.session
+              ? '（云端与本会话）'
+              : (result.cloud ? '已从云端删除' : '仅在本会话隐藏');
+            toast(`历史记录${scope}`);
+          }
         } catch (err) {
-          remove.disabled = false;
           if (!isAbort(err)) toast(err.message);
+        } finally {
+          remove.disabled = false;
         }
       },
       onkeydown: (e) => e.stopPropagation(),
     }, icon('trash-2', 14));
+    if (!ids.length) remove.hidden = true;
     card.append(remove);
-    if (mapKey) loaded.set(mapKey, card);
-    clearLoaded.disabled = loaded.size === 0;
+    if (ids.length) loaded.set(key, record);
+    if (!bulkDeleting) updateClearLoaded();
     return card;
   }
 
@@ -902,6 +1179,7 @@ export function watchHistoryView(root) {
         : '当前未连接账号云端；删除操作只会在本会话隐藏记录。';
       loaded.clear();
       clearLoaded.disabled = true;
+      historyGroups.clear();
       seenHistoryItems.clear();
       seenHistoryPages.clear();
     }
@@ -909,10 +1187,11 @@ export function watchHistoryView(root) {
     const repeatedPage = rememberSourcePage(sourcePageMarker(d, rawList), seenHistoryPages);
     const deduped = dedupeUserListPage(rawList, seenHistoryItems);
     const source = filterComics(deduped.items, setting.blockedTagList || []);
+    const grouped = dedupeHistoryItems(source, historyGroups);
     const declaredCount = finiteNonNegative(d.source_count);
     const sourceCount = Math.max(rawList.length, declaredCount ?? 0);
     return {
-      items: source.map(decorateHistory).filter(Boolean),
+      items: grouped.items.map(decorateHistory).filter(Boolean),
       hasMore: userListPageHasMore({
         total: d.total,
         page: p,
@@ -948,17 +1227,20 @@ export function localHistoryView(root) {
 
     const list = h('div');
     hist.forEach((it) => {
-      const photoId = String(it.photoId || it.aid || '');
-      const aid = String(it.aid || '');
-      const canOpen = /^\d+$/.test(photoId) && /^\d+$/.test(aid);
-      const open = () => { if (canOpen) location.hash = it.offline ? `#/offline/${aid}/${photoId}` : `#/read/${photoId}?aid=${aid}`; };
+      const photoId = String(it.photoId || it.chapterId || it.aid || it.AID || '');
+      const aid = String(it.aid || it.AID || '');
+      const href = localHistoryHref(it);
+      const canOpen = !!href;
+      // 本地记录与云端历史保持一致：先看作品主页，再由主页的“继续阅读”
+      // 按记录中的章节/离线状态进入阅读器，避免直接跳过作品上下文。
+      const open = () => { if (canOpen) location.hash = href; };
       const coverImage = h('img', { loading: 'lazy', alt: it.name || '漫画封面', fetchpriority: 'low' });
       const coverHost = h('div', { class: 'avatar', style: 'border-radius:8px' }, coverImage);
       installImageRetry(coverImage, imgSrc({ ...it, aid }), { lazy: true });
       const item = h('div', {
         class: 'comment-item',
         style: canOpen ? 'cursor:pointer' : '',
-        ...(canOpen ? { role: 'button', tabindex: '0', 'aria-label': `继续阅读${it.name || '漫画'}`, onclick: open } : { 'aria-disabled': 'true' }),
+        ...(canOpen ? { role: 'button', tabindex: '0', 'aria-label': `查看${it.name || '漫画'}主页`, onclick: open } : { 'aria-disabled': 'true' }),
       },
         coverHost,
         h('div', { class: 'body' },
@@ -1008,7 +1290,7 @@ export function myCommentsView(root, params, ctx) {
     },
       h('div', { class: 'body' },
         h('div', { class: 'name' }, `《${c.name || '漫画 ' + aid}》`),
-        h('div', { class: 'content' }, c.content || ''),
+        h('div', { class: 'content' }, commentContentText(c.content)),
         h('div', { class: 'foot' }, fmtTime(c.addtime))),
     );
     if (canOpen) item.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
@@ -1043,7 +1325,7 @@ export function myCommentsView(root, params, ctx) {
       // 只有完整追加成功后才推进页码；失败重试仍请求同一页，不会跳页或重复已有页。
       pageIdx = nextPage;
       sentinel.replaceChildren();
-      if (list.length >= 20) observeAgain = true;
+      if (commentPageHasMore({ total: d.total, page: nextPage, itemCount: list.length })) observeAgain = true;
       else finished = true;
     } catch (e) {
       if (!destroyed && seq === generation && !isInactive(ctx) && !controller.signal.aborted && !isAbort(e)) {

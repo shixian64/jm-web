@@ -1,5 +1,7 @@
 // 浏览类页面：首页 / 搜索 / 分类 / 每周必看 / 漫画详情
-import { api, imgSrc } from './api.js';
+import {
+  api, imgSrc, commentAvatarSrc, commentContentText, commentPageCount, isCommentSpoiler,
+} from './api.js';
 import {
   h, toast, comicCard, comicSkeletons, infiniteList, installPullToRefresh, errorBox, loadingBox,
   installImageRetry,
@@ -924,11 +926,16 @@ export async function albumView(root, id, ctx) {
   }, icon('inbox', 16), '离线缓存');
 
   // 本地历史：继续阅读
-  const localRec = getLocalHistory().find((it) => String(it.aid) === String(id));
-  if (localRec && localRec.photoId && (localRec.photoId !== String(id) || localRec.page > 0)) {
+  const localRec = getLocalHistory().find((it) => String(it.aid || it.AID) === String(id));
+  const localPhotoId = String(localRec?.photoId || '');
+  if (localRec && /^\d+$/.test(localPhotoId)
+      && (localPhotoId !== String(id) || localRec.page > 0 || localRec.offline)) {
+    const localContinueHref = localRec.offline
+      ? `#/offline/${id}/${localPhotoId}`
+      : `#/read/${localPhotoId}?aid=${id}`;
     body.append(h('button', {
       class: 'btn block', style: 'margin-bottom:10px',
-      onclick: () => { location.hash = `#/read/${localRec.photoId}?aid=${id}`; },
+      onclick: () => { location.hash = localContinueHref; },
     }, icon('history', 16), `继续阅读：${localRec.name || ''} 第 ${Number(localRec.page || 0) + 1} 页`));
   }
 
@@ -1178,7 +1185,7 @@ function buildComments(wrap, aid, ctx) {
       const res = await api.comments(aid, p, ctx && ctx.signal);
       if (isInactive(ctx) || seq !== loadSeq) return;
       const d = res.data || {};
-      const list = d.list || [];
+      const list = Array.isArray(d.list) ? d.list : [];
       if (!list.length) {
         listWrap.replaceChildren(h('div', { class: 'empty' }, h('div', { class: 'big' }, icon('message-square', 40)), '还没有评论'));
         return;
@@ -1186,7 +1193,7 @@ function buildComments(wrap, aid, ctx) {
       listWrap.replaceChildren(...list.map((comment) => commentItem(comment, {
         aid, reload: () => load(p), ctx, depth: 0,
       })));
-      const pages = Math.ceil(Number(d.total) / 20);
+      const pages = commentPageCount(d.total);
       if (pages > 1) {
         const { pager } = await import('./ui.js');
         if (isInactive(ctx) || seq !== loadSeq) return;
@@ -1201,9 +1208,12 @@ function buildComments(wrap, aid, ctx) {
   return { reload: () => load(1) };
 }
 
-function commentItem(c, options = {}) {
+export function commentItem(c, options = {}) {
+  c = c && typeof c === 'object' && !Array.isArray(c) ? c : {};
   const { aid = '', reload = () => {}, ctx, depth = 0 } = options;
-  const content = h('div', { class: 'content' + (c.spoiler === '1' || c.spoiler === 1 ? ' spoiler' : '') }, c.content || '');
+  const content = h('div', {
+    class: 'content' + (isCommentSpoiler(c.spoiler) ? ' spoiler' : ''),
+  }, commentContentText(c.content));
   if (content.classList.contains('spoiler')) {
     const reveal = () => {
       content.classList.remove('spoiler');
@@ -1219,9 +1229,7 @@ function commentItem(c, options = {}) {
     content.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); reveal(); } });
     content.title = '点击显示剧透内容';
   }
-  const avatarSrc = c.photo
-    ? (/^https?:/i.test(c.photo) ? `/api/img?u=${encodeURIComponent(c.photo)}` : `/api/img?path=${encodeURIComponent(c.photo.startsWith('/') ? c.photo : '/' + c.photo)}`)
-    : '';
+  const avatarSrc = commentAvatarSrc(c.photo);
   const cid = String(c.CID ?? c.cid ?? c.id ?? '');
   let likeCount = Number(c.likes) || 0;
   let voted = false;
@@ -1253,7 +1261,7 @@ function commentItem(c, options = {}) {
     disabled: !cid || !aid,
     onclick: () => toggleReplyComposer(replyHost, { aid, cid, nickname: c.nickname || c.username, reload, ctx }),
   }, '回复');
-  const replies = c.replys || c.replies || c.children || [];
+  const replies = [c.replys, c.replies, c.children].find(Array.isArray) || [];
   const body = h('div', { class: 'body' },
     h('div', { class: 'head' },
       h('span', { class: 'name' }, c.nickname || c.username || '匿名'),
@@ -1272,11 +1280,28 @@ function commentItem(c, options = {}) {
     })));
     body.append(repliesWrap);
   }
+  const displayName = [c.nickname, c.username]
+    .find((value) => typeof value === 'string' || typeof value === 'number');
+  const avatarFallback = Array.from(String(displayName || '友').trim() || '友')[0];
+  const avatar = h('div', { class: 'avatar' }, avatarFallback);
+  if (avatarSrc) {
+    const image = h('img', { loading: 'lazy', decoding: 'async', fetchpriority: 'low', alt: '' });
+    avatar.replaceChildren(image);
+    installImageRetry(image, avatarSrc, {
+      lazy: true,
+      maxRetries: 2,
+      onBroken: () => {
+        if (avatar.isConnected === false) return;
+        avatar.classList.remove('is-broken');
+        avatar.replaceChildren(document.createTextNode(avatarFallback));
+      },
+    });
+  }
   const el = h('div', {
     class: 'comment-item',
     ...(depth ? { style: 'padding-top:10px;padding-bottom:10px' } : {}),
   },
-    h('div', { class: 'avatar' }, avatarSrc ? h('img', { loading: 'lazy', src: avatarSrc, alt: '' }) : (c.nickname || c.username || '友').slice(0, 1)),
+    avatar,
     body,
   );
   return el;
