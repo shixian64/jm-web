@@ -73,6 +73,105 @@ export const api = {
   deleteHistory: (id) => request('/history/delete', { method: 'POST', body: JSON.stringify({ id }) }),
 };
 
+// /forum 的固定分页大小与收藏/历史接口不同。上游当前每页返回 10 条，
+// total 则是评论总数；不要复用用户列表的 20 条分页常量。
+export const COMMENT_PAGE_SIZE = 10;
+
+const COMMENT_HIDDEN_ELEMENT_RE = /<(script|style|template|noscript|iframe|object|svg|math)\b[^>]*>[\s\S]*?<\/\1\s*>/gi;
+const COMMENT_BLOCK_END_RE = /<\/(?:address|article|aside|blockquote|div|dl|fieldset|figcaption|figure|footer|form|h[1-6]|header|li|main|nav|ol|p|pre|section|table|tbody|td|tfoot|th|thead|tr|ul)\s*>/gi;
+const COMMENT_ENTITY_MAP = Object.freeze({
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
+});
+
+function decodeCommentEntities(value) {
+  return value
+    .replace(/&#(?:x([0-9a-f]{1,6})|([0-9]{1,7}));/gi, (_match, hex, decimal) => {
+      const point = Number.parseInt(hex || decimal, hex ? 16 : 10);
+      if (!Number.isInteger(point) || point <= 0 || point > 0x10ffff ||
+          (point >= 0xd800 && point <= 0xdfff)) return '\ufffd';
+      return String.fromCodePoint(point);
+    })
+    .replace(/&(amp|lt|gt|quot|apos|nbsp);/gi,
+      (_match, name) => COMMENT_ENTITY_MAP[name.toLowerCase()]);
+}
+
+function commentImageAlt(attributes) {
+  const match = String(attributes || '').match(
+    /\balt\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i,
+  );
+  return match ? (match[1] ?? match[2] ?? match[3] ?? '') : '';
+}
+
+/**
+ * 将上游评论 HTML 转成可安全放入 textContent 的正文。
+ *
+ * /forum 会用带 style 的 div 包装正文，并用 img 表示表情。这里不把任何
+ * 上游字符串交给 innerHTML：块级标签转成换行，表情保留 alt 文本，其余
+ * 标签和可执行/可加载的元素全部丢弃，最后只返回普通字符串。
+ */
+export function commentContentText(value) {
+  if (typeof value !== 'string' && typeof value !== 'number') return '';
+  const text = String(value)
+    .replace(/\r\n?/g, '\n')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(COMMENT_HIDDEN_ELEMENT_RE, '')
+    .replace(/<br\b[^>]*>/gi, '\n')
+    .replace(/<hr\b[^>]*>/gi, '\n')
+    .replace(/<img\b([^>]*)>/gi, (_match, attributes) => commentImageAlt(attributes))
+    .replace(COMMENT_BLOCK_END_RE, '\n')
+    .replace(/<[^>]*>/g, '');
+  return decodeCommentEntities(text)
+    .replace(/\u0000/g, '\ufffd')
+    .replace(/[\t\f\v ]+\n/g, '\n')
+    .replace(/\n[\t\f\v ]+/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/** API 当前以 1 表示普通评论、2 表示官网默认隐藏的剧透评论。 */
+export function isCommentSpoiler(value) {
+  if (value === true) return true;
+  const flag = String(value ?? '').trim().toLowerCase();
+  return flag === '2' || flag === 'true';
+}
+
+/** 将 /forum 返回的头像文件名补齐到图片代理允许的 /media/users/ 路径。 */
+export function commentAvatarSrc(value) {
+  if (typeof value !== 'string') return '';
+  const photo = value.trim();
+  if (!photo) return '';
+  if (/^https?:\/\//i.test(photo)) return '/api/img?u=' + encodeURIComponent(photo);
+  if (photo.startsWith('//')) return '/api/img?u=' + encodeURIComponent('https:' + photo);
+  if (photo.startsWith('/media/')) {
+    return '/api/img?path=' + encodeURIComponent(photo.split('#', 1)[0]);
+  }
+  if (photo.startsWith('media/')) {
+    return '/api/img?path=' + encodeURIComponent('/' + photo.split('#', 1)[0]);
+  }
+  const relative = photo.replace(/^\/+/, '');
+  if (!/^[a-z0-9][\w.-]*\.(?:jpe?g|png|webp|gif)(?:[?#].*)?$/i.test(relative)) return '';
+  const filename = relative.split(/[?#]/, 1)[0];
+  return '/api/img?path=' + encodeURIComponent(`/media/users/${filename}`);
+}
+
+export function commentPageCount(total) {
+  const count = Number(total);
+  return Number.isFinite(count) && count > 0 ? Math.ceil(count / COMMENT_PAGE_SIZE) : 0;
+}
+
+/** 短页可靠地表示末页；满页时再用 total 判断是否继续请求。 */
+export function commentPageHasMore({ total, page, itemCount } = {}) {
+  const count = Number(itemCount);
+  if (!Number.isFinite(count) || count <= 0 || count < COMMENT_PAGE_SIZE) return false;
+  const currentPage = Math.max(1, Math.floor(Number(page) || 1));
+  const knownTotal = total === null || total === undefined || String(total).trim() === ''
+    ? NaN : Number(total);
+  if (Number.isFinite(knownTotal) && knownTotal >= 0) {
+    return knownTotal > currentPage * COMMENT_PAGE_SIZE;
+  }
+  return true;
+}
+
 /** 封面/头像等静态图地址：兼容上游常见的 image/cover 字段和多种地址格式。 */
 export function imgSrc(item) {
   // 上游字段并非始终稳定：异常对象/数字不能直接调用 startsWith，

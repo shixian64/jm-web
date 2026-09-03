@@ -49,6 +49,15 @@ function findByText(root, label) {
   return null;
 }
 
+function findByClass(root, className) {
+  if (root instanceof FakeElement && String(root.className).split(/\s+/).includes(className)) return root;
+  for (const child of root.children || []) {
+    const found = child instanceof FakeElement ? findByClass(child, className) : null;
+    if (found) return found;
+  }
+  return null;
+}
+
 global.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
 global.document = {
   createElement: (tag) => new FakeElement(tag),
@@ -69,10 +78,15 @@ function jsonResponse(body, status = 200) {
   const advancedUrl = pathToFileURL(path.resolve(__dirname, '..', 'public', 'js', 'advanced.js')).href;
   const apiUrl = pathToFileURL(path.resolve(__dirname, '..', 'public', 'js', 'api.js')).href;
   const uiUrl = pathToFileURL(path.resolve(__dirname, '..', 'public', 'js', 'ui.js')).href;
+  const viewsUrl = pathToFileURL(path.resolve(__dirname, '..', 'public', 'js', 'views.js')).href;
   const { normalizeChapterImages, normalizeReaderSeries } = await import(readerUrl);
   const { networkView, aboutView } = await import(advancedUrl);
-  const { imgSrc, chapterImgSrc } = await import(apiUrl);
+  const {
+    COMMENT_PAGE_SIZE, imgSrc, chapterImgSrc, commentAvatarSrc, commentContentText,
+    commentPageCount, commentPageHasMore, isCommentSpoiler,
+  } = await import(apiUrl);
   const { comicCard, installImageRetry } = await import(uiUrl);
+  const { commentItem } = await import(viewsUrl);
 
   // 列表上游字段异常时，封面地址和卡片渲染都必须退化为安全空值，
   // 不能因对数字/对象调用 startsWith 或把对象直接 append 到 DOM 而中断整页。
@@ -84,6 +98,65 @@ function jsonResponse(body, status = 200) {
   assert.strictEqual(imgSrc({ image: '', AID: '88' }), '/api/img?path=%2Fmedia%2Falbums%2F88_3x4.jpg');
   assert.strictEqual(chapterImgSrc({ url: 'https://evil.example' }), '');
   assert.doesNotThrow(() => comicCard({ image: { nested: true }, name: { bad: true }, author: { bad: true }, id: 101 }));
+
+  // /forum 正文是 HTML 包装字符串，但只能以安全文本呈现；保留换行和
+  // 表情 alt，绝不能把事件属性、脚本或其它上游标签送进 innerHTML。
+  assert.strictEqual(commentContentText(
+    '<div style="flex-direction:row">第一行<br>第二行 <img src="x" onerror="alert(1)" alt=":笑:"></div>' +
+    '<script>alert("xss")</script>',
+  ), '第一行\n第二行 :笑:');
+  assert.strictEqual(commentContentText('&lt;script&gt;只应作为文字&lt;/script&gt;'), '<script>只应作为文字</script>');
+  assert.strictEqual(commentContentText({ toString: () => '<img onerror=alert(1)>' }), '');
+
+  // 当前线上协议中 1 是普通评论、2 才是官网默认隐藏的剧透评论。
+  assert.strictEqual(isCommentSpoiler('1'), false);
+  assert.strictEqual(isCommentSpoiler('2'), true);
+  assert.strictEqual(isCommentSpoiler(2), true);
+  assert.strictEqual(isCommentSpoiler(true), true);
+
+  assert.strictEqual(
+    commentAvatarSrc('15014403.jpg'),
+    '/api/img?path=%2Fmedia%2Fusers%2F15014403.jpg',
+  );
+  assert.strictEqual(
+    commentAvatarSrc('/media/users/nopic-Male.gif'),
+    '/api/img?path=%2Fmedia%2Fusers%2Fnopic-Male.gif',
+  );
+  assert.strictEqual(commentAvatarSrc('javascript:alert(1)'), '');
+  assert.strictEqual(commentAvatarSrc('../private.jpg'), '');
+
+  assert.strictEqual(COMMENT_PAGE_SIZE, 10);
+  assert.strictEqual(commentPageCount('95'), 10);
+  assert.strictEqual(commentPageCount(65), 7);
+  assert.strictEqual(commentPageHasMore({ total: 25, page: 1, itemCount: 10 }), true);
+  assert.strictEqual(commentPageHasMore({ total: 25, page: 2, itemCount: 10 }), true);
+  assert.strictEqual(commentPageHasMore({ total: 25, page: 3, itemCount: 5 }), false);
+  assert.strictEqual(commentPageHasMore({ total: 20, page: 2, itemCount: 10 }), false);
+  assert.strictEqual(commentPageHasMore({ total: '', page: 1, itemCount: 10 }), true);
+
+  // 适配函数必须真正用于漫画详情评论节点，避免帮助函数正确但渲染路径仍
+  // 继续使用原始 HTML、旧剧透值或错误头像地址。
+  const renderedComment = commentItem({
+    CID: '77', nickname: '测试用户', spoiler: '2', photo: '15014403.jpg',
+    content: '<div>安全正文<img src="x" onerror="alert(1)" alt=":笑:"></div>',
+  });
+  const renderedContent = findByClass(renderedComment, 'content');
+  const renderedAvatar = findByClass(renderedComment, 'avatar');
+  assert(renderedContent && renderedAvatar, '评论必须渲染正文和头像节点');
+  assert.strictEqual(renderedContent.textContent, '安全正文:笑:');
+  assert(String(renderedContent.className).split(/\s+/).includes('spoiler'));
+  assert.strictEqual(
+    renderedAvatar.children[0].attributes.src,
+    '/api/img?path=%2Fmedia%2Fusers%2F15014403.jpg',
+  );
+  const renderedAvatarImage = renderedAvatar.children[0];
+  renderedAvatarImage.onerror();
+  renderedAvatarImage.onerror();
+  renderedAvatarImage.onerror();
+  assert.strictEqual(renderedAvatar.textContent, '测', '头像重试耗尽后必须回退昵称首字');
+  const normalComment = commentItem({ CID: '78', spoiler: '1', content: '<div>普通评论</div>' });
+  assert(!String(findByClass(normalComment, 'content').className).split(/\s+/).includes('spoiler'));
+  assert.strictEqual(findByClass(normalComment, 'avatar').textContent, '友');
 
   // 短暂图片代理失败不应一次 onerror 就永久变成占位图；耗尽重试后才移除 src。
   const retryImage = new FakeElement('img');
