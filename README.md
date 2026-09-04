@@ -57,6 +57,8 @@ node .\server.js
 
 从其他机器迁移代码时不要一并分发现有 `data/`：其中包含服务器密钥、设置和登录会话。直接运行时程序可自动创建该目录；Compose 部署需按下文先创建并授权。只有明确进行同一实例的数据迁移时才应停服后单独、安全地复制它。`data/` 和本地 `.env` 均已从 Git 与 Docker 构建上下文排除。
 
+升级到包含会话安全修复的版本前，先备份同一实例的 `data/.secret`、`data/sessions/`、`data/settings.json` 和生产 `.env`。服务首次启动会在会话目录创建短时 `.sanitize.lock`，扫描并原子脱敏旧用户资料中的认证字段；损坏、过大或扫描期间发生变化的文件不会被覆盖。迁移统计只写入启动日志，不包含会话内容。
+
 生产环境建议用 systemd / pm2 守护：
 
 ```bash
@@ -274,6 +276,14 @@ docker compose --env-file .env.example config --quiet
 docker compose --env-file .env.example \
   -f docker-compose.yml -f docker-compose.ghcr.yml config --quiet
 ```
+
+发布不可变制品时，先完成构建，再对不含 `.git/`、`data/`、`test/`、`.env` 和日志/秘密文件的制品目录执行：
+
+```bash
+RELEASE_BUILD_STATUS=PASS npm run validate:artifact -- /path/to/release-artifact
+```
+
+校验脚本会递归检查禁止内容、Dockerfile 的运行文件清单和生产路径；未明确传入构建成功标志不会输出 `RELEASE-MANIFEST: PASS`。生产切换仍应遵循备份、隔离候选验证、健康检查、原子更新 `current` 和保留旧版本回滚的顺序。
 
 ## License
 
