@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "test": "npm run test:unit && npm run test:backend && npm run test:deployment",
-    "test:unit": "node test/photo.test.js && node test/content-filter.test.js && node test/offline-metadata.test.js && node test/navigation.test.js && node test/service-worker.test.js && node test/frontend-robustness.test.js && node test/user-list-pagination.test.js && node test/mobile-layout.test.js && node test/mobile-gate-focus.test.js && node test/clipboard-runtime.test.js && node test/home-swiper-loading.test.js && node test/reader-performance.test.js && node test/descramble-worker.test.js",
+    "test:unit": "node test/photo.test.js && node test/content-filter.test.js && node test/offline-metadata.test.js && node test/navigation.test.js && node test/service-worker.test.js && node test/frontend-robustness.test.js && node test/user-list-pagination.test.js && node test/mobile-layout.test.js && node test/mobile-gate-focus.test.js && node test/clipboard-runtime.test.js && node test/home-swiper-loading.test.js && node test/reader-performance.test.js && node test/descramble-worker.test.js && node test/chapter-ai.test.js",
     "test:backend": "node test/backend.test.js && node test/https-fetch.test.js",
     "test:deployment": "node test/deployment.test.js",
     "validate:artifact": "scripts/validate-release-artifact.sh",
@@ -16,5 +16,8 @@
   "engines": {
     "node": ">=20.0.0"
   },
-  "license": "GPL-3.0"
+  "license": "GPL-3.0",
+  "dependencies": {
+    "sharp": "^0.33.5"
+  }
 }

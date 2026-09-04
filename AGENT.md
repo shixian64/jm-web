@@ -34,7 +34,7 @@ server.js（零第三方运行依赖的 Node.js HTTP 服务）
 运行要求：
 
 - Node.js `>=20`；Docker 生产基线见 `Dockerfile`。
-- 后端无 npm 运行时依赖，不要为小功能随意引入框架或供应链依赖。
+- 后端仅为服务端章节视觉分析引入 `sharp` 图片编解码依赖；不要再为小功能随意引入框架或供应链依赖。
 - 前端无构建步骤，浏览器直接加载 `public/` 下的 ES Module。
 - SPA 使用 Hash 路由，服务端对非资源 GET 提供 `index.html` 回退。
 

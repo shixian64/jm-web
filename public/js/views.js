@@ -839,6 +839,14 @@ export async function albumView(root, id, ctx) {
   const series = (Array.isArray(data.series) ? data.series : [])
     .filter((item) => item && typeof item === 'object' && !Array.isArray(item))
     .slice().sort((a, b) => Number(a.sort) - Number(b.sort));
+  // 服务端后台视觉分析完成后，为缺少上游章节名的条目补上生成标题。
+  try {
+    const aiRows = (await api.chapterAi(id, null, ctx && ctx.signal))?.data;
+    if (Array.isArray(aiRows) && aiRows.length) {
+      const byId = new Map(aiRows.filter((x) => x?.status === 'completed' && x.generatedTitle).map((x) => [String(x.photoId), x]));
+      series.forEach((row) => { const rec = byId.get(String(row.id)); if (rec && !String(row.name || '').trim()) { row.name = rec.generatedTitle; row.aiSummary = rec.briefSummary || ''; } });
+    }
+  } catch (error) { if (isAbort(error) || isInactive(ctx)) return; }
   const relatedList = (Array.isArray(data.related_list) ? data.related_list : [])
     .filter((item) => item && typeof item === 'object' && !Array.isArray(item));
 
@@ -1027,7 +1035,9 @@ export async function albumView(root, id, ctx) {
       });
       checkboxes.push(checkbox);
       chapterList.append(h('div', { class: 'chapter-download-row' },
-        h('a', { class: 'chapter-item', href: `#/read/${chapterId}?aid=${id}` }, chapterName(s, i)),
+        h('div', null,
+          h('a', { class: 'chapter-item', href: `#/read/${chapterId}?aid=${id}` }, chapterName(s, i)),
+          s.aiSummary ? h('small', { class: 'hint', style: 'display:block;max-width:60ch' }, s.aiSummary) : null),
         h('label', { class: 'chapter-download-check', title: '选择离线下载' }, checkbox, h('span', null, '下载'))));
     });
     body.append(chapterList);

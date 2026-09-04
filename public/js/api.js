@@ -50,6 +50,7 @@ export const api = {
   promoteList: (id, page, signal) => request(`/promote_list?id=${encodeURIComponent(id)}&page=${page}`, { signal }),
   album: (id, signal) => request(`/album?id=${id}`, { signal }),
   chapter: (id, shunt, signal) => request(`/chapter?id=${id}&shunt=${shunt || 1}`, { signal }),
+  chapterAi: (aid, photoId, signal) => request(`/chapter-ai?aid=${encodeURIComponent(aid)}${photoId ? `&photoId=${encodeURIComponent(photoId)}` : ''}`, { signal }),
   search: (q, o, page, signal) => request(`/search?q=${encodeURIComponent(q)}&o=${o}&page=${page}`, { signal }),
   categories: (signal) => request('/categories', { signal }),
   categoryFilter: (c, o, page, signal) => request(`/categories_filter?c=${encodeURIComponent(c)}&o=${o}&page=${page}`, { signal }),

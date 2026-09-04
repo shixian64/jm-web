@@ -6,6 +6,8 @@ WORKDIR /app
 # 发布制品可能在严格 umask 下解包，不能继承宿主机的 root-only 模式后
 # 再交给非 root 进程读取。构建时显式把全部运行文件归 node 用户所有。
 COPY --chown=node:node package.json server.js LICENSE ./
+COPY --chown=node:node package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts=false
 COPY --chown=node:node lib ./lib
 COPY --chown=node:node public ./public
 

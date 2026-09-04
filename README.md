@@ -21,6 +21,7 @@
 - **外观与过滤**：浅色/深色/跟随系统、五套调色板与自定义四色、各页面网格列数、全局/首页标签过滤。
 - **隐私与迁移**：PIN/口令、图案锁、WebAuthn 设备验证、任一/全部验证规则、失焦伪装；JSON 或 PBKDF2 + AES-GCM 加密备份恢复。
 - **AI 与工具**：可选 OpenAI-compatible 流式对话、多会话、人格、停止/编辑/重试/详细/精简、Tavily 联网搜索；漫画编号提取及剪贴板检测。
+- **后台章节分析**：复用上述 AI 配置，按热门/访问候选自动排队；服务端顺序解扰整章图片后生成章节名、详细剧情和简洁总结，结果持久化并可通过 `/api/chapter-ai` 查询。
 - **运维**：API/图片多线路故障切换、可选 DoH 预解析与测速、运行日志、缓存维护、健康检查和 GitHub Release 更新检查。
 - **响应式体验**：手机列表支持下拉刷新与首屏骨架；桌面搜索新页面自动聚焦，触屏端等待用户主动点按以避免系统编辑浮层；桌面和手机返回/前进时均按独立路由记录恢复滚动位置。
 
@@ -185,9 +186,12 @@ docker compose --env-file .env \
 | `JMW_MAX_SEARCH_CONCURRENCY` | `8` | 联网搜索请求并发上限（范围 1–40） |
 | `JMW_TRUST_PROXY` | 空（回环默认可信） | 额外可信反向代理的精确 IP/CIDR，逗号分隔；仅用于安全解析 `X-Forwarded-For` |
 | `AI_API_KEY` | 空 | 可选：OpenAI-compatible AI Key；留空时禁用 AI 发送，不会下发浏览器 |
-| `AI_BASE_URL` | `https://api.openai.com/v1` | AI 服务基址，必须为 HTTPS；后端追加 `/chat/completions` |
-| `AI_MODEL` | `gpt-5-mini` | AI 请求使用的模型名 |
+| `AI_BASE_URL` | `https://newapi.shixian.me/v1` | AI 服务基址，必须为 HTTPS；后端追加 `/chat/completions` |
+| `AI_MODEL` | `grok-4.6` | AI 请求使用的模型名 |
 | `AI_TIMEOUT` | `120000` | 单次 AI 流式请求超时（正整数毫秒，最大 10 分钟） |
+| `CHAPTER_AI_INTERVAL_MS` | `30000` | 后台章节视觉分析轮询间隔；与用户无关 |
+| `CHAPTER_AI_CONCURRENCY` | `1` | 后台章节视觉分析全局模型并发（部署时可调，默认 1） |
+| `CHAPTER_AI_MAX_RETRIES` | `3` | 章节视觉分析失败后的最大重试次数（指数退避） |
 | `TAVILY_API_KEY` | 空 | 可选：启用 Tavily 搜索提供商；Key 仅保存在服务器 |
 | `SEARXNG_BASE_URL` | 空 | 可选：自建 SearXNG 的 HTTPS 基址，不含 `/search`；必须通过后端公网地址安全检查 |
 | `SEARCH_TIMEOUT` | `35000` | 联网搜索总时间预算（正整数毫秒，最大 60000） |

@@ -32,13 +32,14 @@ const net = require('net');
 const { URL } = require('url');
 
 const {
-  ApiError, upstreamRequest, assertPublicUrl, API_VERSION,
+  ApiError, upstreamRequest, assertPublicUrl, readResponseBuffer, API_VERSION,
   setOriginCookie,
 } = require('./lib/jm-api');
 const { parsePhotoHtml } = require('./lib/photo');
 const sessions = require('./lib/sessions');
 const settings = require('./lib/settings');
 const features = require('./lib/features');
+const { ChapterAiScheduler } = require('./lib/chapter-ai');
 
 const configuredPort = Number(process.env.PORT || 3210);
 const portIsValid = Number.isInteger(configuredPort) && configuredPort >= 1 && configuredPort <= 65535;
@@ -115,6 +116,69 @@ const MAX_AI_STREAM_BYTES = Math.min(
 let activeAiRequests = 0;
 let activeSearchRequests = 0;
 
+const chapterAi = new ChapterAiScheduler({
+  dataDir: process.env.JMW_DATA_DIR || path.join(__dirname, 'data'),
+  model: process.env.AI_MODEL || 'grok-4.6',
+  apiKey: process.env.AI_API_KEY || '',
+  baseUrl: process.env.AI_BASE_URL || 'https://newapi.shixian.me/v1',
+  intervalMs: process.env.CHAPTER_AI_INTERVAL_MS || 30000,
+  maxRetries: process.env.CHAPTER_AI_MAX_RETRIES || 3,
+  maxConcurrency: process.env.CHAPTER_AI_CONCURRENCY || 1,
+  modelTimeoutMs: process.env.AI_TIMEOUT || 120000,
+  modelFetch: features.outboundFetch,
+  discover: async (scheduler) => {
+    const jar = { cookiesByOrigin: {}, user: null, apiHost: '' };
+    const callPublic = (pathName, query = {}) => upstreamRequest({ path: pathName, query, hosts: settings.apiHostsForSource('mixed', ''), cookieHosts: settings.allDataSourceHosts(), jar, dnsLookup: features.dohLookup, fetchImpl: features.outboundFetch });
+    const feeds = await Promise.all([callPublic('/promote'), callPublic('/week')]);
+    const aids = new Set();
+    const rankWeights = new Map();
+    for (const feed of feeds) {
+      const value = feed?.data || feed;
+      const rows = Array.isArray(value) ? value : (value?.list || value?.albums || value?.items || []);
+      rows.slice(0, 20).forEach((row, index) => { const aid = String(row?.aid || row?.id || row?.AID || ''); if (/^\d{1,16}$/.test(aid)) { aids.add(aid); rankWeights.set(aid, Math.max(rankWeights.get(aid) || 0, Math.max(5, 100 - index * 4))); } });
+    }
+    scheduler.applyRankWeights(rankWeights);
+    for (const aid of [...aids].slice(0, 10)) {
+      try {
+        const out = await callPublic('/album', { id: aid });
+        const value = out?.data || out; const rows = Array.isArray(value?.series) ? value.series : [];
+        rows.slice(0, 20).forEach((row, index) => { const photoId = String(row?.id || ''); if (/^\d+$/.test(photoId)) scheduler.enqueue(aid, photoId, scheduler.priorityFor(aid) + 50 - index); });
+      } catch (_) {}
+    }
+  },
+  fetchChapter: async (aid, photoId) => {
+    const jar = { cookiesByOrigin: {}, user: null, apiHost: '' };
+    const html = await upstreamRequest({
+      path: '/chapter_view_template',
+      query: { id: photoId, app_img_shunt: '1', mode: 'vertical', page: '0', express: 'off', v: String(Math.floor(Date.now() / 1000)) },
+      hosts: settings.apiHostsForSource('mixed', ''), cookieHosts: settings.allDataSourceHosts(), jar,
+      dnsLookup: features.dohLookup, fetchImpl: features.outboundFetch,
+    });
+    const parsed = parsePhotoHtml(String(html));
+    if (parsed.imghost) settings.addImageHost(parsed.imghost);
+    let name = '';
+    try {
+      const album = await upstreamRequest({ path: '/album', query: { id: aid }, hosts: settings.apiHostsForSource('mixed', ''), cookieHosts: settings.allDataSourceHosts(), jar, dnsLookup: features.dohLookup, fetchImpl: features.outboundFetch });
+      const value = album?.data || album;
+      const rows = Array.isArray(value?.series) ? value.series : (Array.isArray(value?.chapters) ? value.chapters : []);
+      const row = rows.find((item) => String(item?.id || item?.photoId || '') === String(photoId));
+      name = String(row?.name || row?.title || '').trim();
+    } catch (_) {}
+    return { ...parsed, aid, name };
+  },
+  fetchImage: async (url) => {
+    const fetched = await fetchImageResponse(url, 30000, features.dohLookup);
+    try {
+      if (!fetched.response.ok || !fetched.response.body) throw new Error(`图片请求失败（HTTP ${fetched.response.status}）`);
+      const buffer = await readResponseBuffer(fetched.response, MAX_IMAGE_BYTES, '章节图片', fetched.signal);
+      if (!buffer.length) throw new Error('图片响应为空');
+      return buffer;
+    } finally { fetched.cleanup(); }
+  },
+  logger: (level, message) => features.addLog(level, message),
+});
+chapterAi.start();
+
 const API_METHODS = Object.freeze({
   '/config': ['GET'],
   '/config/api-host': ['POST'],
@@ -147,6 +211,8 @@ const API_METHODS = Object.freeze({
   '/setting': ['GET'],
   '/ai/config': ['GET'],
   '/ai/chat': ['POST'],
+  '/chapter-ai': ['GET'],
+  '/chapter-ai/enqueue': ['POST'],
   '/ai/search': ['POST'],
   '/doh': ['GET', 'POST'],
   '/doh/test': ['GET'],
@@ -1757,8 +1823,21 @@ async function api(req, res, u, requestSignal) {
         page: q.get('page') || '1',
       } }));
 
-    case '/album':
-      return sendJson(res, 200, await call({ path: '/album', query: { id: q.get('id') } }));
+    case '/album': {
+      const out = await call({ path: '/album', query: { id: q.get('id') } });
+      const value = out?.data || out; const aid = String(q.get('id') || '');
+      const hotPriority = chapterAi.touchPopularity(aid, { weight: 1 });
+      const rows = Array.isArray(value?.series) ? value.series : [];
+      rows.forEach((row, index) => { const photoId = String(row?.id || ''); if (/^\d+$/.test(photoId)) { try { chapterAi.enqueue(aid, photoId, hotPriority + Math.max(10, 100 - index)); } catch (_) {} } });
+      if (Array.isArray(value?.series)) {
+        value.series = value.series.map((row) => {
+          const rec = chapterAi.get(aid, String(row?.id || ''));
+          if (rec?.status === 'completed' && !String(row?.name || '').trim() && rec.generatedTitle) return { ...row, name: rec.generatedTitle, aiTitle: rec.generatedTitle, aiSummary: rec.briefSummary || '' };
+          return row;
+        });
+      }
+      return sendJson(res, 200, out);
+    }
 
     case '/search':
       return sendJson(res, 200, await call({ path: '/search', query: {
@@ -2017,6 +2096,8 @@ async function api(req, res, u, requestSignal) {
         throw new ApiError(e.message || '解析章节 HTML 失败', 502);
       }
       if (parsed.imghost) settings.addImageHost(parsed.imghost);
+      // 用户访问章节即记录为后台候选；不绑定用户身份，按访问自然提升优先级。
+      try { const aid = parsed.aid || id; const hotPriority = chapterAi.touchPopularity(aid, { photoId: id, weight: 2 }); chapterAi.enqueue(aid, id, hotPriority + 100); } catch (_) {}
       return sendJson(res, 200, { code: 200, data: parsed });
     }
 
@@ -2051,7 +2132,24 @@ async function api(req, res, u, requestSignal) {
 
     /* ---- 高级功能 ---- */
     case '/ai/config':
-      return sendJson(res, 200, features.aiConfig());
+      return sendJson(res, 200, { ...features.aiConfig(), chapterAnalysis: chapterAi.config() });
+
+    case '/chapter-ai': {
+      const aid = q.get('aid'); const photoId = q.get('photoId');
+      if (!/^\d{1,16}$/.test(String(aid || ''))) return sendJson(res, 400, { error: '缺少合法的 aid' });
+      if (photoId == null || photoId === '') {
+        return sendJson(res, 200, { data: Object.values(chapterAi.state.records).filter((x) => String(x.aid) === String(aid)) });
+      }
+      if (!/^\d{1,16}$/.test(String(photoId))) return sendJson(res, 400, { error: '章节 ID 不合法' });
+      return sendJson(res, 200, { data: chapterAi.get(aid, photoId) });
+    }
+
+    case '/chapter-ai/enqueue': {
+      const body = await readJsonBody(req);
+      const aid = String(body.aid || ''); const photoId = String(body.photoId || '');
+      if (!/^\d{1,16}$/.test(aid) || !/^\d{1,16}$/.test(photoId)) return sendJson(res, 400, { error: '漫画或章节 ID 不合法' });
+      return sendJson(res, 202, { data: chapterAi.enqueue(aid, photoId, Number(body.priority) || 0) });
+    }
 
     case '/ai/chat': {
       if (!rateLimit(`ai:${clientIp(req)}`, 30, 5 * 60 * 1000) ||
