@@ -50,6 +50,7 @@ if (process.env.PORT && !portIsValid) {
 const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const ACCESS_PASSWORD = process.env.ACCESS_PASSWORD || '';
+const MIN_ACCESS_PASSWORD_BYTES = 16;
 
 // 逗号分隔的可信反代 IP/CIDR。环回对端默认作为本机反代信任；
 // 其他直连客户即使伪造 X-Forwarded-For 也不会被采信。
@@ -162,6 +163,10 @@ if (nodeMajor < 20 || typeof fetch !== 'function') {
 }
 if (!ACCESS_PASSWORD) {
   console.warn('[警告] 未设置 ACCESS_PASSWORD：普通功能不受口令保护；运维日志和全局 DoH 仅允许无反代的直接回环访问，容器/反代部署需配置口令');
+} else if (Buffer.byteLength(ACCESS_PASSWORD, 'utf8') < MIN_ACCESS_PASSWORD_BYTES) {
+  // 不在日志中输出口令或实际长度；保留启动以便管理员通过健康检查进入并
+  // 轮换配置，但明确标记为不可接受的生产安全基线。
+  console.error(`[严重警告] ACCESS_PASSWORD 必须至少 ${MIN_ACCESS_PASSWORD_BYTES} 字节，请在发布前轮换为高熵随机口令`);
 }
 
 // 环境变量指定的 API 域名优先级最高且锁定（仅内存，不写入设置文件）
@@ -531,6 +536,30 @@ function checkOperationalAccess(req) {
 
 /* ----------------------------- 图片代理 ----------------------------- */
 
+function imageTrace(res) {
+  return res && res.jmwImageTrace && typeof res.jmwImageTrace === 'object'
+    ? res.jmwImageTrace : null;
+}
+
+function addImageTraceDuration(trace, key, started) {
+  if (!trace) return;
+  trace[key] = Math.max(0, Number(trace[key]) || 0) + Math.max(0, Date.now() - started);
+}
+
+function hostnameOnly(value) {
+  try { return new URL(String(value || '')).hostname.toLowerCase().slice(0, 253); } catch (_) { return ''; }
+}
+
+function setImageTraceHost(trace, value) {
+  if (trace) trace.upstream_host = hostnameOnly(value);
+}
+
+function taggedImageError(message, code, type, options) {
+  const error = new ApiError(message, code, options);
+  error.imageFailureType = type;
+  return error;
+}
+
 function clientDisconnectError() {
   const error = new Error('客户端已断开');
   error.code = 'JMW_CLIENT_DISCONNECTED';
@@ -764,7 +793,9 @@ function linkedTimeoutSignal(timeoutMs, parentSignal) {
     else parentSignal.addEventListener('abort', onParentAbort, { once: true });
   }
   const timer = setTimeout(() => {
-    if (!controller.signal.aborted) controller.abort(new ApiError('图片获取超时', 504));
+    if (!controller.signal.aborted) {
+      controller.abort(taggedImageError('图片获取超时', 504, 'timeout'));
+    }
   }, ms);
   return {
     signal: controller.signal,
@@ -842,6 +873,11 @@ function cacheKeyForFetchedImage(requestedKey, finalUrl) {
 
 function sendCachedImage(res, entry, cacheDays) {
   if (!entry || res.destroyed) return false;
+  const trace = imageTrace(res);
+  if (trace) {
+    trace.cache_hit = true;
+    trace.bytes = entry.body.length;
+  }
   res.writeHead(200, baseHeaders({
     'Cache-Control': imageCacheControl(cacheDays),
     'Content-Type': entry.mime,
@@ -880,18 +916,29 @@ async function serveImageCacheFlight(res, key, cacheDays, signal) {
 }
 
 /** 手动跟随重定向，每一跳都重新验证 HTTPS 与精确 origin 白名单。 */
-async function fetchImageResponse(urlStr, timeoutMs, dnsLookup, clientSignal) {
+async function fetchImageResponse(urlStr, timeoutMs, dnsLookup, clientSignal, trace) {
   let current = validateImageUrl(urlStr);
   // 预检和实际 socket 使用同一个 resolver。outboundFetch 还会再次校验并把
   // 第二次得到的安全地址集固定给 TLS 连接，以消除校验后的 DNS TOCTOU。
   const effectiveLookup = dnsLookup || features.dohLookup;
   const deadline = Date.now() + timeoutMs;
   for (let hop = 0; hop <= MAX_IMAGE_REDIRECTS; hop++) {
+    setImageTraceHost(trace, current);
     throwIfAborted(clientSignal);
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new ApiError('图片获取超时', 504);
     // 紧邻 fetch 对每一跳的当前 DNS A/AAAA 做非公网拒绝。
-    await assertPublicUrl(current, effectiveLookup, remaining, clientSignal);
+    const dnsStarted = Date.now();
+    try {
+      await assertPublicUrl(current, effectiveLookup, remaining, clientSignal);
+    } catch (error) {
+      if (error && !error.imageFailureType && /DNS|解析|地址族/.test(String(error.message || ''))) {
+        error.imageFailureType = 'dns';
+      }
+      throw error;
+    } finally {
+      addImageTraceDuration(trace, 'dns_ms', dnsStarted);
+    }
     throwIfAborted(clientSignal);
     const fetchRemaining = deadline - Date.now();
     if (fetchRemaining <= 0) throw new ApiError('图片获取超时', 504);
@@ -903,6 +950,7 @@ async function fetchImageResponse(urlStr, timeoutMs, dnsLookup, clientSignal) {
         signal: linked.signal,
         redirect: 'manual',
         jmwLookup: effectiveLookup,
+        jmwTrace: trace,
       });
     } catch (e) {
       linked.cleanup();
@@ -913,28 +961,28 @@ async function fetchImageResponse(urlStr, timeoutMs, dnsLookup, clientSignal) {
       const location = response.headers.get('location');
       await cancelBody(response);
       linked.cleanup();
-      if (!location) throw new ApiError('图片重定向缺少 Location', 502);
-      if (hop >= MAX_IMAGE_REDIRECTS) throw new ApiError('图片重定向次数过多', 502);
+      if (!location) throw taggedImageError('图片重定向缺少 Location', 502, 'redirect');
+      if (hop >= MAX_IMAGE_REDIRECTS) throw taggedImageError('图片重定向次数过多', 502, 'redirect');
       current = validateImageUrl(new URL(location, current));
       continue;
     }
     return { response, finalUrl: current, signal: linked.signal, cleanup: linked.cleanup };
   }
-  throw new ApiError('图片重定向次数过多', 502);
+  throw taggedImageError('图片重定向次数过多', 502, 'redirect');
 }
 
 async function rasterResponseInfo(response) {
   const mime = (response.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
   if (!SAFE_RASTER_MIME.has(mime)) {
     await cancelBody(response);
-    throw new ApiError(`上游返回了非安全栅格图片类型：${mime || '未知'}`, 415);
+    throw taggedImageError(`上游返回了非安全栅格图片类型：${mime || '未知'}`, 415, 'mime');
   }
-  if (!response.body) throw new ApiError('上游图片响应为空', 502);
+  if (!response.body) throw taggedImageError('上游图片响应为空', 502, 'upstream_body');
   const lengthHeader = response.headers.get('content-length');
   const declared = lengthHeader === null ? NaN : Number(lengthHeader);
   if (Number.isFinite(declared) && declared > MAX_IMAGE_BYTES) {
     await cancelBody(response);
-    throw new ApiError(`图片超过 ${Math.floor(MAX_IMAGE_BYTES / 1024 / 1024)} MiB 上限`, 413);
+    throw taggedImageError(`图片超过 ${Math.floor(MAX_IMAGE_BYTES / 1024 / 1024)} MiB 上限`, 413, 'too_large');
   }
   return { mime };
 }
@@ -953,14 +1001,14 @@ async function readRasterImage(response) {
       total += value.byteLength;
       if (total > MAX_IMAGE_BYTES) {
         await reader.cancel();
-        throw new ApiError(`图片超过 ${Math.floor(MAX_IMAGE_BYTES / 1024 / 1024)} MiB 上限`, 413);
+        throw taggedImageError(`图片超过 ${Math.floor(MAX_IMAGE_BYTES / 1024 / 1024)} MiB 上限`, 413, 'too_large');
       }
       chunks.push(Buffer.from(value));
     }
   } catch (e) {
     try { await reader.cancel(); } catch (_) {}
     if (e instanceof ApiError) throw e;
-    throw new ApiError('读取上游图片失败：' + e.message, 502);
+    throw taggedImageError('读取上游图片失败', 502, 'body', { cause: e });
   }
   return { mime, body: Buffer.concat(chunks, total) };
 }
@@ -1022,10 +1070,16 @@ async function sendUpstreamImage(
   const onClose = () => {
     if (res.writableEnded) return;
     clientClosed = true;
+    const trace = imageTrace(res);
+    if (trace) trace.client_aborted = true;
     reader.cancel().catch(() => {});
   };
   const onAbort = () => {
-    if (isClientDisconnectError(requestSignal.reason)) clientClosed = true;
+    if (isClientDisconnectError(requestSignal.reason)) {
+      clientClosed = true;
+      const trace = imageTrace(res);
+      if (trace) trace.client_aborted = true;
+    }
     reader.cancel().catch(() => {});
   };
   res.once('close', onClose);
@@ -1043,9 +1097,11 @@ async function sendUpstreamImage(
     if (clientClosed) return;
     if (!part.done) {
       total += part.value.byteLength;
+      const trace = imageTrace(res);
+      if (trace) trace.bytes = total;
       if (total > MAX_IMAGE_BYTES) {
         await reader.cancel();
-        throw new ApiError(`图片超过 ${Math.floor(MAX_IMAGE_BYTES / 1024 / 1024)} MiB 上限`, 413);
+        throw taggedImageError(`图片超过 ${Math.floor(MAX_IMAGE_BYTES / 1024 / 1024)} MiB 上限`, 413, 'too_large');
       }
     }
 
@@ -1058,6 +1114,8 @@ async function sendUpstreamImage(
 
     while (!part.done) {
       const chunk = Buffer.from(part.value);
+      const trace = imageTrace(res);
+      if (trace) trace.bytes = total;
       if (cacheable) {
         cacheTotal += chunk.length;
         if (cacheTotal <= MAX_IMAGE_CACHE_ENTRY_BYTES) cacheChunks.push(chunk);
@@ -1074,9 +1132,11 @@ async function sendUpstreamImage(
       if (clientClosed) return;
       if (!part.done) {
         total += part.value.byteLength;
+        const trace = imageTrace(res);
+        if (trace) trace.bytes = total;
         if (total > MAX_IMAGE_BYTES) {
           await reader.cancel();
-          throw new ApiError(`图片超过 ${Math.floor(MAX_IMAGE_BYTES / 1024 / 1024)} MiB 上限`, 413);
+          throw taggedImageError(`图片超过 ${Math.floor(MAX_IMAGE_BYTES / 1024 / 1024)} MiB 上限`, 413, 'too_large');
         }
       }
     }
@@ -1090,7 +1150,9 @@ async function sendUpstreamImage(
     try { await reader.cancel(); } catch (_) {}
     if (clientClosed) return;
     if (e instanceof ApiError) throw e;
-    throw new ApiError('读取上游图片失败：' + e.message, 502);
+    // 保留底层错误类型供调用方区分（HTTP 层会统一脱敏）；不直接把该
+    // message 写入图片完成日志或返回浏览器。
+    throw taggedImageError(`读取上游图片失败：${e.message || '响应流异常'}`, 502, 'body', { cause: e });
   } finally {
     res.off('close', onClose);
     if (requestSignal) requestSignal.removeEventListener('abort', onAbort);
@@ -1106,6 +1168,141 @@ function publicErrorMessage(error, fallback) {
   return error instanceof ApiError && error.expose === true
     ? (error.publicMessage || error.message || fallback)
     : fallback;
+}
+
+const IMAGE_HOST_FAILURE_BASE_MS = 5000;
+const IMAGE_HOST_FAILURE_MAX_MS = 2 * 60 * 1000;
+const IMAGE_HOST_HEALTH_LIMIT = 200;
+const imageHostHealth = new Map();
+const TRANSIENT_IMAGE_FAILURES = new Set([
+  'dns', 'connect', 'tls', 'timeout', 'network', 'http_retryable', 'http_429', 'http_5xx',
+]);
+
+function underlyingErrorCode(error) {
+  let current = error;
+  for (let depth = 0; current && depth < 4; depth++, current = current.cause) {
+    const code = String(current.code || '').toUpperCase();
+    if (/^[A-Z0-9_]{1,64}$/.test(code)) return code;
+  }
+  return '';
+}
+
+function classifyImageFailure(errorOrStatus) {
+  if (typeof errorOrStatus === 'number') {
+    if (errorOrStatus === 408 || errorOrStatus === 425) return 'http_retryable';
+    if (errorOrStatus === 429) return 'http_429';
+    if (errorOrStatus >= 500) return 'http_5xx';
+    return errorOrStatus >= 400 ? 'upstream_http' : '';
+  }
+  const error = errorOrStatus || {};
+  if (error.imageFailureType && error.imageFailureType !== 'body') return error.imageFailureType;
+  const code = underlyingErrorCode(error);
+  if (['EAI_AGAIN', 'ENOTFOUND', 'ENODATA', 'EAI_FAIL'].includes(code)) return 'dns';
+  if (code === 'ETIMEDOUT' || code === 'ESOCKETTIMEDOUT' || code === 'UND_ERR_CONNECT_TIMEOUT') return 'timeout';
+  if (/^(?:ERR_TLS_|CERT_|DEPTH_ZERO_SELF_SIGNED_CERT|UNABLE_TO_VERIFY_LEAF_SIGNATURE)/.test(code)) return 'tls';
+  if ([
+    'ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE',
+    'ERR_SOCKET_CLOSED', 'UND_ERR_SOCKET',
+  ].includes(code)) return 'connect';
+  if (error.imageFailureType) return error.imageFailureType;
+  const status = imageErrorStatus(error);
+  if (status === 408 || status === 425 || status === 504) return 'timeout';
+  if (status === 429) return 'http_429';
+  if (status >= 500) return 'http_5xx';
+  if (status === 413) return 'too_large';
+  if (status === 415) return 'mime';
+  if (status === 400 || status === 403) return 'security';
+  return 'internal';
+}
+
+function isTransientImageFailure(errorOrStatus) {
+  return TRANSIENT_IMAGE_FAILURES.has(classifyImageFailure(errorOrStatus));
+}
+
+function normalizedImageHost(host) {
+  return settings.normalizeHost(String(host || ''));
+}
+
+function pruneImageHostHealth() {
+  while (imageHostHealth.size > IMAGE_HOST_HEALTH_LIMIT) {
+    imageHostHealth.delete(imageHostHealth.keys().next().value);
+  }
+}
+
+/** 指数退避开启熔断；到期后只允许一个半开探测请求。 */
+function markImageHostFailed(host, errorOrStatus, ttlMs) {
+  const normalized = normalizedImageHost(host);
+  if (!normalized || !isTransientImageFailure(errorOrStatus)) return false;
+  const previous = imageHostHealth.get(normalized);
+  const failures = Math.min(8, Math.max(0, Number(previous?.failures) || 0) + 1);
+  const exponential = Math.min(IMAGE_HOST_FAILURE_MAX_MS, IMAGE_HOST_FAILURE_BASE_MS * (2 ** (failures - 1)));
+  const delay = ttlMs === undefined ? exponential : Math.max(1000, Math.min(IMAGE_HOST_FAILURE_MAX_MS, Number(ttlMs) || 0));
+  imageHostHealth.delete(normalized);
+  imageHostHealth.set(normalized, {
+    failures,
+    openUntil: Date.now() + delay,
+    probeInFlight: false,
+  });
+  pruneImageHostHealth();
+  return true;
+}
+
+function markImageHostHealthy(host) {
+  const normalized = normalizedImageHost(host);
+  if (normalized) imageHostHealth.delete(normalized);
+}
+
+function releaseImageHostProbe(host) {
+  const normalized = normalizedImageHost(host);
+  const health = normalized && imageHostHealth.get(normalized);
+  if (health && health.probeInFlight) health.probeInFlight = false;
+}
+
+function clearImageHostHealth() {
+  imageHostHealth.clear();
+}
+
+function reserveImageHost(host, now = Date.now()) {
+  const normalized = normalizedImageHost(host);
+  if (!normalized) return false;
+  const health = imageHostHealth.get(normalized);
+  if (!health) return true;
+  if (now < health.openUntil || health.probeInFlight) return false;
+  health.probeInFlight = true;
+  return true;
+}
+
+function noteImageAttempt(trace, attempts) {
+  if (trace) trace.retry_count = Math.max(0, attempts - 1);
+}
+
+function noteImageFailure(res, errorOrStatus) {
+  const trace = imageTrace(res);
+  const type = classifyImageFailure(errorOrStatus);
+  if (trace) trace.error_type = type;
+  if (typeof errorOrStatus === 'number') return type;
+  if (errorOrStatus instanceof ApiError && errorOrStatus.expose === true) return type;
+  const code = underlyingErrorCode(errorOrStatus);
+  const fields = [
+    `request_id=${trace?.request_id || 'unknown'}`,
+    `error_type=${type}`,
+    `upstream_host=${trace?.upstream_host || ''}`,
+  ];
+  if (code) fields.push(`error_code=${code}`);
+  // 不输出 Error 对象或 message；其中可能包含签名 URL、查询参数或内部地址。
+  console.error(`[image] ${fields.join(' ')}`);
+  return type;
+}
+
+function imageUrlCandidates(value) {
+  const original = validateImageUrl(value);
+  const candidates = [original];
+  for (const host of settings.imageHosts()) {
+    if (host === original.origin) continue;
+    const candidate = new URL(`${original.pathname}${original.search}`, host);
+    candidates.push(validateImageUrl(candidate));
+  }
+  return candidates;
 }
 
 async function proxyImage(res, urlStr, cacheDays = 7, clientSignal) {
@@ -1128,44 +1325,89 @@ async function proxyImage(res, urlStr, cacheDays = 7, clientSignal) {
       cacheFlight = claim.flight;
     }
   }
-  let fetched;
+  const trace = imageTrace(res);
+  const deadline = Date.now() + IMAGE_PATH_TOTAL_TIMEOUT;
+  let attempts = 0;
+  let lastError = null;
+  let lastStatus = 502;
   try {
-    fetched = await fetchImageResponse(urlStr, 30000, undefined, clientSignal);
-    const { response } = fetched;
-    if (!response.ok || !response.body) {
-      await cancelBody(response);
-      return sendJson(res, 502, { error: `图片获取失败（HTTP ${response.status}）` });
+    for (const target of imageUrlCandidates(urlStr)) {
+      if ((clientSignal && clientSignal.aborted) || res.destroyed) return;
+      const host = target.origin;
+      if (!reserveImageHost(host)) continue;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        releaseImageHostProbe(host);
+        lastError = taggedImageError('图片获取总时间已超限', 504, 'timeout');
+        lastStatus = 504;
+        break;
+      }
+      attempts++;
+      noteImageAttempt(trace, attempts);
+      setImageTraceHost(trace, target);
+      let fetched;
+      let hostHealthy = false;
+      try {
+        fetched = await fetchImageResponse(
+          target, Math.min(8000, remaining), undefined, clientSignal, trace,
+        );
+        const { response } = fetched;
+        if (!response.ok || !response.body) {
+          await cancelBody(response);
+          lastError = response.status;
+          noteImageFailure(res, response.status);
+          if (isTransientImageFailure(response.status)) {
+            markImageHostFailed(host, response.status);
+            continue;
+          }
+          markImageHostHealthy(host);
+          return sendJson(res, 502, { error: `图片获取失败（HTTP ${response.status}）` });
+        }
+        if (trace) trace.error_type = '';
+        await sendUpstreamImage(
+          res, response, cacheDays, fetched.signal, IMAGE_DRAIN_TIMEOUT,
+          cacheKeyForFetchedImage(cacheKey, fetched.finalUrl),
+        );
+        markImageHostHealthy(host);
+        hostHealthy = true;
+        settings.setPreferredImageHost(host);
+        return;
+      } catch (error) {
+        if ((clientSignal && clientSignal.aborted) || isClientDisconnectError(error) || res.destroyed) return;
+        lastError = error;
+        lastStatus = imageErrorStatus(error);
+        noteImageFailure(res, error);
+        if (res.headersSent) {
+          if (isTransientImageFailure(error)) markImageHostFailed(host, error);
+          if (!res.destroyed) res.destroy();
+          return;
+        }
+        if (isTransientImageFailure(error)) {
+          markImageHostFailed(host, error);
+          continue;
+        }
+        markImageHostHealthy(host);
+        return sendJson(res, lastStatus, { error: publicErrorMessage(error, '图片获取失败') });
+      } finally {
+        if (fetched) fetched.cleanup();
+        if (!hostHealthy) releaseImageHostProbe(host);
+      }
     }
-    await sendUpstreamImage(
-      res, response, cacheDays, fetched.signal, IMAGE_DRAIN_TIMEOUT,
-      cacheKeyForFetchedImage(cacheKey, fetched.finalUrl),
-    );
-  } catch (e) {
-    if ((clientSignal && clientSignal.aborted) || isClientDisconnectError(e) || res.destroyed) return;
-    if (!(e instanceof ApiError) || e.expose !== true) console.error('[image] 内部错误:', e);
-    if (!res.headersSent) sendJson(res, imageErrorStatus(e), {
-      error: publicErrorMessage(e, '图片获取失败'),
+    if ((clientSignal && clientSignal.aborted) || res.destroyed) return;
+    if (!attempts && trace) trace.error_type = 'circuit_open';
+    if (!res.headersSent) sendJson(res, lastStatus, {
+      error: publicErrorMessage(lastError, '图片获取失败'),
+    });
+  } catch (error) {
+    if ((clientSignal && clientSignal.aborted) || isClientDisconnectError(error) || res.destroyed) return;
+    noteImageFailure(res, error);
+    if (!res.headersSent) sendJson(res, imageErrorStatus(error), {
+      error: publicErrorMessage(error, '图片获取失败'),
     });
     else res.destroy();
   } finally {
-    if (fetched) fetched.cleanup();
     if (cacheFlight) finishImageCacheFlight(cacheKey, cacheFlight, getImageCache(cacheKey));
   }
-}
-
-// 图片路径代理：按域名列表依次尝试，临时失败域名短时间跳过（负缓存）
-const imageHostFailedUntil = new Map();
-
-function isTransientImageFailure(errorOrStatus) {
-  const status = typeof errorOrStatus === 'number'
-    ? errorOrStatus
-    : imageErrorStatus(errorOrStatus);
-  return status === 408 || status === 425 || status === 429 || status >= 500;
-}
-
-function markImageHostFailed(host, errorOrStatus, ttlMs = 30 * 1000) {
-  if (!isTransientImageFailure(errorOrStatus)) return;
-  imageHostFailedUntil.set(host, Date.now() + Math.max(1000, ttlMs));
 }
 
 /** path 形式：在图片域名列表中依次尝试（记住成功的域名） */
@@ -1191,10 +1433,12 @@ async function proxyImagePath(res, p, clientSignal) {
   }
   try {
     const hosts = settings.imageHosts();
+    const trace = imageTrace(res);
     const now = Date.now();
     const deadline = now + IMAGE_PATH_TOTAL_TIMEOUT;
     let lastError = '所有图片域名均无法获取该资源';
     let lastStatus = 502;
+    let attempts = 0;
     for (const host of hosts) {
       if (clientSignal && clientSignal.aborted) return;
       const remaining = deadline - Date.now();
@@ -1203,51 +1447,68 @@ async function proxyImagePath(res, p, clientSignal) {
         lastStatus = 504;
         break;
       }
-      const failedAt = imageHostFailedUntil.get(host);
-      if (failedAt && Date.now() < failedAt) continue;
+      if (!reserveImageHost(host)) continue;
+      attempts++;
+      noteImageAttempt(trace, attempts);
+      setImageTraceHost(trace, host);
       let fetched;
+      let hostHealthy = false;
       try {
         const target = host.replace(/\/+$/, '') + p;
-        fetched = await fetchImageResponse(target, Math.min(8000, remaining), undefined, clientSignal);
+        fetched = await fetchImageResponse(target, Math.min(8000, remaining), undefined, clientSignal, trace);
         const { response } = fetched;
         if (!response.ok || !response.body) {
           lastError = `HTTP ${response.status}`;
           await cancelBody(response);
-          markImageHostFailed(host, response.status, response.status === 429 ? 45 * 1000 : 20 * 1000);
+          noteImageFailure(res, response.status);
+          if (isTransientImageFailure(response.status)) markImageHostFailed(host, response.status);
+          else markImageHostHealthy(host);
           continue;
         }
+        if (trace) trace.error_type = '';
         await sendUpstreamImage(
           res, response, 1, fetched.signal, IMAGE_DRAIN_TIMEOUT,
           cacheKeyForFetchedImage(cacheKey, fetched.finalUrl),
         );
-        imageHostFailedUntil.delete(host);
+        markImageHostHealthy(host);
+        hostHealthy = true;
         settings.setPreferredImageHost(host);
         return;
       } catch (e) {
         if ((clientSignal && clientSignal.aborted) || isClientDisconnectError(e) || res.destroyed) return;
         // 流式转发已发出 200 后无法再切换域名或改写 JSON 错误。
         if (res.headersSent) {
+          noteImageFailure(res, e);
+          if (isTransientImageFailure(e)) markImageHostFailed(host, e);
           if (!res.destroyed) res.destroy();
           return;
         }
         if (!(e instanceof ApiError) || e.expose !== true) {
-          console.error('[image] 内部错误:', e);
+          noteImageFailure(res, e);
           lastError = '图片获取失败';
         } else {
+          noteImageFailure(res, e);
           lastError = publicErrorMessage(e, lastError);
         }
         lastStatus = imageErrorStatus(e);
         // 网络、超时、上游 5xx/429 才进入短负缓存；MIME/重定向安全拒绝
         // 不污染域名健康状态，避免误伤其他正常资源。
-        markImageHostFailed(host, e);
+        if (isTransientImageFailure(e)) markImageHostFailed(host, e);
+        else markImageHostHealthy(host);
         /* 尝试下一个域名 */
       } finally {
         if (fetched) fetched.cleanup();
+        if (!hostHealthy) releaseImageHostProbe(host);
       }
     }
     if ((clientSignal && clientSignal.aborted) || res.destroyed) return;
-    if (imageHostFailedUntil.size > 200) imageHostFailedUntil.clear();
-    sendJson(res, lastStatus, { error: lastError });
+    if (!attempts && trace) trace.error_type = 'circuit_open';
+    // 网络线路耗尽或熔断时只返回稳定文案；不把上游状态、内部错误或 URL
+    // 细节暴露给浏览器。资源明确存在但被上游拒绝的 4xx 仍保留简短状态。
+    const publicLastError = lastStatus >= 500
+      ? '图片获取失败'
+      : (typeof lastError === 'string' ? lastError : '图片获取失败');
+    sendJson(res, lastStatus, { error: publicLastError });
   } finally {
     if (cacheFlight) finishImageCacheFlight(cacheKey, cacheFlight, getImageCache(cacheKey));
   }
@@ -1295,11 +1556,19 @@ async function proxyEventStream(res, response, signal) {
 async function api(req, res, u, requestSignal) {
   const route = u.pathname.replace(/^\/api/, '');
   const q = u.searchParams;
-  // /api/auth 在口令验证前调用：避免未通过口令的扫描请求也创建会话文件
-  const jar = route === '/auth' ? { cookiesByOrigin: {}, user: null, apiHost: '' } : ensureJar(req, res);
+  // /api/auth 在口令验证前调用；/api/img 只依赖站点门禁和服务端图片白名单。
+  // 两者都不创建 JM Session，避免首屏并发图片生成大量空 jmw_sid 文件。
+  const stateless = route === '/auth' || route === '/img';
+  const jar = stateless ? { cookiesByOrigin: {}, user: null, apiHost: '' } : ensureJar(req, res);
 
   // 数据源由浏览器设置选择，但只能是固定枚举；实际 origin 始终来自服务端白名单。
   const dataSource = settings.normalizeDataSource(String(req.headers['x-jmw-data-source'] || 'mixed'));
+  if (route !== '/img' && route !== '/auth') {
+    req.jmwApiTrace = {
+      request_id: crypto.randomBytes(8).toString('hex'),
+      upstream_host: '', retry_count: 0, attempts: 0, upstream_ms: 0, error_type: '',
+    };
+  }
   // 透传到上游的快捷封装（会话内 API 域名覆盖优先）。成功响应会记住
   // 实际成功的精确 origin；登录可能走备用域名，后续请求必须继续使用同一
   // origin，避免 Cookie 按域隔离后再次落到没有 AVS 的线路。
@@ -1313,9 +1582,17 @@ async function api(req, res, u, requestSignal) {
       fetchImpl: features.outboundFetch,
       signal: requestSignal,
       ...rest,
+      trace: req.jmwApiTrace,
       onSuccess: async (meta) => {
         let changed = false;
         const origin = settings.normalizeHost(meta && meta.origin);
+        req.jmwApiTrace = req.jmwApiTrace || {};
+        Object.assign(req.jmwApiTrace, {
+          upstream_host: hostnameOnly(origin),
+          retry_count: Math.max(0, Number(meta && meta.index) || 0),
+          upstream_ms: Math.max(0, Number(meta && meta.durationMs) || Number(req.jmwApiTrace.upstream_ms) || 0),
+          error_type: '',
+        });
         if (origin && settings.isTrustedApiHost(origin) && jar.apiHost !== origin) {
           jar.apiHost = origin;
           changed = true;
@@ -1755,9 +2032,13 @@ async function api(req, res, u, requestSignal) {
         sendCachedImage(res, cached, abs ? 30 : 1);
         return;
       }
+      const trace = imageTrace(res);
+      const queueStarted = Date.now();
       const releaseImageSlot = await waitForImageRequestSlot(clientIp(req), requestSignal);
+      addImageTraceDuration(trace, 'queue_ms', queueStarted);
       if (!releaseImageSlot) {
         if (requestSignal.aborted || res.destroyed) return;
+        if (trace) trace.error_type = 'queue';
         return sendJson(res, 503, { error: '图片代理并发请求过多，请稍后重试' }, { 'Retry-After': '1' });
       }
       try {
@@ -1848,7 +2129,7 @@ async function api(req, res, u, requestSignal) {
       try {
         if (out && out.data && out.data.img_host) {
           const host = settings.normalizeHost(String(out.data.img_host));
-          if (host) settings.set({ imgHost: host });
+          if (host && settings.isKnownImageHost(host)) settings.set({ imgHost: host });
         }
       } catch (_) {}
       return sendJson(res, 200, out);
@@ -1955,6 +2236,34 @@ function serveStatic(req, res, u) {
 
 /* ----------------------------- 服务器 ----------------------------- */
 
+function imageCompletionMeta(trace, res, started, clientClosed = false) {
+  if (clientClosed) {
+    trace.client_aborted = true;
+    if (!trace.error_type) trace.error_type = 'client_aborted';
+  }
+  const status = clientClosed && !res.headersSent ? 499 : Number(res.statusCode || 0);
+  if (!trace.error_type && status >= 400) {
+    trace.error_type = status === 401 ? 'access_auth' : status >= 500 ? 'upstream_error' : 'client_error';
+  }
+  const metric = (key) => Math.max(0, Math.round(Number(trace[key]) || 0));
+  return {
+    request_id: trace.request_id,
+    status,
+    duration_ms: Math.max(0, Date.now() - started),
+    upstream_host: trace.upstream_host || '',
+    error_type: trace.error_type || '',
+    dns_ms: metric('dns_ms'),
+    connect_ms: metric('connect_ms'),
+    tls_ms: metric('tls_ms'),
+    ttfb_ms: metric('ttfb_ms'),
+    retry_count: metric('retry_count'),
+    queue_ms: metric('queue_ms'),
+    cache_hit: trace.cache_hit === true,
+    bytes: metric('bytes'),
+    client_aborted: trace.client_aborted === true,
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   const started = Date.now();
   let u;
@@ -1964,14 +2273,49 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(400, baseHeaders({ 'Content-Type': 'text/plain; charset=utf-8' }));
     return res.end('Bad Request');
   }
-  res.on('finish', () => {
-    if (u.pathname.startsWith('/api/') && u.pathname !== '/api/img') {
+  if (u.pathname === '/api/img') {
+    res.jmwImageTrace = {
+      request_id: crypto.randomBytes(8).toString('hex'),
+      upstream_host: '', error_type: '', dns_ms: 0, connect_ms: 0, tls_ms: 0,
+      ttfb_ms: 0, retry_count: 0, queue_ms: 0, cache_hit: false, bytes: 0,
+      client_aborted: false,
+    };
+    let imageLogged = false;
+    const writeImageLog = (clientClosed) => {
+      if (imageLogged) return;
+      imageLogged = true;
+      const meta = imageCompletionMeta(res.jmwImageTrace, res, started, clientClosed);
+      const message = `${req.method} /api/img -> ${meta.status} (${meta.duration_ms}ms)`;
+      const level = meta.status >= 500 || meta.status === 499 ? 'error' : meta.status >= 400 ? 'warn' : 'info';
+      console.log(`[image] ${JSON.stringify(meta)}`);
+      features.addLog(level, message, meta);
+    };
+    res.once('finish', () => writeImageLog(false));
+    res.once('close', () => writeImageLog(!res.writableEnded));
+  } else {
+    res.on('finish', () => {
+      if (u.pathname.startsWith('/api/')) {
       // 查询参数可能包含搜索词、用户标识或临时凭据；访问日志只记录路由。
-      const message = `${req.method} ${u.pathname} -> ${res.statusCode} (${Date.now() - started}ms)`;
+      const trace = req.jmwApiTrace;
+      const suffix = trace && trace.upstream_host
+        ? ` upstream_host=${trace.upstream_host} retry_count=${trace.retry_count}` : '';
+      const message = `${req.method} ${u.pathname} -> ${res.statusCode} (${Date.now() - started}ms)${suffix}`;
       console.log(`[api] ${message}`);
-      features.addLog(res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info', message);
-    }
-  });
+      features.addLog(
+        res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info',
+        message,
+        trace && trace.upstream_host ? {
+          request_id: trace.request_id,
+          upstream_host: trace.upstream_host,
+          retry_count: trace.retry_count,
+          attempts: trace.attempts,
+          upstream_ms: trace.upstream_ms,
+          error_type: trace.error_type || '',
+        } : undefined,
+      );
+      }
+    });
+  }
 
   // 容器/反代健康检查：不验证访问口令，不创建会话，不访问上游。
   if (u.pathname === '/healthz') {
@@ -2091,5 +2435,11 @@ module.exports = {
   imageCacheStats,
   isTransientImageFailure,
   markImageHostFailed,
+  markImageHostHealthy,
+  releaseImageHostProbe,
+  reserveImageHost,
+  clearImageHostHealth,
+  classifyImageFailure,
+  imageUrlCandidates,
   SAFE_RASTER_MIME,
 };

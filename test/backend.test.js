@@ -60,6 +60,14 @@ const {
   imageCacheStats,
   waitForImageRequestSlot,
   acquireImageRequestSlot,
+  isTransientImageFailure,
+  markImageHostFailed,
+  markImageHostHealthy,
+  releaseImageHostProbe,
+  reserveImageHost,
+  clearImageHostHealth,
+  classifyImageFailure,
+  imageUrlCandidates,
 } = require('../server');
 
 const publicDns = async () => [{ address: '93.184.216.34', family: 4 }];
@@ -208,8 +216,22 @@ class MockServerResponse extends EventEmitter {
       'https://user:pass@example.com', 'https://example.com/path',
     ]) assert.strictEqual(settings.normalizeHost(host), '', host);
     assert.strictEqual(settings.normalizeHost('example.com'), 'https://example.com');
+    assert.strictEqual(settings.isKnownImageHost('https://cdn-msp9.jmapiproxy3.cc'), true);
+    assert.strictEqual(settings.isKnownImageHost('https://cdn-msp.example.com'), false);
+    assert.strictEqual(settings.addImageHost('https://attacker.example'), false,
+      '章节 imghost 不得永久扩张为任意公网白名单');
     assert.strictEqual(settings.isTrustedApiHost('https://example.com'), false);
     assert.strictEqual(settings.isTrustedApiHost(settings.apiHosts()[0]), true);
+    assert.strictEqual(features.hasUsableIpv6({ lo: [
+      { address: '::1', family: 'IPv6', internal: true },
+    ] }), false);
+    assert.strictEqual(features.hasUsableIpv6({ eth0: [
+      { address: 'fe80::1', family: 'IPv6', internal: false },
+      { address: '2001:db8::1', family: 'IPv6', internal: false },
+    ] }), false);
+    assert.strictEqual(features.hasUsableIpv6({ eth0: [
+      { address: '240e:1234::1', family: 'IPv6', internal: false },
+    ] }), true);
     assert.strictEqual(
       features.normalizeGithubReleaseUrl('owner/repo', 'https://github.com/owner/repo/releases/tag/v1.2.3'),
       'https://github.com/owner/repo/releases/tag/v1.2.3'
@@ -282,7 +304,7 @@ class MockServerResponse extends EventEmitter {
       headers: { 'x-forwarded-for': 'not-an-ip' },
     }), '10.1.2.3');
     assert.strictEqual(requestIsSecure({ socket: { encrypted: true }, headers: {} }), true);
-    assert.strictEqual(requestIsSecure({
+  assert.strictEqual(requestIsSecure({
       socket: { remoteAddress: '198.51.100.20' }, headers: { 'x-forwarded-proto': 'https' },
     }), false, '不可信直连不得伪造 X-Forwarded-Proto');
     assert.strictEqual(requestIsSecure({
@@ -291,6 +313,7 @@ class MockServerResponse extends EventEmitter {
     assert.strictEqual(requestIsSecure({
       socket: { remoteAddress: '10.1.2.3' }, headers: { 'x-forwarded-proto': 'https, http' },
     }), false, '拒绝含歧义链的 X-Forwarded-Proto');
+    assert.strictEqual(Buffer.byteLength('短口令', 'utf8') < 16, true);
 
     // 图片代理同时受全局与单客户端并发上限约束，释放后槽位必须可复用。
     assert.ok(MAX_IMAGE_CONCURRENCY_PER_IP <= MAX_IMAGE_CONCURRENCY);
@@ -328,6 +351,29 @@ class MockServerResponse extends EventEmitter {
     assert.strictEqual(cachedRes.statusCode, 200);
     assert.strictEqual(cachedRes.headers['X-JMW-Image-Cache'], 'HIT');
     assert.strictEqual(Buffer.concat(cachedRes.chunks).toString(), 'cover-cache');
+
+    // 图片线路只对网络/超时/429/5xx 熔断；到期后仅放行一个半开探测，
+    // 成功即恢复。绝对 URL 的备用候选必须原样保留 path/query。
+    clearImageHostHealth();
+    const healthHost = settings.imageHosts()[0];
+    const healthStarted = Date.now();
+    assert.strictEqual(classifyImageFailure(Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })), 'timeout');
+    assert.strictEqual(isTransientImageFailure(429), true);
+    assert.strictEqual(isTransientImageFailure(new ApiError('bad mime', 415)), false);
+    assert.strictEqual(markImageHostFailed(healthHost, 503, 1000), true);
+    assert.strictEqual(reserveImageHost(healthHost, healthStarted), false);
+    assert.strictEqual(reserveImageHost(healthHost, healthStarted + 1500), true);
+    assert.strictEqual(reserveImageHost(healthHost, healthStarted + 1500), false);
+    releaseImageHostProbe(healthHost);
+    assert.strictEqual(reserveImageHost(healthHost, healthStarted + 1500), true);
+    markImageHostHealthy(healthHost);
+    assert.strictEqual(reserveImageHost(healthHost, healthStarted + 1500), true);
+    const signedCandidates = imageUrlCandidates(`${healthHost}/media/photos/7/0001.webp?token=test-signature&v=2`);
+    assert.ok(signedCandidates.length >= 2);
+    assert.ok(signedCandidates.every((url) => url.pathname === '/media/photos/7/0001.webp'));
+    assert.ok(signedCandidates.every((url) => url.search === '?token=test-signature&v=2'));
+    assert.strictEqual(new Set(signedCandidates.map((url) => url.origin)).size, signedCandidates.length);
+    clearImageHostHealth();
 
     const streamedCoverKey = imageCacheKeyForPath('/media/albums/streamed-cover.jpg');
     const streamedCover = new Response('streamed-cover', { headers: { 'Content-Type': 'image/jpeg' } });
@@ -409,6 +455,27 @@ class MockServerResponse extends EventEmitter {
     assert.strictEqual(response.status, 405);
     assert.strictEqual(response.headers.get('allow'), 'GET');
     assert.strictEqual(sessionFileCount(), 0);
+
+    // 图片代理不使用 JM 登录态，首次图片请求不得创建空 Session 或下发 jmw_sid。
+    const statelessImageLookup = features.dohLookup;
+    global.fetch = async () => new Response('stateless-cover', {
+      headers: { 'Content-Type': 'image/jpeg' },
+    });
+    features.dohLookup = publicDns;
+    try {
+      response = await originalFetch(
+        `http://127.0.0.1:${port}/api/img?path=${encodeURIComponent('/media/albums/stateless.jpg')}`,
+      );
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(await response.text(), 'stateless-cover');
+      assert.strictEqual(response.headers.get('set-cookie'), null);
+      sessions.flushAll();
+      assert.strictEqual(sessionFileCount(), 0);
+    } finally {
+      global.fetch = originalFetch;
+      features.dohLookup = statelessImageLookup;
+      clearImageCache();
+    }
 
     response = await originalFetch(`http://127.0.0.1:${port}/api/config/api-host`, {
       method: 'POST',
@@ -981,12 +1048,77 @@ class MockServerResponse extends EventEmitter {
     global.fetch = originalFetch;
     features.dohLookup = originalDohLookup;
 
+    // 章节返回的绝对图片 URL 在原 origin 网络超时后，应只替换到其它受信
+    // 图片 origin，完整保留 path/query；熔断期间后续请求直接绕过坏线路。
+    clearImageHostHealth();
+    const absoluteHosts = settings.imageHosts().slice(0, 2);
+    assert.strictEqual(absoluteHosts.length, 2);
+    const imageQueryMarker = 'SIGNED_QUERY_MUST_NOT_BE_LOGGED_41c8';
+    const absoluteUrl = `${absoluteHosts[0]}/media/photos/7788/00001.webp?token=${imageQueryMarker}&v=2`;
+    let absoluteCalls = [];
+    global.fetch = async (input) => {
+      const target = new URL(String(input));
+      absoluteCalls.push(target);
+      if (target.origin === absoluteHosts[0]) {
+        throw Object.assign(new Error('connect timeout'), { code: 'ETIMEDOUT' });
+      }
+      return new Response('absolute-fallback-image', { headers: { 'Content-Type': 'image/webp' } });
+    };
+    features.dohLookup = publicDns;
+    features.clearLogs();
+    response = await originalFetch(`http://127.0.0.1:${port}/api/img?u=${encodeURIComponent(absoluteUrl)}`);
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(await response.text(), 'absolute-fallback-image');
+    assert.strictEqual(absoluteCalls.length, 2);
+    assert.strictEqual(absoluteCalls[0].origin, absoluteHosts[0]);
+    assert.strictEqual(absoluteCalls[1].origin, absoluteHosts[1]);
+    assert.strictEqual(absoluteCalls[1].pathname, absoluteCalls[0].pathname);
+    assert.strictEqual(absoluteCalls[1].search, absoluteCalls[0].search);
+    await new Promise((resolve) => setImmediate(resolve));
+    const imageLog = features.getLogs(20).find((item) => /GET \/api\/img -> 200/.test(item.message));
+    assert.ok(imageLog && imageLog.meta, '图片完成日志必须进入有界运维日志');
+    assert.strictEqual(imageLog.meta.upstream_host, new URL(absoluteHosts[1]).hostname);
+    assert.strictEqual(imageLog.meta.retry_count, 1);
+    assert.strictEqual(imageLog.meta.cache_hit, false);
+    assert.strictEqual(imageLog.meta.bytes, Buffer.byteLength('absolute-fallback-image'));
+    for (const field of ['dns_ms', 'connect_ms', 'tls_ms', 'ttfb_ms', 'queue_ms', 'duration_ms']) {
+      assert.ok(Number.isFinite(imageLog.meta[field]) && imageLog.meta[field] >= 0, field);
+    }
+    assert.ok(!JSON.stringify(imageLog).includes(imageQueryMarker), '图片日志不得记录签名查询参数');
+
+    absoluteCalls = [];
+    response = await originalFetch(`http://127.0.0.1:${port}/api/img?u=${encodeURIComponent(absoluteUrl)}`);
+    assert.strictEqual(response.status, 200);
+    await response.arrayBuffer();
+    assert.ok(absoluteCalls.length >= 1);
+    assert.ok(absoluteCalls.every((target) => target.origin !== absoluteHosts[0]), '熔断期不得重复等待坏线路');
+
+    // 404 是资源语义，不得开启整个域名的熔断，也不得对可能绑定 origin 的
+    // 签名 URL 盲目换线。
+    clearImageHostHealth();
+    let notFoundCalls = 0;
+    global.fetch = async () => {
+      notFoundCalls++;
+      return new Response('', { status: 404, headers: { 'Content-Type': 'image/webp' } });
+    };
+    for (let i = 0; i < 2; i++) {
+      response = await originalFetch(`http://127.0.0.1:${port}/api/img?u=${encodeURIComponent(absoluteUrl)}`);
+      assert.strictEqual(response.status, 502);
+      await response.arrayBuffer();
+    }
+    assert.strictEqual(notFoundCalls, 2);
+    clearImageHostHealth();
+    settings.setPreferredImageHost(absoluteHosts[0]);
+    global.fetch = originalFetch;
+    features.dohLookup = originalDohLookup;
+
     // 图片代理有自己的局部 catch；内部/上游 ApiError 5xx 同样不得绕过中央脱敏策略。
     const imagePrivateMarker = 'PRIVATE_IMAGE_FAILURE_82ce';
     let imageDiagnostics = '';
     const imageConsoleError = console.error;
     global.fetch = async () => { throw new ApiError(imagePrivateMarker, 502); };
     features.dohLookup = publicDns;
+    clearImageHostHealth();
     console.error = (...args) => { imageDiagnostics += args.map(String).join(' '); };
     try {
       response = await originalFetch(`http://127.0.0.1:${port}/api/img?u=${encodeURIComponent(`${settings.imageHosts()[0]}/private.png`)}`);
@@ -1004,8 +1136,10 @@ class MockServerResponse extends EventEmitter {
       console.error = imageConsoleError;
       global.fetch = originalFetch;
       features.dohLookup = originalDohLookup;
+      clearImageHostHealth();
     }
-    assert.ok(imageDiagnostics.includes(imagePrivateMarker), '图片内部错误仍应保留服务端诊断');
+    assert.ok(!imageDiagnostics.includes(imagePrivateMarker), '图片诊断不得记录可能含签名 URL 的原始错误');
+    assert.match(imageDiagnostics, /error_type=http_5xx/, '图片内部错误应保留脱敏分类诊断');
 
     // 日志接口属于实例级运维能力：远端客户不可读、不可清空；本机默认可用。
     features.addLog('info', 'OPERATIONAL_BOUNDARY_MARKER');
@@ -1042,6 +1176,7 @@ class MockServerResponse extends EventEmitter {
     assert.ok(logResult.logs.length <= 2);
     assert.ok(logResult.logs.some((x) => /GET \/api\/config -> 200/.test(x.message)));
     assert.ok(!JSON.stringify(logResult.logs).includes(querySecret), '访问日志不得记录原始查询串');
+
     response = await originalFetch(`http://127.0.0.1:${port}/api/logs`, {
       method: 'DELETE', headers: { Cookie: sidCookie },
     });
@@ -1561,6 +1696,48 @@ class MockServerResponse extends EventEmitter {
     // 持久用户状态有独立上限，避免异常上游对象长期占据整个会话 LRU。
     assert.deepStrictEqual(sessions.sanitizeUser({ id: 1, name: 'tester' }), { id: 1, name: 'tester' });
     assert.strictEqual(sessions.sanitizeUser({ oversized: 'x'.repeat(300 * 1024) }), null);
+
+    // 启动迁移必须一次性清除所有旧 Session 中递归嵌套的认证资料，同时
+    // 保留 AVS Cookie、原 mtime 和损坏文件，且活跃迁移锁会阻止并发扫描。
+    const migrationDir = fs.mkdtempSync(path.join(os.tmpdir(), 'jmw-session-migration-test-'));
+    try {
+      const migrationSid = 'a'.repeat(32);
+      const migrationFile = path.join(migrationDir, `${migrationSid}.json`);
+      const corruptFile = path.join(migrationDir, `${'b'.repeat(32)}.json`);
+      const oldTime = new Date(Date.now() - 3 * 24 * 3600 * 1000);
+      fs.writeFileSync(migrationFile, JSON.stringify({
+        cookiesByOrigin: { 'https://auth.example': { AVS: 'test-avs-value' } },
+        user: {
+          uid: '7', s: 'test-user-session', jwttoken: 'test-jwt',
+          nested: { access_token: 'test-access-token', display: 'kept' },
+        },
+        apiHost: 'https://auth.example',
+        favoriteFolders: [], favoriteFolderMap: {}, hiddenHistory: [],
+      }), { mode: 0o644 });
+      fs.utimesSync(migrationFile, oldTime, oldTime);
+      fs.writeFileSync(corruptFile, '{not-json', { mode: 0o600 });
+
+      const migration = sessions.migrateSessionFiles(migrationDir);
+      assert.deepStrictEqual(
+        { scanned: migration.scanned, migrated: migration.migrated, invalid: migration.invalid },
+        { scanned: 2, migrated: 1, invalid: 1 },
+      );
+      const migrated = JSON.parse(fs.readFileSync(migrationFile, 'utf8'));
+      assert.strictEqual(migrated.cookiesByOrigin['https://auth.example'].AVS, 'test-avs-value');
+      assert.deepStrictEqual(migrated.user, { uid: '7', nested: { display: 'kept' } });
+      assert.strictEqual(fs.readFileSync(corruptFile, 'utf8'), '{not-json');
+      assert.ok(Math.abs(fs.statSync(migrationFile).mtimeMs - oldTime.getTime()) < 5);
+      if (process.platform !== 'win32') {
+        assert.strictEqual(fs.statSync(migrationFile).mode & 0o777, 0o600);
+      }
+
+      fs.writeFileSync(path.join(migrationDir, '.sanitize.lock'), 'active\n');
+      const lockedMigration = sessions.migrateSessionFiles(migrationDir);
+      assert.strictEqual(lockedMigration.locked, true);
+      assert.strictEqual(lockedMigration.migrated, 0);
+    } finally {
+      fs.rmSync(migrationDir, { recursive: true, force: true });
+    }
 
     // logout/延迟保存不得复活文件，磁盘会话数有硬上限。
     const jar = sessions.createJar();

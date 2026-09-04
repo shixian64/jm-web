@@ -10,6 +10,7 @@
     "test:unit": "node test/photo.test.js && node test/content-filter.test.js && node test/offline-metadata.test.js && node test/navigation.test.js && node test/service-worker.test.js && node test/frontend-robustness.test.js && node test/user-list-pagination.test.js && node test/mobile-layout.test.js && node test/mobile-gate-focus.test.js && node test/clipboard-runtime.test.js && node test/home-swiper-loading.test.js && node test/reader-performance.test.js && node test/descramble-worker.test.js",
     "test:backend": "node test/backend.test.js && node test/https-fetch.test.js",
     "test:deployment": "node test/deployment.test.js",
+    "validate:artifact": "scripts/validate-release-artifact.sh",
     "check": "node test/check.js"
   },
   "engines": {

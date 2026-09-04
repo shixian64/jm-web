@@ -2,7 +2,9 @@
 
 const assert = require('assert');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { execFileSync } = require('child_process');
 
 const root = path.join(__dirname, '..');
 const read = (name) => fs.readFileSync(path.join(root, name), 'utf8');
@@ -13,6 +15,7 @@ const workflow = read(path.join('.github', 'workflows', 'docker-publish.yml'));
 const envExample = read('.env.example');
 const server = read('server.js');
 const readme = read('README.md');
+const artifactValidator = path.join(root, 'scripts', 'validate-release-artifact.sh');
 
 function mustMatch(text, pattern, message) {
   assert.match(text, pattern, message);
@@ -87,5 +90,56 @@ mustMatch(workflow, /linux\/amd64,linux\/arm64/, '镜像 workflow 必须发布 x
 mustMatch(workflow, /packages:\s*write/, '镜像 workflow 必须允许写入 GHCR');
 mustMatch(workflow, /docker\/build-push-action@v6/, '镜像 workflow 必须使用 Buildx 发布');
 mustMatch(workflow, /if: github\.event_name != 'pull_request'/, 'Pull Request 不得发布镜像');
+assert.ok(fs.statSync(artifactValidator).mode & 0o111, '制品校验脚本必须可执行');
+mustMatch(read('package.json'), /"validate:artifact"\s*:/, 'package.json 必须提供制品校验入口');
+
+// 制品校验必须只在构建成功标志明确存在时生成 PASS，并拒绝缺失运行文件。
+const artifact = fs.mkdtempSync(path.join(os.tmpdir(), 'jmw-release-artifact-test-'));
+try {
+  for (const item of ['.dockerignore', '.env.example', 'AGENT.md', 'AGENTS.md', 'Dockerfile',
+    'LICENSE', 'README.md', 'docker-compose.yml', 'package.json', 'server.js']) {
+    fs.cpSync(path.join(root, item), path.join(artifact, item), { recursive: true });
+  }
+  for (const dir of ['lib', 'public']) fs.cpSync(path.join(root, dir), path.join(artifact, dir), { recursive: true });
+  const output = execFileSync(artifactValidator, [artifact], {
+    env: { ...process.env, RELEASE_BUILD_STATUS: 'PASS' }, encoding: 'utf8',
+  });
+  assert.match(output, /RELEASE-MANIFEST: PASS/);
+  assert.throws(
+    () => execFileSync(artifactValidator, [artifact], { env: { ...process.env }, encoding: 'utf8' }),
+    /status|exited with|package\.json/i,
+    '未确认构建成功不得生成 PASS',
+  );
+  fs.rmSync(path.join(artifact, 'package.json'));
+  assert.throws(
+    () => execFileSync(artifactValidator, [artifact], {
+      env: { ...process.env, RELEASE_BUILD_STATUS: 'PASS' }, encoding: 'utf8',
+    }),
+    /status|exited with|package\.json/i,
+    '缺少 package.json 的失败制品不得通过',
+  );
+
+  // 禁止内容检查必须递归，不能通过把生产状态放入嵌套目录绕过门禁。
+  fs.writeFileSync(path.join(artifact, 'package.json'), JSON.stringify({ name: 'jm-web' }));
+  fs.mkdirSync(path.join(artifact, 'nested', 'data'), { recursive: true });
+  assert.throws(
+    () => execFileSync(artifactValidator, [artifact], {
+      env: { ...process.env, RELEASE_BUILD_STATUS: 'PASS' }, encoding: 'utf8',
+    }),
+    /禁止内容|nested\/data/i,
+    '嵌套 data 目录不得进入发布制品',
+  );
+
+  // 路径规范化后仍须阻断旧生产目录；这里只验证不存在的变体不会被误判
+  // 为制品，实际生产目录由部署流程单独保护。
+  assert.throws(
+    () => execFileSync(artifactValidator, ['/srv/jm-web/../jm-web'], {
+      env: { ...process.env, RELEASE_BUILD_STATUS: 'PASS' }, encoding: 'utf8',
+    }),
+    /目录不存在|生产路径|exited with/i,
+  );
+} finally {
+  fs.rmSync(artifact, { recursive: true, force: true });
+}
 
 console.log('deployment hardening checks pass');

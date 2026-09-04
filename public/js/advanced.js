@@ -12,6 +12,7 @@ const dec = new TextDecoder();
 const LOCK_KEY = 'jmw_lock_credential';
 const BIO_KEY = 'jmw_webauthn_credential';
 let runtimeInstalled = false;
+let unlockedTasksDeferred = false;
 let locked = false;
 let lockOverlay = null;
 let lastClipboardValue = '';
@@ -1664,7 +1665,7 @@ function showOnboarding() {
       step === 2 ? h('div', null, toggleRow('自动签到', 'autoSignInEnabled'), toggleRow('剪贴板编号检测', 'clipboardAutoDetectEnabled'), toggleRow('显示 AI 入口', 'showAiEntry')) : null,
       h('div', { style: 'display:flex;justify-content:flex-end;gap:8px;margin-top:18px' },
         step ? h('button', { class: 'btn', onclick: () => { step--; render(); } }, '上一步') : null,
-        h('button', { class: 'btn primary', onclick: () => { if (step < pages.length - 1) { step++; render(); } else { updateSetting({ onboardingCompleted: true, nsfwWarningDismissed: true }); modal.remove(); runUnlockedTasks(); } } }, step === pages.length - 1 ? '开始使用' : '继续')),
+        h('button', { class: 'btn primary', onclick: () => { if (step < pages.length - 1) { step++; render(); } else { updateSetting({ onboardingCompleted: true, nsfwWarningDismissed: true }); modal.remove(); if (!unlockedTasksDeferred) runUnlockedTasks(); } } }, step === pages.length - 1 ? '开始使用' : '继续')),
     ].filter(Boolean));
   };
   modal.append(card); document.body.append(modal); render();
@@ -1746,15 +1747,16 @@ function handleLockStorageEvent(event) {
   scheduleStorageReconcile(true, event.newValue == null ? 80 : 0);
 }
 
-export function installAdvancedRuntime() {
+function installAdvancedRuntimeListeners() {
   if (runtimeInstalled) return;
   runtimeInstalled = true;
-  window.addEventListener('jmw-local-unlocked', runUnlockedTasks);
+  window.addEventListener('jmw-local-unlocked', () => {
+    if (!unlockedTasksDeferred) runUnlockedTasks();
+  });
   window.addEventListener('storage', handleLockStorageEvent);
   syncSettingFromStorage(localStorage.getItem(SETTING_STORAGE_KEY));
   showOnboarding();
   if (setting.appLockEnabled) showLockGate();
-  runUnlockedTasks();
   document.addEventListener('paste', handleClipboardPaste);
   window.addEventListener('blur', () => { if (setting.privacyMode) document.documentElement.classList.add('window-blurred'); });
   window.addEventListener('focus', () => document.documentElement.classList.remove('window-blurred'));
@@ -1764,6 +1766,18 @@ export function installAdvancedRuntime() {
       if (locked) showLockGate();
     }
   });
+}
+
+// 首屏先安装本地锁及隐私监听器，但在站点访问门禁确认前不运行自动签到等 API 任务。
+export function prepareAdvancedRuntime() {
+  unlockedTasksDeferred = true;
+  installAdvancedRuntimeListeners();
+}
+
+export function installAdvancedRuntime() {
+  unlockedTasksDeferred = false;
+  installAdvancedRuntimeListeners();
+  runUnlockedTasks();
 }
 
 function runUnlockedTasks() {

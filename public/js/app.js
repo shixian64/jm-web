@@ -10,7 +10,8 @@ import { registerOfflineWorker } from './offline.js';
 import { NAV_STATE_KEY, hashRouteKey } from './navigation.js';
 import {
   advancedHubView, blockedTagsView, paletteView, securityView, backupView, personasView,
-  aiView, networkView, logsView, extractCodeView, cacheView, aboutView, installAdvancedRuntime, isLocalAppLocked,
+  aiView, networkView, logsView, extractCodeView, cacheView, aboutView,
+  prepareAdvancedRuntime, installAdvancedRuntime, isLocalAppLocked,
 } from './advanced.js';
 import {
   userView, signinView, favoritesView, watchHistoryView, localHistoryView, myCommentsView, settingsView,
@@ -375,37 +376,44 @@ function highlightNav(path) {
 }
 
 /* ---------- 启动 ---------- */
+let applicationStarted = false;
+
+function startApplication() {
+  if (applicationStarted) return;
+  applicationStarted = true;
+  window.addEventListener('hashchange', () => render(prepareHashNavigation()));
+  render();
+  refreshAvatar();
+  installAdvancedRuntime();
+  registerOfflineWorker().catch((error) => console.warn('[offline] Service Worker 注册失败:', error.message));
+}
+
 async function boot() {
   mountShell();
-  installAdvancedRuntime();
+  // 本地锁必须先于任何网络检查显示；自动签到等 API 任务则延迟到站点门禁通过。
+  prepareAdvancedRuntime();
   if (isLocalAppLocked()) {
     await new Promise((resolve) => window.addEventListener('jmw-local-unlocked', resolve, { once: true }));
   }
-  render();
-
-  window.addEventListener('hashchange', () => render(prepareHashNavigation()));
 
   // 访问口令保护：/api/me 返回 401 说明服务器开启了口令且本机未验证
+  const accessProbe = new AbortController();
+  const accessProbeTimer = setTimeout(() => accessProbe.abort(), 8000);
   try {
-    const res = await fetch('/api/me');
+    const res = await fetch('/api/me', { signal: accessProbe.signal });
     if (res.status === 401) {
       const { passwordGate } = await import('./gate.js');
-      // 首次渲染可能已经收到 401 并展示错误态；验证口令后重新加载当前路由。
-      passwordGate(() => {
-        render();
-        refreshAvatar();
-        installAdvancedRuntime();
-        registerOfflineWorker().catch((error) => console.warn('[offline] Service Worker 注册失败:', error.message));
-      });
+      passwordGate(startApplication);
       return;
     }
   } catch (e) {
     console.warn('[boot] 访问保护检查失败:', e && e.message);
+  } finally {
+    clearTimeout(accessProbeTimer);
   }
 
-  refreshAvatar();
-  installAdvancedRuntime();
-  registerOfflineWorker().catch((error) => console.warn('[offline] Service Worker 注册失败:', error.message));
+  // 门禁检查网络故障时仍进入应用，由各 View 呈现其正常错误态，不永久卡在空壳。
+  startApplication();
 }
 
 let avatarRefreshSeq = 0;

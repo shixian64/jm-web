@@ -228,6 +228,28 @@ function jsonResponse(body, status = 200) {
   assert.ok(source.includes("typeof navigator.clipboard.writeText !== 'function'"));
   assert.ok(source.includes("jsonRequest('/logs', { method: 'DELETE', signal: ctx?.signal })"));
 
+  // 首次业务 render 必须由门禁判断后的单一启动函数触发；boot 自身不得在
+  // /api/me 返回前渲染路由，也不能重复绑定 hashchange。
+  const appSource = require('fs').readFileSync(path.resolve(__dirname, '..', 'public', 'js', 'app.js'), 'utf8');
+  const advancedSource = require('fs').readFileSync(path.resolve(__dirname, '..', 'public', 'js', 'advanced.js'), 'utf8');
+  const startBegin = appSource.indexOf('function startApplication()');
+  const bootBegin = appSource.indexOf('async function boot()');
+  const bootEnd = appSource.indexOf('\nlet avatarRefreshSeq', bootBegin);
+  assert.ok(startBegin >= 0 && bootBegin > startBegin && bootEnd > bootBegin);
+  const startSource = appSource.slice(startBegin, bootBegin);
+  const bootSource = appSource.slice(bootBegin, bootEnd);
+  assert.match(startSource, /if \(applicationStarted\) return;/);
+  assert.strictEqual((startSource.match(/addEventListener\('hashchange'/g) || []).length, 1);
+  assert.strictEqual((startSource.match(/\brender\(\);/g) || []).length, 1);
+  assert.ok(!/\brender\(\);/.test(bootSource), 'boot 不得在门禁判断前直接 render');
+  assert.ok(bootSource.indexOf("await fetch('/api/me'") < bootSource.indexOf('passwordGate(startApplication)'));
+  assert.match(bootSource, /catch \(e\)[\s\S]*startApplication\(\);/,
+    '门禁探测网络失败后必须进入可见的应用错误态');
+  assert.match(bootSource, /new AbortController\(\)/,
+    '门禁探测必须可超时，避免网络卡住时永久空白');
+  assert.match(advancedSource, /if \(!unlockedTasksDeferred\) runUnlockedTasks\(\)/,
+    '引导完成不得绕过站点访问门禁触发自动任务');
+
   console.log('frontend robustness all pass');
 })().catch((error) => {
   console.error(error);

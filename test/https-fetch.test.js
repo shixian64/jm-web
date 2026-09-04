@@ -351,8 +351,12 @@ function isAbort(error) {
     });
 
     await run('多地址 IPv6 到 IPv4 回退', async () => {
-      const response = await httpsFetch(url('/plain'), {}, fallbackLookup);
+      const trace = {};
+      const response = await httpsFetch(url('/plain'), { jmwTrace: trace }, fallbackLookup);
       assert.strictEqual(await response.text(), 'plain');
+      for (const key of ['connect_ms', 'tls_ms', 'ttfb_ms']) {
+        assert.ok(Number.isFinite(trace[key]) && trace[key] >= 0, `${key}: ${trace[key]}`);
+      }
     });
 
     await run('IPv6 直连', async () => {
