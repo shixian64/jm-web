@@ -228,6 +228,12 @@ function jsonResponse(body, status = 200) {
   assert.ok(source.includes("typeof navigator.clipboard.writeText !== 'function'"));
   assert.ok(source.includes("jsonRequest('/logs', { method: 'DELETE', signal: ctx?.signal })"));
 
+  // 章节 AI 的详细描述/简洁总结先只持久化，不能在当前章节列表中直接展示；
+  // 标题由服务端按“原标题优先、AI 标题兜底”注入后再渲染。
+  const viewsSource = require('fs').readFileSync(path.resolve(__dirname, '..', 'public', 'js', 'views.js'), 'utf8');
+  assert.ok(!viewsSource.includes('aiSummary'), '章节列表不得直接显示 AI 总结');
+  assert.ok(!viewsSource.includes('chapterAi('), '章节列表暂不应主动拉取 AI 结果展示');
+
   // 首次业务 render 必须由门禁判断后的单一启动函数触发；boot 自身不得在
   // /api/me 返回前渲染路由，也不能重复绑定 hashchange。
   const appSource = require('fs').readFileSync(path.resolve(__dirname, '..', 'public', 'js', 'app.js'), 'utf8');

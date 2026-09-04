@@ -39,7 +39,7 @@ const { parsePhotoHtml } = require('./lib/photo');
 const sessions = require('./lib/sessions');
 const settings = require('./lib/settings');
 const features = require('./lib/features');
-const { ChapterAiScheduler } = require('./lib/chapter-ai');
+const { ChapterAiScheduler, chapterSourceTitle, effectiveChapterTitle } = require('./lib/chapter-ai');
 
 const configuredPort = Number(process.env.PORT || 3210);
 const portIsValid = Number.isInteger(configuredPort) && configuredPort >= 1 && configuredPort <= 65535;
@@ -162,7 +162,7 @@ const chapterAi = new ChapterAiScheduler({
       const value = album?.data || album;
       const rows = Array.isArray(value?.series) ? value.series : (Array.isArray(value?.chapters) ? value.chapters : []);
       const row = rows.find((item) => String(item?.id || item?.photoId || '') === String(photoId));
-      name = String(row?.name || row?.title || '').trim();
+      name = chapterSourceTitle(row);
     } catch (_) {}
     return { ...parsed, aid, name };
   },
@@ -1832,7 +1832,19 @@ async function api(req, res, u, requestSignal) {
       if (Array.isArray(value?.series)) {
         value.series = value.series.map((row) => {
           const rec = chapterAi.get(aid, String(row?.id || ''));
-          if (rec?.status === 'completed' && !String(row?.name || '').trim() && rec.generatedTitle) return { ...row, name: rec.generatedTitle, aiTitle: rec.generatedTitle, aiSummary: rec.briefSummary || '' };
+          // 上游章节名是默认/优先标题；只有确实缺少上游标题时，才把已完成
+          // 的 AI 标题作为列表名称。描述和总结只留在 chapter-ai 记录中，
+          // 暂不注入漫画详情响应，待确定展示位置后再单独接入。
+          const sourceTitle = chapterSourceTitle(row);
+          if (rec?.status === 'completed' && !sourceTitle) {
+            // 这里 sourceTitle 已确认为空，因此只取本次分析生成的标题；
+            // 不能用记录里旧的 sourceName 覆盖当前章节的无标题状态。
+            const title = effectiveChapterTitle(sourceTitle, rec.generatedTitle);
+            if (title) return { ...row, name: title };
+          }
+          // 某些上游线路把章节标题放在 title 而不是 name；统一补到前端使用
+          // 的 name 字段，但不改变原标题内容或把 AI 结果覆盖上去。
+          if (sourceTitle && !String(row?.name || '').trim()) return { ...row, name: sourceTitle };
           return row;
         });
       }
