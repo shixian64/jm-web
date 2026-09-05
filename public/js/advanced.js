@@ -132,7 +132,13 @@ function menuLink(label, href, description = '') {
 
 function toggleRow(label, key, description = '') {
   const input = h('input', { type: 'checkbox', checked: !!setting[key] });
-  input.addEventListener('change', () => updateSetting({ [key]: input.checked }));
+  input.addEventListener('change', () => {
+    updateSetting({ [key]: input.checked });
+    if (key === 'autoSignInEnabled') {
+      if (input.checked) runUnlockedTasks();
+      else autoSignInStarted = false;
+    }
+  });
   return h('label', { class: 'setting-row toggle-row' },
     h('div', null, h('div', { class: 'lab' }, label), description ? h('div', { class: 'hint' }, description) : null), input);
 }
@@ -1621,10 +1627,12 @@ export async function aboutView(root, _m, _q, ctx) {
 
 async function autoSignIn() {
   if (!setting.autoSignInEnabled || locked || autoSignInStarted) return;
-  autoSignInStarted = true;
   try {
     const me = (await api.me()).user; if (!me || locked) return;
     const daily = (await api.daily(me.uid)).data;
+    // 只有成功读取到当前账号的签到数据后才锁定本次启动任务；网络暂时失败或
+    // 启动时尚未登录时，后续登录事件仍可再次触发自动签到。
+    autoSignInStarted = true;
     const records = Array.isArray(daily?.record) ? daily.record.flat() : [];
     const today = records[new Date().getDate() - 1];
     const signed = today?.signed === true || today?.signed === 1 || today?.signed === '1'
@@ -1763,6 +1771,10 @@ function installAdvancedRuntimeListeners() {
   if (runtimeInstalled) return;
   runtimeInstalled = true;
   window.addEventListener('jmw-local-unlocked', () => {
+    if (!unlockedTasksDeferred) runUnlockedTasks();
+  });
+  window.addEventListener('jmw-auth-changed', () => {
+    autoSignInStarted = false;
     if (!unlockedTasksDeferred) runUnlockedTasks();
   });
   window.addEventListener('storage', handleLockStorageEvent);
