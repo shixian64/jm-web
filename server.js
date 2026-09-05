@@ -526,11 +526,13 @@ function ensureJar(req, res) {
   let jar = sid ? sessions.loadJar(sid) : null;
   if (!jar) {
     jar = sessions.createJar();
-    res.setHeader(
-      'Set-Cookie',
-      `jmw_sid=${jar.sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_COOKIE_MAX_AGE}${cookieSecurity(req)}`
-    );
   }
+  // 滚动续期：旧版本签发的 90 天 Cookie 在用户正常访问时升级到当前
+  // 配置的有效期，避免必须清理浏览器 Cookie 才能获得新的期限。
+  res.setHeader(
+    'Set-Cookie',
+    `jmw_sid=${jar.sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_COOKIE_MAX_AGE}${cookieSecurity(req)}`
+  );
   // 旧版可能在会话文件中留下任意 Host；升级后一律清除非受信值。
   if (jar.apiHost && !settings.isTrustedApiHost(jar.apiHost)) {
     jar.apiHost = '';
