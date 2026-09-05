@@ -152,7 +152,7 @@ const chapterAi = new ChapterAiScheduler({
       try {
         const out = await callPublic('/album', { id: aid });
         const value = out?.data || out; const rows = Array.isArray(value?.series) ? value.series : [];
-        rows.slice(0, 20).forEach((row, index) => { const photoId = String(row?.id || ''); if (/^\d+$/.test(photoId)) scheduler.enqueue(aid, photoId, scheduler.priorityFor(aid) + 50 - index); });
+        rows.forEach((row, index) => { const photoId = String(row?.id || ''); if (/^\d+$/.test(photoId)) { const order = Number(row?.sort); scheduler.enqueue(aid, photoId, scheduler.priorityFor(aid), Number.isFinite(order) ? order : index); } });
       } catch (_) {}
     }
   },
@@ -1944,7 +1944,7 @@ async function api(req, res, u, requestSignal) {
       const value = out?.data || out; const aid = String(q.get('id') || '');
       const hotPriority = chapterAi.touchPopularity(aid, { weight: 1 });
       const rows = Array.isArray(value?.series) ? value.series : [];
-      rows.forEach((row, index) => { const photoId = String(row?.id || ''); if (/^\d+$/.test(photoId)) { try { chapterAi.enqueue(aid, photoId, hotPriority + Math.max(10, 100 - index)); } catch (_) {} } });
+      rows.forEach((row, index) => { const photoId = String(row?.id || ''); if (/^\d+$/.test(photoId)) { try { const order = Number(row?.sort); chapterAi.enqueue(aid, photoId, hotPriority, Number.isFinite(order) ? order : index); } catch (_) {} } });
       if (Array.isArray(value?.series)) {
         value.series = value.series.map((row) => {
           const rec = chapterAi.get(aid, String(row?.id || ''));

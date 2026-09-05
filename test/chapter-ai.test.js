@@ -56,7 +56,9 @@ try {
   assert.strictEqual(withoutSourceTitle.effectiveTitle, 'AI 标题 202');
   const prompt = modelBodies[0].messages[1].content[0].text;
   assert.match(prompt, /无论原章节名是否为空/);
-  assert.match(prompt, /三个字段必须一起返回/);
+  assert.match(prompt, /三个字段必须同时存在/);
+  assert.match(prompt, /所有字段值必须使用简体中文/);
+  assert.match(prompt, /格式固定为/);
   assert.doesNotMatch(prompt, /仅在原章节名为空或无意义时生成/);
 
   // runJob 必须把标题、详细剧情和简洁总结作为同一条完成记录原子保存。
@@ -124,6 +126,18 @@ try {
   scheduler.setRankWeight('100', 50);
   scheduler.setRankWeight('100', 10);
   assert.strictEqual(scheduler.state.stats['100'].rankWeight, 10, '榜单权重应使用当前榜单快照');
+
+  // 调度必须先锁定热门漫画，再按章节顺序处理；当前漫画还有任务时不能跳到下一本。
+  const lane = new ChapterAiScheduler({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'jmw-chapter-ai-lane-')), apiKey: 'test', model: 'test', maxConcurrency: 1 });
+  lane.enqueue('200', '203', 100, 3);
+  lane.enqueue('200', '201', 100, 1);
+  lane.enqueue('200', '202', 100, 2);
+  lane.enqueue('201', '301', 200, 1);
+  assert.deepStrictEqual(lane.nextJobs(Date.now()).map((job) => job.key), ['201:301']);
+  lane.state.queue = lane.state.queue.filter((job) => job.key !== '201:301');
+  assert.deepStrictEqual(lane.nextJobs(Date.now()).map((job) => job.key), ['200:201']);
+  lane.state.queue = lane.state.queue.filter((job) => job.key !== '200:201');
+  assert.deepStrictEqual(lane.nextJobs(Date.now()).map((job) => job.key), ['200:202']);
 
   scheduler.enqueue('100', '200', 1);
   scheduler.analyze = async () => { throw new Error('expected failure'); };
