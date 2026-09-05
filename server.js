@@ -54,6 +54,13 @@ if (process.env.PORT && !portIsValid) {
 const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const ACCESS_PASSWORD = process.env.ACCESS_PASSWORD || '';
+const SESSION_COOKIE_MAX_AGE = (() => {
+  const fallback = 365 * 24 * 3600;
+  const raw = Number(process.env.JMW_SESSION_TTL_SECONDS);
+  return Number.isFinite(raw)
+    ? Math.max(7 * 24 * 3600, Math.min(2 * 365 * 24 * 3600, Math.floor(raw)))
+    : fallback;
+})();
 const MIN_ACCESS_PASSWORD_BYTES = 16;
 
 // 逗号分隔的可信反代 IP/CIDR。环回对端默认作为本机反代信任；
@@ -521,7 +528,7 @@ function ensureJar(req, res) {
     jar = sessions.createJar();
     res.setHeader(
       'Set-Cookie',
-      `jmw_sid=${jar.sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=7776000${cookieSecurity(req)}`
+      `jmw_sid=${jar.sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_COOKIE_MAX_AGE}${cookieSecurity(req)}`
     );
   }
   // 旧版可能在会话文件中留下任意 Host；升级后一律清除非受信值。
