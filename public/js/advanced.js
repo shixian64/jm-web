@@ -1627,7 +1627,9 @@ async function autoSignIn() {
     const daily = (await api.daily(me.uid)).data;
     const records = Array.isArray(daily?.record) ? daily.record.flat() : [];
     const today = records[new Date().getDate() - 1];
-    if (!locked && daily?.daily_id && today?.signed !== true) await api.dailyCheck(me.uid, daily.daily_id);
+    const signed = today?.signed === true || today?.signed === 1 || today?.signed === '1'
+      || String(today?.signed).toLowerCase() === 'true';
+    if (!locked && daily?.daily_id && !signed) await api.dailyCheck(me.uid, daily.daily_id);
   } catch (_) {}
 }
 

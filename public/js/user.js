@@ -520,6 +520,12 @@ function menuItem(ic, label, href) {
 
 /* ============================== 签到 ============================== */
 
+function signedRecord(record) {
+  if (!record || typeof record !== 'object') return false;
+  const value = record.signed;
+  return value === true || value === 1 || value === '1' || String(value).toLowerCase() === 'true';
+}
+
 export function signinView(root, ctx) {
   const page = h('div', { class: 'page signin-page', style: 'max-width:560px' });
   const content = h('div');
@@ -577,12 +583,13 @@ export function signinView(root, ctx) {
     const datedToday = flat.find((item) => String(item.date || '').slice(0, 10) === todayKey);
     const fallbackToday = flat[new Date().getDate() - 1];
     const todayRecord = datedToday || (!flat.some((item) => item.date) ? fallbackToday : null);
-    const isTodaySigned = todayRecord?.signed === true;
+    const isTodaySigned = signedRecord(todayRecord);
     const canCheckIn = !isTodaySigned && data.daily_id != null && String(data.daily_id) !== '';
     const grid = h('div', { class: 'sign-grid' });
     flat.forEach((d, i) => {
-      grid.append(h('div', { class: 'd' + (d.signed ? ' signed' : '') + (d.bonus ? ' bonus' : '') },
-        h('b', null, d.signed ? icon('check', 16) : String(i + 1)),
+      const signed = signedRecord(d);
+      grid.append(h('div', { class: 'd' + (signed ? ' signed' : '') + (d.bonus ? ' bonus' : '') },
+        h('b', null, signed ? icon('check', 16) : String(i + 1)),
         h('span', null, (d.date || '').slice(5)),
       ));
     });
