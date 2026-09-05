@@ -775,6 +775,23 @@ body.reading #main { padding: 0; }
 .sign-grid .d.bonus::after {
   content: ""; position: absolute; top: 4px; right: 4px; width: 7px; height: 7px; border-radius: 50%; background: #f5a623;
 }
+.sign-grid .d.today { outline: 2px solid var(--primary); outline-offset: 1px; }
+.signin-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.signin-status { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.signin-status-dot { width: 10px; height: 10px; flex: none; border-radius: 50%; background: var(--text-2); }
+.signin-status.ready { color: var(--primary); }
+.signin-status.ready .signin-status-dot { background: var(--primary); box-shadow: 0 0 0 4px var(--primary-weak); }
+.signin-status.done { color: var(--primary); }
+.signin-status.done .signin-status-dot { background: var(--primary); }
+.signin-status.unavailable { color: var(--text-2); }
+.signin-status b, .signin-status span { display: block; }
+.signin-status b { font-size: 15px; }
+.signin-status span { margin-top: 2px; color: var(--text-2); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.signin-streak { flex: none; min-width: 64px; padding: 7px 10px; border-radius: 10px; text-align: center; background: var(--primary-weak); color: var(--primary); }
+.signin-streak b, .signin-streak span { display: block; }
+.signin-streak b { font-size: 20px; line-height: 1.1; }
+.signin-streak span { font-size: 11px; color: var(--text-2); }
+.signin-reward { margin: -2px 0 12px; color: var(--text-2); font-size: 12px; }
 
 /* ---------- 设置页 ---------- */
 .setting-group { background: var(--card); border-radius: 12px; margin-bottom: 14px; overflow: hidden; }

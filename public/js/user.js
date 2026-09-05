@@ -588,7 +588,11 @@ export function signinView(root, ctx) {
     const grid = h('div', { class: 'sign-grid' });
     flat.forEach((d, i) => {
       const signed = signedRecord(d);
-      grid.append(h('div', { class: 'd' + (signed ? ' signed' : '') + (d.bonus ? ' bonus' : '') },
+      const isToday = d === todayRecord || (todayRecord == null && i === new Date().getDate() - 1);
+      grid.append(h('div', {
+        class: 'd' + (signed ? ' signed' : '') + (d.bonus ? ' bonus' : '') + (isToday ? ' today' : ''),
+        'aria-label': `${d.date || `第${i + 1}天`}${signed ? '，已签到' : '，未签到'}${isToday ? '，今天' : ''}`,
+      },
         h('b', null, signed ? icon('check', 16) : String(i + 1)),
         h('span', null, (d.date || '').slice(5)),
       ));
@@ -623,9 +627,16 @@ export function signinView(root, ctx) {
     content.replaceChildren(
       h('div', { class: 'list-head' }, h('h2', null, '每日签到')),
       h('div', { class: 'card', style: 'padding:16px' },
-        h('div', { style: 'color:var(--text-2);font-size:13px' },
-          `${data.event_name || '签到活动'} · 已连续签到 ${todayIdx} 天 · 连续 3 天 +${data.three_days_coin || 0} 金币`),
+        h('div', { class: 'signin-summary' },
+          h('div', { class: `signin-status${isTodaySigned ? ' done' : canCheckIn ? ' ready' : ' unavailable'}` },
+            h('span', { class: 'signin-status-dot', 'aria-hidden': 'true' }),
+            h('div', null,
+              h('b', null, isTodaySigned ? '今天已签到' : canCheckIn ? '今天还未签到' : '今天暂时无法签到'),
+              h('span', null, data.event_name || '每日签到活动'))),
+          h('div', { class: 'signin-streak' },
+            h('b', null, String(todayIdx)), h('span', null, '连续天数'))),
         grid,
+        h('div', { class: 'signin-reward' }, `连续 3 天可获得 ${data.three_days_coin || 0} 金币`),
         btn,
       ),
     );
