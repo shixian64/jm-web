@@ -526,6 +526,52 @@ function signedRecord(record) {
   return value === true || value === 1 || value === '1' || String(value).toLowerCase() === 'true';
 }
 
+function localDayKey(date = new Date()) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function recordDayKey(value, fallbackYear) {
+  const raw = String(value || '').trim().replaceAll('/', '-');
+  let match = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(raw);
+  if (!match) match = /^(\d{1,2})-(\d{1,2})$/.exec(raw);
+  if (!match) return '';
+  if (match.length === 4) {
+    const [, year, month, day] = match;
+    return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  }
+  return `${fallbackYear}-${String(match[1]).padStart(2, '0')}-${String(match[2]).padStart(2, '0')}`;
+}
+
+function previousDayKey(key) {
+  const date = new Date(`${key}T12:00:00`);
+  if (Number.isNaN(date.getTime())) return '';
+  date.setDate(date.getDate() - 1);
+  return localDayKey(date);
+}
+
+function signinStreak(records, todayKey, fallbackIndex) {
+  const dated = new Map();
+  const year = Number(todayKey.slice(0, 4));
+  records.forEach((record) => {
+    const key = recordDayKey(record.date, year);
+    if (key) dated.set(key, record);
+  });
+  if (dated.size) {
+    let count = 0;
+    let key = todayKey;
+    while (signedRecord(dated.get(key))) {
+      count++;
+      key = previousDayKey(key);
+    }
+    return count;
+  }
+  let index = Number.isInteger(fallbackIndex) ? fallbackIndex : -1;
+  if (index < 0 || !signedRecord(records[index])) return 0;
+  let count = 0;
+  while (index >= 0 && signedRecord(records[index])) { count++; index--; }
+  return count;
+}
+
 export function signinView(root, ctx) {
   const page = h('div', { class: 'page signin-page', style: 'max-width:560px' });
   const content = h('div');
@@ -575,15 +621,17 @@ export function signinView(root, ctx) {
 
     const flat = (Array.isArray(data.record) ? data.record : []).flat()
       .filter((item) => item && typeof item === 'object' && !Array.isArray(item));
-    const todayIdx = Math.max(0, Number(data.currentProgress) || 0);
+    const now = new Date();
+    const todayKey = localDayKey(now);
+    const fallbackIndex = now.getDate() - 1;
     // 上游记录不一定从当月 1 号开始，不能直接用 getDate() 作为数组下标。
     // 优先按日期匹配，旧接口未返回日期时再保留原有的下标兼容逻辑。
-    const now = new Date();
-    const todayKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-    const datedToday = flat.find((item) => String(item.date || '').slice(0, 10) === todayKey);
-    const fallbackToday = flat[new Date().getDate() - 1];
-    const todayRecord = datedToday || (!flat.some((item) => item.date) ? fallbackToday : null);
+    const datedToday = flat.find((item) => recordDayKey(item.date, now.getFullYear()) === todayKey);
+    const fallbackToday = flat[fallbackIndex];
+    const hasRecognizedDates = flat.some((item) => recordDayKey(item.date, now.getFullYear()));
+    const todayRecord = datedToday || (!hasRecognizedDates ? fallbackToday : null);
     const isTodaySigned = signedRecord(todayRecord);
+    const streakDays = signinStreak(flat, todayKey, fallbackIndex);
     const canCheckIn = !isTodaySigned && data.daily_id != null && String(data.daily_id) !== '';
     const grid = h('div', { class: 'sign-grid' });
     flat.forEach((d, i) => {
@@ -634,7 +682,7 @@ export function signinView(root, ctx) {
               h('b', null, isTodaySigned ? '今天已签到' : canCheckIn ? '今天还未签到' : '今天暂时无法签到'),
               h('span', null, data.event_name || '每日签到活动'))),
           h('div', { class: 'signin-streak' },
-            h('b', null, String(todayIdx)), h('span', null, '连续天数'))),
+            h('b', null, String(streakDays)), h('span', null, '连续天数'))),
         grid,
         h('div', { class: 'signin-reward' }, `连续 3 天可获得 ${data.three_days_coin || 0} 金币`),
         btn,
