@@ -102,6 +102,7 @@ def _font_candidates() -> list[Path]:
             Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
             Path("/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf"),
             Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+            Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
             Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
         ]
     )
