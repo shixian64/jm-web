@@ -1104,12 +1104,37 @@ export function mountReader(root, photoId, query, options = {}) {
       blob = stored?.blob;
       if (!(blob instanceof Blob) || !blob.size) throw new Error(`离线图片 ${idx + 1} 缺失或损坏`);
     } else {
-      const res = await fetch(srcOf(idx), {
-        headers: { 'X-JMW-Data-Source': selectedDataSource() },
-        credentials: 'same-origin',
-        signal: imageSignal,
-      });
-      if (!res.ok) throw new Error(`图片 ${idx + 1} 获取失败（${res.status}）`);
+      // 图片线路偶发超时/5xx 时自动短退避重试，避免连续滚动在单页失败后
+      // 必须手动点击“重试”。仅重试网络错误和 5xx，4xx 仍立即报告。
+      let res = null;
+      let lastError = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        assertImageActive(generation, imageSignal);
+        try {
+          res = await fetch(srcOf(idx), {
+            headers: { 'X-JMW-Data-Source': selectedDataSource() },
+            credentials: 'same-origin',
+            // Chromium 会据此让当前可见页优先于预加载邻页；不支持该字段的
+            // 浏览器会安全忽略它。
+            priority: idx === state.cur ? 'high' : 'low',
+            signal: imageSignal,
+          });
+          if (res.ok || (res.status >= 400 && res.status < 500)) break;
+          lastError = new Error(`图片 ${idx + 1} 获取失败（${res.status}）`);
+          try { res.body?.cancel(); } catch (_) {}
+        } catch (error) {
+          if (error?.name === 'AbortError' || imageSignal.aborted) throw error;
+          lastError = error;
+        }
+        if (attempt < 2) await new Promise((resolve, reject) => {
+          const timer = setTimeout(done, 250 * (attempt + 1));
+          const onAbort = () => { clearTimeout(timer); imageSignal.removeEventListener('abort', onAbort); reject(abortError()); };
+          const done = () => { imageSignal.removeEventListener('abort', onAbort); resolve(); };
+          imageSignal.addEventListener('abort', onAbort, { once: true });
+        });
+      }
+      if (!res) throw lastError || new Error(`图片 ${idx + 1} 获取失败`);
+      if (!res.ok) throw lastError || new Error(`图片 ${idx + 1} 获取失败（${res.status}）`);
       const responseMime = String(res.headers?.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
       if (!SAFE_IMAGE_MIME.has(responseMime)) {
         throw new Error(`图片 ${idx + 1} 返回了不支持的内容类型`);
@@ -1136,7 +1161,9 @@ export function mountReader(root, photoId, query, options = {}) {
       pageIndex: String(idx),
       targetLang: 'zh-CN',
       pipeline: 'fast',
-      waitMs: '1500',
+      // 翻译是增强功能，不应阻塞连续滚动的首图。服务端在该窗口内未就绪
+      // 即返回 202，阅读器会立即回退原图；后续预取仍可复用翻译缓存。
+      waitMs: idx === state.cur ? '300' : '1000',
     });
     let response;
     try {

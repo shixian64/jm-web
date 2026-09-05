@@ -194,7 +194,7 @@ export function comicCard(item) {
   const rawId = item.id ?? item.aid ?? item.AID;
   const id = rawId == null ? '' : String(rawId);
   const canOpen = /^\d+$/.test(id);
-  const open = () => { location.hash = `#/album/${id}`; };
+  const href = `#/album/${id}`;
   const category = text(item.category_sub?.title || item.category?.title || item.category);
   const image = h('img', {
     loading: 'lazy', decoding: 'async', fetchpriority: 'low', alt: name,
@@ -203,12 +203,14 @@ export function comicCard(item) {
   installImageRetry(image, imgSrcOf(item), { lazy: true });
   if (category) cover.append(h('span', { class: 'card-badge' }, category));
   if (canOpen) cover.append(h('span', { class: 'cover-action', 'aria-hidden': 'true' }, icon('arrow-up-right', 15)));
-  const card = h('div', {
+  // 使用原生链接而不是仅绑定 click 的 div：这样浏览器的“在新标签页打开”、
+  // Ctrl/⌘+Click、中键和长按菜单都能正常工作，同时单击仍由 hash 路由接管。
+  const card = h('a', {
     class: 'comic-card',
+    ...(canOpen ? { href } : {}),
     ...(category ? { 'data-kind': category } : {}),
-    ...(canOpen ? { onclick: open, 'aria-label': `查看${name === '未知' ? '漫画' : name}详情` } : { 'aria-disabled': 'true' }),
+    ...(canOpen ? { 'aria-label': `查看${name === '未知' ? '漫画' : name}详情` } : { 'aria-disabled': 'true', tabindex: '-1' }),
   });
-  if (canOpen) asActivatable(card, open);
   card.append(
     cover,
     h('div', { class: 'card-copy' },
