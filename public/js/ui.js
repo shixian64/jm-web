@@ -454,5 +454,6 @@ export function errorBox(message, retry) {
 }
 
 export function loadingBox(text = '加载中…') {
-  return h('div', { class: 'empty' }, h('div', { class: 'spinner' }), text);
+  return h('div', { class: 'empty loading-state', role: 'status', 'aria-live': 'polite', 'aria-label': text },
+    h('div', { class: 'spinner', 'aria-hidden': 'true' }), h('div', null, text));
 }

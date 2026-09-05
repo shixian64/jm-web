@@ -1325,6 +1325,20 @@ export function mountReader(root, photoId, query, options = {}) {
       ));
   }
 
+  function captureScrollAnchor() {
+    if (state.mode !== 'scroll' || !pages.isConnected) return null;
+    const anchor = pages.querySelector(`.slot[data-idx="${state.cur}"]`) || pages.querySelector('.slot');
+    if (!anchor) return null;
+    return { anchor, top: anchor.getBoundingClientRect().top };
+  }
+
+  function restoreScrollAnchor(snapshot) {
+    if (!snapshot || state.mode !== 'scroll' || !snapshot.anchor.isConnected) return;
+    const nextTop = snapshot.anchor.getBoundingClientRect().top;
+    const delta = nextTop - snapshot.top;
+    if (Math.abs(delta) > 0.5) pages.scrollTop += delta;
+  }
+
   function mountSlot(idx) {
     const slot = pages.querySelector(`.slot[data-idx="${idx}"]`);
     if (!slot || state.destroyed) return;
@@ -1333,16 +1347,28 @@ export function mountReader(root, photoId, query, options = {}) {
     if (slot.dataset.mounted === '1' && slot.dataset.generation === String(rec.generation)
         && slot.dataset.objectUrl === rec.url) return;
     const previousObjectUrl = slot.dataset.objectUrl || '';
+    const scrollAnchor = captureScrollAnchor();
+    // 保留占位高度直到最终 <img> onload，避免图片请求期间槽位塌陷导致滚动位置跳动。
+    if (state.mode === 'scroll' && slot.offsetHeight > 0) {
+      slot.style.minHeight = `${slot.offsetHeight}px`;
+      slot.dataset.reservedHeight = '1';
+    }
     slot.dataset.mounted = '1';
     slot.dataset.generation = String(rec.generation);
     slot.dataset.objectUrl = rec.url;
     const image = h('img', {
       src: rec.url, alt: `第${idx + 1}页`, draggable: 'false',
       onload: () => {
+        const beforeResize = captureScrollAnchor();
         backfillReaderImageDimensions({
           image, slot, index: idx, record: rec, state,
           generation: imageGeneration, sourceVersion: imageSourceVersion,
         });
+        if (slot.dataset.reservedHeight === '1') {
+          delete slot.dataset.reservedHeight;
+          slot.style.removeProperty('min-height');
+          restoreScrollAnchor(beforeResize || scrollAnchor);
+        }
       },
       onerror: () => {
         // Blob 的 MIME 可能看似图片但内容已损坏；此时 <img> 才是最终校验点。
@@ -1367,6 +1393,7 @@ export function mountReader(root, photoId, query, options = {}) {
     } else {
       slot.replaceChildren(h('div', { class: 'page-num' }, `${idx + 1}`), image);
     }
+    restoreScrollAnchor(scrollAnchor);
     if (previousObjectUrl && previousObjectUrl !== rec.url && retiredObjectUrls.delete(previousObjectUrl)) {
       URL.revokeObjectURL(previousObjectUrl);
     }

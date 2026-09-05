@@ -180,6 +180,7 @@ body.no-tab #main { padding-bottom: 24px; }
 
 .empty { text-align: center; color: var(--text-2); padding: 60px 0; }
 .empty .big { display: flex; align-items: center; justify-content: center; margin-bottom: 10px; }
+.loading-state { min-height: 180px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; }
 .error-box { text-align: center; padding: 50px 20px; color: var(--text-2); }
 .error-box .btn { margin-top: 14px; }
 

@@ -569,8 +569,16 @@ export function signinView(root, ctx) {
 
     const flat = (Array.isArray(data.record) ? data.record : []).flat()
       .filter((item) => item && typeof item === 'object' && !Array.isArray(item));
-    const todayIdx = Number(data.currentProgress) || 0;
-    const isTodaySigned = flat[new Date().getDate() - 1]?.signed === true;
+    const todayIdx = Math.max(0, Number(data.currentProgress) || 0);
+    // 上游记录不一定从当月 1 号开始，不能直接用 getDate() 作为数组下标。
+    // 优先按日期匹配，旧接口未返回日期时再保留原有的下标兼容逻辑。
+    const now = new Date();
+    const todayKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const datedToday = flat.find((item) => String(item.date || '').slice(0, 10) === todayKey);
+    const fallbackToday = flat[new Date().getDate() - 1];
+    const todayRecord = datedToday || (!flat.some((item) => item.date) ? fallbackToday : null);
+    const isTodaySigned = todayRecord?.signed === true;
+    const canCheckIn = !isTodaySigned && data.daily_id != null && String(data.daily_id) !== '';
     const grid = h('div', { class: 'sign-grid' });
     flat.forEach((d, i) => {
       grid.append(h('div', { class: 'd' + (d.signed ? ' signed' : '') + (d.bonus ? ' bonus' : '') },
@@ -580,9 +588,9 @@ export function signinView(root, ctx) {
     });
 
     const btn = h('button', {
-      class: 'btn primary block', type: 'button', disabled: isTodaySigned,
+      class: 'btn primary block', type: 'button', disabled: !canCheckIn,
       onclick: async () => {
-        if (isTodaySigned) return;
+        if (!canCheckIn) return;
         btn.disabled = true;
         btn.textContent = '签到中…';
         try {
@@ -596,9 +604,14 @@ export function signinView(root, ctx) {
             btn.disabled = false;
             btn.textContent = '立即签到';
           }
+        } finally {
+          if (!isInactive(ctx) && btn.isConnected && btn.textContent === '签到中…') {
+            btn.disabled = false;
+            btn.textContent = '立即签到';
+          }
         }
       },
-    }, isTodaySigned ? '今日已签到' : '立即签到');
+    }, isTodaySigned ? '今日已签到' : canCheckIn ? '立即签到' : '签到暂不可用');
 
     content.replaceChildren(
       h('div', { class: 'list-head' }, h('h2', null, '每日签到')),
