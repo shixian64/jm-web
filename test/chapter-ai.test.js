@@ -8,6 +8,7 @@ const sharp = require('sharp');
 const {
   ChapterAiScheduler,
   chapterSourceTitle,
+  isMeaningfulChapterTitle,
   effectiveChapterTitle,
   CHAPTER_AI_PROMPT_VERSION,
 } = require('../lib/chapter-ai');
@@ -100,6 +101,12 @@ try {
   assert.strictEqual(effectiveChapterTitle('', 'AI 标题'), 'AI 标题');
   assert.strictEqual(chapterSourceTitle({ name: '  名称  ', title: '备用标题' }), '名称');
   assert.strictEqual(chapterSourceTitle({ name: '  ', title: '备用标题' }), '备用标题');
+  assert.strictEqual(isMeaningfulChapterTitle('277'), false);
+  assert.strictEqual(isMeaningfulChapterTitle('休刊公告'), false);
+  assert.strictEqual(isMeaningfulChapterTitle('停更通知'), false);
+  assert.strictEqual(chapterSourceTitle({ name: '277', title: '实际标题' }), '实际标题');
+  assert.strictEqual(chapterSourceTitle({ name: '休刊公告', title: '休刊公告' }), '');
+  assert.strictEqual(effectiveChapterTitle('277', 'AI 标题'), 'AI 标题');
 
   const scheduler = new ChapterAiScheduler({
     dataDir: dir,
