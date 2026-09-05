@@ -108,6 +108,27 @@ Compose 默认只将 `127.0.0.1:3210` 发布到宿主机，适合同机 Nginx/Ca
 
 图片代理只做白名单校验、并发控制和流式转发，不在服务端把整章下载到内存或执行解扰；封面/缩略图会进入有界的进程内 LRU 缓存（默认总计 64 MiB、单张 2 MiB、保存 24 小时），章节正文仍保持流式转发，重启后缓存自动清空。上游暂时超时或 5xx 时，前端会以退避方式有限重试，后端也会短暂跳过故障线路。解扰在浏览器中进行。支持的浏览器会把解扰放入模块 Worker/OffscreenCanvas，减少阅读器主线程卡顿；旧 Safari/WebView 自动回退主线程 Canvas。阅读器会按设备内存以字节预算回收原图缓存，并在创建 Canvas 前拒绝超大或单轴过长的条漫图片。公网部署仍建议保持访问口令、反向代理和单实例资源上限，不要把它当作多人共享的无认证图片代理。
 
+#### 漫画翻译试运行（可选）
+
+翻译服务是独立的 Python 服务；阅读器会在当前页挂载前最多等待约 1.5 秒，邻页按预取顺序处理，超时则直接显示原图，不会在用户看过后迟到替换。先启动仓库内 `translation-service-poc` 目录中的服务：
+
+```bash
+cd translation-service-poc
+cp .env.example .env
+# .env 中设置随机 TRANSLATION_SERVICE_TOKEN
+docker compose up -d --build
+```
+
+若 `jm-web` 也在 Docker 中、翻译服务单独发布在宿主机 `127.0.0.1:8091`，在 `jm-web/.env` 设置：
+
+```text
+TRANSLATION_SERVICE_URL=http://host.docker.internal:8091
+TRANSLATION_SERVICE_TOKEN=与翻译服务相同的随机 token
+TRANSLATION_MAX_PAGE_BYTES=26214400
+```
+
+Compose 已加入 Linux `host-gateway` 映射。未设置 `TRANSLATION_SERVICE_URL` 时，阅读器保持原图。当前试运行后端仅覆盖繁体中文到简体中文的 `fast` 路径；复杂背景会安全回退原图。
+
 基础镜像默认固定 Node 与 Alpine 的补丁版本；生产发布还应将多架构 manifest digest 纳入制品清单。先用 `docker buildx imagetools inspect node:22.23.2-alpine3.24` 从可信仓库核验摘要，再把 `.env` 的 `JMW_NODE_IMAGE` 设置为 `node:22.23.2-alpine3.24@sha256:<核验得到的摘要>`。摘要与平台有关且会随版本升级，本仓库不写入未经当前构建环境验证的值。
 
 不使用 Compose 时可用 Docker 命名卷，该写法在 Linux、macOS 和 PowerShell 中一致：
@@ -186,6 +207,9 @@ docker compose --env-file .env \
 | `JMW_IMAGE_CACHE_TTL` | `86400` | 封面缓存有效期（秒，最短 60 秒） |
 | `JMW_IMAGE_QUEUE_LIMIT` | `96` | 图片代理等待队列上限（范围 0–512） |
 | `JMW_IMAGE_QUEUE_TIMEOUT` | `3000` | 单个图片请求排队最长时间（毫秒） |
+| `TRANSLATION_SERVICE_URL` | 空 | 可选翻译服务地址；留空则关闭翻译 |
+| `TRANSLATION_SERVICE_TOKEN` | 空 | 翻译服务内部访问令牌，不下发浏览器 |
+| `TRANSLATION_MAX_PAGE_BYTES` | `26214400` | 翻译单页请求/响应大小上限（字节） |
 | `JMW_MAX_API_RESPONSE_BYTES` | `16777216` | 上游 API 单响应大小上限（字节，范围 1–32 MiB） |
 | `JMW_MAX_AI_STREAM_BYTES` | `16777216` | 单次 AI 流式响应大小上限（字节，范围 1–64 MiB） |
 | `JMW_MAX_AI_CONCURRENCY` | `4` | AI 流式请求并发上限（范围 1–20） |

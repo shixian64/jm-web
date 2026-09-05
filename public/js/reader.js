@@ -1124,6 +1124,52 @@ export function mountReader(root, photoId, query, options = {}) {
     return blob;
   }
 
+  /**
+   * 当前页翻译采用“短等待、失败回退”策略：译图在首次挂载前返回，避免
+   * 用户先看到原图又被迟到的译图替换。邻页由同一个解码/翻译 Promise 预取。
+   */
+  async function translatePageBlob(blob, idx, generation, sourceVersion, imageSignal) {
+    if (!(blob instanceof Blob) || !blob.size) return null;
+    const query = new URLSearchParams({
+      aid: String(state.aid || ''),
+      photoId: String(state.photoId || ''),
+      pageIndex: String(idx),
+      targetLang: 'zh-CN',
+      pipeline: 'fast',
+      waitMs: '1500',
+    });
+    let response;
+    try {
+      response = await fetch(`/api/translation/page?${query.toString()}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': String(blob.type || 'image/webp').split(';', 1)[0] || 'image/webp',
+          'X-JMW-Data-Source': selectedDataSource(),
+        },
+        body: blob,
+        signal: imageSignal,
+      });
+      assertImageActive(generation, imageSignal);
+      if (!response.ok || response.status === 202 || response.status === 429) {
+        await response.arrayBuffer().catch(() => {});
+        return null;
+      }
+      const contentType = String(response.headers.get('content-type') || '')
+        .split(';', 1)[0].trim().toLowerCase();
+      if (contentType !== 'image/webp') {
+        await response.arrayBuffer().catch(() => {});
+        return null;
+      }
+      const translated = await response.blob();
+      assertImageActive(generation, imageSignal);
+      return translated.size ? translated : null;
+    } catch (error) {
+      if (error?.name === 'AbortError' || imageSignal.aborted) throw error;
+      // 翻译服务未配置、排队已满或单页失败都回退原图，不影响阅读器。
+      return null;
+    }
+  }
+
   /** 同一页的并发请求共享同一个解码 Promise；完成后从队列移除 */
   function ensureDecoded(idx) {
     if (state.destroyed || signal.aborted) return Promise.resolve(null);
@@ -1169,8 +1215,9 @@ export function mountReader(root, photoId, query, options = {}) {
       const img = state.images[idx];
       // 原图统一走 raws LRU：解扰页重看时也能复用已下载的 blob
       const blob = await getRawBlob(idx, generation, imageSignal);
+      let displayBlob = blob;
       if (!isRaw(idx)) {
-        const { blob: out, width, height } = await decodeFromBlob(
+        const decoded = await decodeFromBlob(
           blob,
           Number(state.photoId),
           img.page,
@@ -1180,15 +1227,21 @@ export function mountReader(root, photoId, query, options = {}) {
           },
         );
         assertImageActive(generation, imageSignal);
-        const url = URL.createObjectURL(out);
-        const rec = { url, width, height, generation, sourceVersion };
-        retireDecoded(state.decoded.get(idx));
-        state.decoded.set(idx, rec);
-        state.dims.set(idx, { width, height });
-        return rec;
+        displayBlob = decoded.blob;
+        state.dims.set(idx, { width: decoded.width, height: decoded.height });
       }
+      const translated = await translatePageBlob(displayBlob, idx, generation, sourceVersion, imageSignal);
+      if (translated) displayBlob = translated;
       assertImageActive(generation, imageSignal);
-      const url = URL.createObjectURL(blob);
+      // 保留未解码原图的轻量路径；有译图时仅把最终 Blob 换成译图。
+      let displayUrl;
+      if (displayBlob === blob) {
+        const url = URL.createObjectURL(blob);
+        displayUrl = url;
+      } else {
+        displayUrl = URL.createObjectURL(displayBlob);
+      }
+      const url = displayUrl;
       const rec = { url, generation, sourceVersion };
       retireDecoded(state.decoded.get(idx));
       state.decoded.set(idx, rec);

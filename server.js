@@ -20,6 +20,9 @@
  *  JMW_IMAGE_CACHE_TTL 图片内存缓存有效期秒数（默认 86400）
  *  JMW_IMAGE_QUEUE_LIMIT 图片代理等待队列上限（默认 96）
  *  JMW_IMAGE_QUEUE_TIMEOUT 图片代理排队最长等待毫秒（默认 3000）
+ *  TRANSLATION_SERVICE_URL 翻译服务地址；留空则阅读器自动回退原图
+ *  TRANSLATION_SERVICE_TOKEN 翻译服务内部访问令牌
+ *  TRANSLATION_MAX_PAGE_BYTES 翻译单页请求/响应上限（默认 25 MiB）
  *  JMW_TRUST_PROXY 可信反代 IP/CIDR（逗号分隔；环回默认可信）
  *  JMW_DATA_DIR    数据目录（默认 ./data）
  */
@@ -96,6 +99,13 @@ const IMAGE_QUEUE_TIMEOUT = Math.min(
 );
 const IMAGE_DRAIN_TIMEOUT = 15000;
 const IMAGE_PATH_TOTAL_TIMEOUT = 30000;
+const TRANSLATION_SERVICE_URL = String(process.env.TRANSLATION_SERVICE_URL || '').trim().replace(/\/+$/, '');
+const TRANSLATION_SERVICE_TOKEN = String(process.env.TRANSLATION_SERVICE_TOKEN || '');
+const TRANSLATION_MAX_PAGE_BYTES = Math.min(
+  100 * 1024 * 1024,
+  Math.max(1024 * 1024, Number(process.env.TRANSLATION_MAX_PAGE_BYTES) || 25 * 1024 * 1024),
+);
+const TRANSLATION_IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']);
 let activeImageRequests = 0;
 const imageRequestsByClient = new Map();
 // 只缓存成功的封面/缩略图，按字节和 TTL 双重限制；章节原图通常走流式转发，
@@ -208,6 +218,7 @@ const API_METHODS = Object.freeze({
   '/history/delete': ['POST'],
   '/chapter': ['GET'],
   '/img': ['GET'],
+  '/translation/page': ['POST'],
   '/setting': ['GET'],
   '/ai/config': ['GET'],
   '/ai/chat': ['POST'],
@@ -1619,12 +1630,117 @@ async function proxyEventStream(res, response, signal) {
   }
 }
 
+function translationServiceHeaders(contentType) {
+  const headers = { 'Content-Type': contentType };
+  if (TRANSLATION_SERVICE_TOKEN) headers.Authorization = `Bearer ${TRANSLATION_SERVICE_TOKEN}`;
+  return headers;
+}
+
+function translationQuery(u) {
+  const allowed = ['aid', 'photoId', 'pageIndex', 'targetLang', 'pipeline', 'waitMs'];
+  const query = new URLSearchParams();
+  for (const key of allowed) {
+    const value = String(u.searchParams.get(key) || '').trim();
+    if (value) query.set(key, value);
+  }
+  return query;
+}
+
+async function proxyTranslationPage(req, res, u, requestSignal) {
+  if (!TRANSLATION_SERVICE_URL) {
+    if (typeof req.resume === 'function') req.resume();
+    throw new ApiError('翻译服务未配置', 503, { expose: true, publicMessage: '翻译服务暂不可用' });
+  }
+  const contentType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
+  if (!TRANSLATION_IMAGE_MIMES.has(contentType)) {
+    if (typeof req.resume === 'function') req.resume();
+    throw new ApiError('请以 image/* 二进制上传图片', 415);
+  }
+  const source = await readBody(req, TRANSLATION_MAX_PAGE_BYTES);
+  if (!source.length) throw new ApiError('图片请求体为空', 400);
+
+  let endpoint;
+  try {
+    endpoint = new URL('/v1/translate/page', `${TRANSLATION_SERVICE_URL}/`);
+    endpoint.search = translationQuery(u).toString();
+  } catch (_) {
+    throw new ApiError('翻译服务地址配置无效', 503, { expose: true, publicMessage: '翻译服务暂不可用' });
+  }
+
+  let upstream;
+  try {
+    upstream = await fetch(endpoint, {
+      method: 'POST',
+      headers: translationServiceHeaders(contentType),
+      body: source,
+      signal: requestSignal,
+    });
+  } catch (error) {
+    if (requestSignal?.aborted || error?.name === 'AbortError') throw error;
+    throw new ApiError('翻译服务连接失败', 502, { cause: error });
+  }
+
+  const responseBody = await readResponseBuffer(upstream, 2 * 1024 * 1024, '翻译服务响应', requestSignal);
+  let payload = null;
+  try { payload = responseBody.length ? JSON.parse(responseBody.toString('utf8')) : null; } catch (_) {}
+  if (!upstream.ok) {
+    const status = upstream.status === 429 ? 429 : (upstream.status >= 400 && upstream.status < 500 ? upstream.status : 502);
+    return sendJson(res, status, {
+      status: payload?.status || 'error',
+      error: status === 429 ? 'translation_queue_full' : 'translation_unavailable',
+      retryAfterMs: payload?.retryAfterMs || 2000,
+    }, status === 429 ? { 'Retry-After': '2' } : {});
+  }
+  if (!payload || typeof payload !== 'object') {
+    throw new ApiError('翻译服务响应格式无效', 502);
+  }
+  if (payload.status !== 'ready' || !payload.imageUrl) {
+    return sendJson(res, 202, {
+      status: payload.status || 'queued',
+      jobId: payload.jobId || null,
+      pollAfterMs: payload.pollAfterMs || 1000,
+    }, { 'Retry-After': '1' });
+  }
+
+  let resultUrl;
+  try { resultUrl = new URL(String(payload.imageUrl), `${TRANSLATION_SERVICE_URL}/`); } catch (_) {
+    throw new ApiError('翻译结果地址无效', 502);
+  }
+  const serviceOrigin = new URL(`${TRANSLATION_SERVICE_URL}/`).origin;
+  if (resultUrl.origin !== serviceOrigin || !/^\/v1\/results\/[0-9a-f]{64}\.webp$/.test(resultUrl.pathname)) {
+    throw new ApiError('翻译结果地址不受信任', 502);
+  }
+  let translated;
+  try {
+    translated = await fetch(resultUrl, {
+      headers: translationServiceHeaders('application/json'),
+      signal: requestSignal,
+    });
+  } catch (error) {
+    if (requestSignal?.aborted || error?.name === 'AbortError') throw error;
+    throw new ApiError('翻译结果获取失败', 502, { cause: error });
+  }
+  if (!translated.ok) throw new ApiError('翻译结果获取失败', 502);
+  const resultType = String(translated.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
+  if (resultType !== 'image/webp') throw new ApiError('翻译结果不是 WebP 图片', 502);
+  const output = await readResponseBuffer(translated, TRANSLATION_MAX_PAGE_BYTES, '翻译结果', requestSignal);
+  if (!output.length) throw new ApiError('翻译结果为空', 502);
+  res.writeHead(200, baseHeaders({
+    'Content-Type': 'image/webp',
+    'Content-Length': output.length,
+    'Cache-Control': 'private, max-age=86400',
+    'X-Translation-Status': 'ready',
+    'X-Translation-Cache-Hit': payload.cacheHit === true ? '1' : '0',
+  }));
+  return res.end(output);
+}
+
 async function api(req, res, u, requestSignal) {
   const route = u.pathname.replace(/^\/api/, '');
   const q = u.searchParams;
   // /api/auth 在口令验证前调用；/api/img 只依赖站点门禁和服务端图片白名单。
   // 两者都不创建 JM Session，避免首屏并发图片生成大量空 jmw_sid 文件。
-  const stateless = route === '/auth' || route === '/img';
+  const stateless = route === '/auth' || route === '/img' || route === '/translation/page';
   const jar = stateless ? { cookiesByOrigin: {}, user: null, apiHost: '' } : ensureJar(req, res);
 
   // 数据源由浏览器设置选择，但只能是固定枚举；实际 origin 始终来自服务端白名单。
@@ -2141,6 +2257,9 @@ async function api(req, res, u, requestSignal) {
         releaseImageSlot();
       }
     }
+
+    case '/translation/page':
+      return await proxyTranslationPage(req, res, u, requestSignal);
 
     /* ---- 高级功能 ---- */
     case '/ai/config':
