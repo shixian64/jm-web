@@ -1948,11 +1948,11 @@ async function api(req, res, u, requestSignal) {
       if (Array.isArray(value?.series)) {
         value.series = value.series.map((row) => {
           const rec = chapterAi.get(aid, String(row?.id || ''));
-          // 上游章节名是默认/优先标题；只有确实缺少上游标题时，才把已完成
-          // 的 AI 标题作为列表名称。描述和总结只留在 chapter-ai 记录中，
-          // 暂不注入漫画详情响应，待确定展示位置后再单独接入。
+          // 有效的上游章节名优先；数字、休刊公告等占位标题视为缺失。
+          // 旧记录重新排队时也先沿用已有 AI 标题，避免重新分析期间标题闪回序号。
+          // 描述和总结只留在 chapter-ai 记录中，暂不注入漫画详情响应。
           const sourceTitle = chapterSourceTitle(row);
-          if (rec?.status === 'completed' && !sourceTitle) {
+          if (rec?.generatedTitle && !sourceTitle) {
             // 这里 sourceTitle 已确认为空，因此只取本次分析生成的标题；
             // 不能用记录里旧的 sourceName 覆盖当前章节的无标题状态。
             const title = effectiveChapterTitle(sourceTitle, rec.generatedTitle);
