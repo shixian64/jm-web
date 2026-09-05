@@ -2,6 +2,9 @@
 # 与主 Compose 文件一起使用：
 # docker compose -f docker-compose.yml -f docker-compose.ghcr.yml --env-file .env up -d --pull always
 services:
+  translation-service:
+    image: "${TRANSLATION_IMAGE:-ghcr.io/shixian64/jm-web-translation:latest}"
+    build: !reset null
   jm-web:
     image: "${JMW_IMAGE:-ghcr.io/shixian64/jm-web:latest}"
     # 覆盖主文件的 build，避免部署预构建镜像时需要源码和本地构建工具。

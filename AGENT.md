@@ -35,6 +35,7 @@ server.js（零第三方运行依赖的 Node.js HTTP 服务）
 
 - Node.js `>=20`；Docker 生产基线见 `Dockerfile`。
 - 后端仅为服务端章节视觉分析引入 `sharp` 图片编解码依赖；不要再为小功能随意引入框架或供应链依赖。
+- 漫画繁简翻译由仓库内 `translation-service-poc/` 的独立 Python 容器处理，随主 Compose 统一管理；不要把 OCR 依赖并入 Node 镜像。
 - 前端无构建步骤，浏览器直接加载 `public/` 下的 ES Module。
 - SPA 使用 Hash 路由，服务端对非资源 GET 提供 `index.html` 回退。
 
@@ -73,6 +74,7 @@ jm-web/
 │       ├── descramble-worker.js 模块 Worker / OffscreenCanvas 解扰
 │       └── descramble.js     Worker 调度与主线程兼容回退
 ├── test/                     单元、后端、安全、移动端和部署回归
+├── translation-service-poc/  Python OCR/繁简转换服务、Dockerfile 与独立测试
 ├── data/                     运行状态；不进入 Git 或普通发布制品
 ├── Dockerfile
 ├── docker-compose.yml
@@ -162,6 +164,8 @@ Worker/OffscreenCanvas，且申请画布前检查像素、单轴尺寸与估算�
 
 ## 7. 持久化状态与秘密
 
+翻译生成结果单独保存到 Compose 命名卷 `translation-cache`（容器内 `/app/cache`），不覆盖原图或主站 `data/`。普通停止、重启、`down` 不删除缓存；不要用 `down -v` 进行升级。两个服务共享根 `.env` 的 `TRANSLATION_SERVICE_TOKEN`，翻译端口不发布到宿主机。
+
 容器内状态目录：
 
 ```text
@@ -243,6 +247,9 @@ docker compose --project-name jm-web \
 
 ### GHCR 预构建镜像（可选）
 
+- 主 Compose 同时构建 `jm-web` 和 `translation-service`；不带服务名的 `up -d`、`stop`、`restart`、`down` 统一管理两个容器。单独操作 `jm-web` 容器不代表同步操作翻译容器。
+- GHCR workflow 同时发布 `jm-web` 和 `jm-web-translation` 两个镜像；预构建覆盖文件必须对两者都禁用 build，首次部署前确认两个镜像的对应标签均已发布。
+
 - `.github/workflows/docker-publish.yml` 只在测试通过后发布 `linux/amd64` 与
   `linux/arm64`；Pull Request 只构建校验，不推送镜像。
 - `vX.Y.Z` 版本标签生成版本标签和 `latest`；默认分支生成 `latest` 与 `edge`。GHCR 首次发布后，
@@ -268,6 +275,11 @@ lib/
 package.json
 public/
 server.js
+translation-service-poc/.dockerignore
+translation-service-poc/Dockerfile
+translation-service-poc/requirements.txt
+translation-service-poc/pipeline.py
+translation-service-poc/service.py
 ```
 
 制品禁止包含：
@@ -276,6 +288,9 @@ server.js
 .git/
 data/
 test/
+translation-service-poc/tests/
+translation-service-poc/cache/
+__pycache__/
 .env
 生产 Cookie、密码、Key、Session
 临时 QA 请求头或业务响应
@@ -288,6 +303,7 @@ test/
 ```bash
 npm test
 npm run check
+python -m pytest translation-service-poc/tests -q
 git diff --check
 docker compose config --quiet
 docker compose --env-file .env.example config --quiet

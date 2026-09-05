@@ -1,0 +1,9 @@
+cache/
+benchmark-*/
+*.log
+prototype-*.webp
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.env
+tests/

@@ -55,11 +55,41 @@ jobs:
           cache-from: type=gha,scope=docker-ci
           cache-to: type=gha,mode=max,scope=docker-ci
 
+      - name: Build translation test image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./translation-service-poc
+          file: ./translation-service-poc/Dockerfile
+          platforms: linux/amd64
+          tags: jm-web-translation:ci
+          load: true
+          push: false
+          cache-from: type=gha,scope=translation-ci
+          cache-to: type=gha,mode=max,scope=translation-ci
+
+      - name: Test translation service in image
+        run: |
+          docker run --rm \
+            --mount type=bind,source="$PWD/translation-service-poc/tests",target=/app/tests,readonly \
+            --entrypoint sh jm-web-translation:ci \
+            -c 'pip install --user "pytest>=8,<9" "httpx>=0.27,<1" && python -m pytest /app/tests -q -p no:cacheprovider'
+
   publish:
     name: Publish multi-architecture image
     needs: test
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - component: web
+            context: .
+            file: ./Dockerfile
+            suffix: ""
+          - component: translation
+            context: ./translation-service-poc
+            file: ./translation-service-poc/Dockerfile
+            suffix: "-translation"
     permissions:
       contents: read
       packages: write
@@ -78,7 +108,9 @@ jobs:
       - name: Normalize image name
         id: image
         shell: bash
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+        env:
+          IMAGE_SUFFIX: ${{ matrix.suffix }}
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}${IMAGE_SUFFIX}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -103,7 +135,7 @@ jobs:
             type=raw,value=edge,enable={{is_default_branch}}
             type=sha,prefix=sha-
           labels: |
-            org.opencontainers.image.title=JM Web
+            org.opencontainers.image.title=JM Web (${{ matrix.component }})
             org.opencontainers.image.description=JM 漫画自部署网页版
             org.opencontainers.image.licenses=GPL-3.0
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
@@ -111,13 +143,13 @@ jobs:
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: ./Dockerfile
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=docker-publish
-          cache-to: type=gha,mode=max,scope=docker-publish
+          cache-from: type=gha,scope=docker-publish-${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=docker-publish-${{ matrix.component }}
           provenance: mode=max
           sbom: true

@@ -33,6 +33,9 @@ esac
 required=(
   .dockerignore .env.example AGENT.md AGENTS.md Dockerfile LICENSE README.md
   docker-compose.yml lib package.json public server.js
+  translation-service-poc/.dockerignore translation-service-poc/Dockerfile
+  translation-service-poc/requirements.txt translation-service-poc/pipeline.py
+  translation-service-poc/service.py
 )
 for item in "${required[@]}"; do
   if [[ ! -e "$artifact/$item" || -L "$artifact/$item" ]]; then
@@ -53,7 +56,7 @@ if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg) || typeof pkg.name !==
 
 // 递归检查路径，不能只看制品根目录：嵌套 data/.git/.env 同样可能携带
 // 生产状态或凭据。符号链接一律拒绝，避免校验路径与实际打包内容不一致。
-const forbiddenDirs = new Set(['.git', 'data', 'test', 'node_modules']);
+const forbiddenDirs = new Set(['.git', 'data', 'test', 'tests', 'node_modules', '__pycache__', '.pytest_cache', 'cache']);
 const walk = (dir, relative = '') => {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const childRelative = relative ? `${relative}/${entry.name}` : entry.name;

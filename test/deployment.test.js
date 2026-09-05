@@ -101,10 +101,24 @@ try {
     fs.cpSync(path.join(root, item), path.join(artifact, item), { recursive: true });
   }
   for (const dir of ['lib', 'public']) fs.cpSync(path.join(root, dir), path.join(artifact, dir), { recursive: true });
+  fs.mkdirSync(path.join(artifact, 'translation-service-poc'));
+  for (const item of ['.dockerignore', 'Dockerfile', 'requirements.txt', 'pipeline.py', 'service.py']) {
+    fs.copyFileSync(path.join(root, 'translation-service-poc', item), path.join(artifact, 'translation-service-poc', item));
+  }
   const output = execFileSync(artifactValidator, [artifact], {
     env: { ...process.env, RELEASE_BUILD_STATUS: 'PASS' }, encoding: 'utf8',
   });
   assert.match(output, /RELEASE-MANIFEST: PASS/);
+  const pipelinePath = path.join(artifact, 'translation-service-poc', 'pipeline.py');
+  fs.rmSync(pipelinePath);
+  assert.throws(
+    () => execFileSync(artifactValidator, [artifact], {
+      env: { ...process.env, RELEASE_BUILD_STATUS: 'PASS' }, encoding: 'utf8',
+    }),
+    /status|exited with|pipeline\.py/i,
+    '缺少翻译运行源码的制品不得通过',
+  );
+  fs.copyFileSync(path.join(root, 'translation-service-poc', 'pipeline.py'), pipelinePath);
   assert.throws(
     () => execFileSync(artifactValidator, [artifact], { env: { ...process.env }, encoding: 'utf8' }),
     /status|exited with|package\.json/i,

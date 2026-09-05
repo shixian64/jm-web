@@ -1,4 +1,50 @@
 services:
+  translation-service:
+    build:
+      context: ./translation-service-poc
+    container_name: jm-translation
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    cpus: "${TRANSLATION_CPU_LIMIT:-2.0}"
+    mem_limit: "${TRANSLATION_MEMORY_LIMIT:-2g}"
+    pids_limit: "${TRANSLATION_PIDS_LIMIT:-256}"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
+    volumes:
+      - translation-cache:/app/cache
+    environment:
+      TRANSLATION_CACHE_DIR: /app/cache
+      TRANSLATION_WORKERS: "${TRANSLATION_WORKERS:-2}"
+      TRANSLATION_MAX_INFLIGHT: "${TRANSLATION_MAX_INFLIGHT:-8}"
+      TRANSLATION_MAX_UPLOAD_BYTES: "${TRANSLATION_MAX_UPLOAD_BYTES:-26214400}"
+      TRANSLATION_MAX_PIXELS: "${TRANSLATION_MAX_PIXELS:-20000000}"
+      TRANSLATION_INLINE_WAIT_MS: "${TRANSLATION_INLINE_WAIT_MS:-1800}"
+      TRANSLATION_JOB_TTL_SECONDS: "${TRANSLATION_JOB_TTL_SECONDS:-3600}"
+      TRANSLATION_RESULT_MAX_AGE_SECONDS: "${TRANSLATION_RESULT_MAX_AGE_SECONDS:-86400}"
+      TRANSLATION_WEBP_METHOD: "${TRANSLATION_WEBP_METHOD:-2}"
+      TRANSLATION_WEBP_QUALITY: "${TRANSLATION_WEBP_QUALITY:-92}"
+      TRANSLATION_WARMUP: "${TRANSLATION_WARMUP:-1}"
+      TRANSLATION_USE_CUDA: "${TRANSLATION_USE_CUDA:-0}"
+      TRANSLATION_SERVICE_TOKEN: "${TRANSLATION_SERVICE_TOKEN:-}"
+      TRANSLATION_FONT: "${TRANSLATION_FONT:-}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8091/healthz', timeout=2); raise SystemExit(0 if r.status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "${TRANSLATION_LOG_MAX_SIZE:-10m}"
+        max-file: "${TRANSLATION_LOG_MAX_FILE:-3}"
+
   jm-web:
     build:
       context: .
@@ -18,10 +64,9 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # Linux Docker 中通过 host.docker.internal 访问宿主机上的独立翻译服务。
-    # 不启用翻译时该映射无副作用。
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    depends_on:
+      translation-service:
+        condition: service_healthy
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m
     logging:
@@ -53,7 +98,7 @@ services:
       JMW_IMAGE_CACHE_TTL: "${JMW_IMAGE_CACHE_TTL:-86400}"
       JMW_IMAGE_QUEUE_LIMIT: "${JMW_IMAGE_QUEUE_LIMIT:-96}"
       JMW_IMAGE_QUEUE_TIMEOUT: "${JMW_IMAGE_QUEUE_TIMEOUT:-3000}"
-      TRANSLATION_SERVICE_URL: "${TRANSLATION_SERVICE_URL:-}"
+      TRANSLATION_SERVICE_URL: "${TRANSLATION_SERVICE_URL-http://translation-service:8091}"
       TRANSLATION_SERVICE_TOKEN: "${TRANSLATION_SERVICE_TOKEN:-}"
       TRANSLATION_MAX_PAGE_BYTES: "${TRANSLATION_MAX_PAGE_BYTES:-26214400}"
       JMW_MAX_API_RESPONSE_BYTES: "${JMW_MAX_API_RESPONSE_BYTES:-16777216}"
@@ -79,3 +124,6 @@ services:
         bind:
           # 禁止 Docker 以 root 静默创建宿主机目录，避免非 root 应用启动后才报权限错误。
           create_host_path: false
+
+volumes:
+  translation-cache:

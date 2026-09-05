@@ -108,26 +108,31 @@ Compose 默认只将 `127.0.0.1:3210` 发布到宿主机，适合同机 Nginx/Ca
 
 图片代理只做白名单校验、并发控制和流式转发，不在服务端把整章下载到内存或执行解扰；封面/缩略图会进入有界的进程内 LRU 缓存（默认总计 64 MiB、单张 2 MiB、保存 24 小时），章节正文仍保持流式转发，重启后缓存自动清空。上游暂时超时或 5xx 时，前端会以退避方式有限重试，后端也会短暂跳过故障线路。解扰在浏览器中进行。支持的浏览器会把解扰放入模块 Worker/OffscreenCanvas，减少阅读器主线程卡顿；旧 Safari/WebView 自动回退主线程 Canvas。阅读器会按设备内存以字节预算回收原图缓存，并在创建 Canvas 前拒绝超大或单轴过长的条漫图片。公网部署仍建议保持访问口令、反向代理和单实例资源上限，不要把它当作多人共享的无认证图片代理。
 
-#### 漫画翻译试运行（可选）
+#### 漫画翻译服务（随主服务统一管理）
 
-翻译服务是独立的 Python 服务；阅读器会在当前页挂载前最多等待约 1.5 秒，邻页按预取顺序处理，超时则直接显示原图，不会在用户看过后迟到替换。先启动仓库内 `translation-service-poc` 目录中的服务：
+翻译服务仍是独立的 Python 容器，但已经纳入主项目 Compose。阅读器会在当前页挂载前最多等待约 1.5 秒，邻页按预取顺序处理，超时则直接显示原图，不会在用户看过后迟到替换。首次部署只需：
 
 ```bash
-cd translation-service-poc
 cp .env.example .env
-# .env 中设置随机 TRANSLATION_SERVICE_TOKEN
+# .env 中设置高强度 ACCESS_PASSWORD 和随机 TRANSLATION_SERVICE_TOKEN
+mkdir -p data
+sudo chown 1000:1000 data
 docker compose up -d --build
 ```
 
-若 `jm-web` 也在 Docker 中、翻译服务单独发布在宿主机 `127.0.0.1:8091`，在 `jm-web/.env` 设置：
+主服务和翻译服务会一起启动、停止、重启：
 
-```text
-TRANSLATION_SERVICE_URL=http://host.docker.internal:8091
-TRANSLATION_SERVICE_TOKEN=与翻译服务相同的随机 token
-TRANSLATION_MAX_PAGE_BYTES=26214400
+```bash
+docker compose stop
+docker compose restart
+docker compose down
 ```
 
-Compose 已加入 Linux `host-gateway` 映射。未设置 `TRANSLATION_SERVICE_URL` 时，阅读器保持原图。当前试运行后端仅覆盖繁体中文到简体中文的 `fast` 路径；复杂背景会安全回退原图。
+翻译容器只加入 Compose 内部网络，不对宿主机发布 8091 端口；`jm-web` 通过 `http://translation-service:8091` 访问。设置 `TRANSLATION_SERVICE_URL=` 可关闭主站翻译调用，但翻译容器仍会随 Compose 启动。当前后端仅覆盖繁体中文到简体中文的 `fast` 路径；复杂背景会安全回退原图。翻译结果保存在 Docker 命名卷 `translation-cache` 中。
+
+已有部署请保留原 `.env`，将其中的 `TRANSLATION_SERVICE_URL` 改为 `http://translation-service:8091`，再执行 `docker compose up -d --build`；不要用示例覆盖生产配置。第一次构建需要下载 Python/OCR 依赖。翻译容器默认上限为 2 CPU、2 GiB 内存，2 个工作线程、8 个在途任务，可通过 `.env` 的 `TRANSLATION_*` 调整。
+
+上述命令必须在项目目录执行且不指定单个服务名。`docker restart jm-web` 或 `docker compose restart jm-web` 只重启主容器；两个容器的异常退出重启也各自独立。`docker compose down` 保留译图缓存，`down -v` 会删除命名卷，不要用于普通升级。
 
 基础镜像默认固定 Node 与 Alpine 的补丁版本；生产发布还应将多架构 manifest digest 纳入制品清单。先用 `docker buildx imagetools inspect node:22.23.2-alpine3.24` 从可信仓库核验摘要，再把 `.env` 的 `JMW_NODE_IMAGE` 设置为 `node:22.23.2-alpine3.24@sha256:<核验得到的摘要>`。摘要与平台有关且会随版本升级，本仓库不写入未经当前构建环境验证的值。
 
@@ -142,12 +147,12 @@ docker run -d --name jm-web --restart unless-stopped --user 1000:1000 --read-onl
 #### 使用 GitHub Actions 发布的预构建镜像
 
 仓库内的 `.github/workflows/docker-publish.yml` 会在测试通过后，使用 GitHub Actions
-构建并发布 `linux/amd64`（x86_64）和 `linux/arm64`（64 位 ARM）镜像到 GHCR，
+为主服务和翻译服务分别构建并发布 `linux/amd64`（x86_64）和 `linux/arm64`（64 位 ARM）镜像到 GHCR，
 不需要维护者准备 ARM 机器。推送 `v1.2.3` 这样的版本标签时会生成 `latest`、
 `1.2.3`、`1.2` 和 `1` 标签；`main` 分支会生成 `latest` 与 `edge`，其中 `edge`
 适合测试最新代码。生产环境建议在版本标签生成后固定到具体版本或 digest。
 
-维护者首次发布后，需要在 GitHub 的 **Packages → jm-web → Package settings** 中确认包的
+维护者首次发布后，需要在 GitHub 的 **Packages → Package settings** 中分别确认 `jm-web` 和 `jm-web-translation` 两个包的
 可见性。个人或小范围部署建议保持 **Private**，只向需要部署的账号授予 read:packages；
 公开包虽然部署最方便，但镜像层仍包含 `server.js`、`lib/` 和前端资源，能拉取镜像的人
 可以解出这些文件，不能把“公开镜像”当作源码保密方案。无论可见性如何，生产环境都应
@@ -170,8 +175,8 @@ docker compose --env-file .env \
   -f docker-compose.yml -f docker-compose.ghcr.yml up -d --pull always --no-build
 ```
 
-`docker-compose.ghcr.yml` 默认使用 `ghcr.io/shixian64/jm-web:latest`；Fork 本仓库或
-使用自己的构建时，在 `.env` 中设置 `JMW_IMAGE=ghcr.io/<owner>/jm-web:<tag>`。
+`docker-compose.ghcr.yml` 默认使用 `ghcr.io/shixian64/jm-web:latest` 和 `ghcr.io/shixian64/jm-web-translation:latest`；Fork 本仓库或
+使用自己的构建时，在 `.env` 中分别设置 `JMW_IMAGE` 和 `TRANSLATION_IMAGE`，建议两个镜像固定到同一版本标签。翻译镜像须先由更新后的发布 workflow 成功构建，才能使用 `--no-build` 部署。
 公开包无需登录 GHCR；私有包则先执行 `docker login ghcr.io`。升级时重复执行
 `up -d --pull always --no-build` 即可，`data/` 目录不要删除。Compose 的安全限制、
 端口发布和反向代理要求与本地构建方式相同。
@@ -207,7 +212,10 @@ docker compose --env-file .env \
 | `JMW_IMAGE_CACHE_TTL` | `86400` | 封面缓存有效期（秒，最短 60 秒） |
 | `JMW_IMAGE_QUEUE_LIMIT` | `96` | 图片代理等待队列上限（范围 0–512） |
 | `JMW_IMAGE_QUEUE_TIMEOUT` | `3000` | 单个图片请求排队最长时间（毫秒） |
-| `TRANSLATION_SERVICE_URL` | 空 | 可选翻译服务地址；留空则关闭翻译 |
+| `TRANSLATION_SERVICE_URL` | 直接运行为空；Compose 为 `http://translation-service:8091` | 翻译服务地址；显式留空则关闭主站翻译调用 |
+| `TRANSLATION_IMAGE` | GHCR 覆盖默认为 `ghcr.io/shixian64/jm-web-translation:latest` | 翻译预构建镜像地址，可指定版本或 digest |
+| `TRANSLATION_CPU_LIMIT` / `TRANSLATION_MEMORY_LIMIT` | `2.0` / `2g` | 翻译容器 CPU / 内存上限 |
+| `TRANSLATION_WORKERS` / `TRANSLATION_MAX_INFLIGHT` | `2` / `8` | 翻译工作线程数 / 在途任务上限 |
 | `TRANSLATION_SERVICE_TOKEN` | 空 | 翻译服务内部访问令牌，不下发浏览器 |
 | `TRANSLATION_MAX_PAGE_BYTES` | `26214400` | 翻译单页请求/响应大小上限（字节） |
 | `JMW_MAX_API_RESPONSE_BYTES` | `16777216` | 上游 API 单响应大小上限（字节，范围 1–32 MiB） |
