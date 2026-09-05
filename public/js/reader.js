@@ -1339,6 +1339,12 @@ export function mountReader(root, photoId, query, options = {}) {
     if (Math.abs(delta) > 0.5) pages.scrollTop += delta;
   }
 
+  function clearReservedHeight(slot) {
+    if (!slot) return;
+    delete slot.dataset.reservedHeight;
+    slot.style.removeProperty('min-height');
+  }
+
   function mountSlot(idx) {
     const slot = pages.querySelector(`.slot[data-idx="${idx}"]`);
     if (!slot || state.destroyed) return;
@@ -1365,8 +1371,7 @@ export function mountReader(root, photoId, query, options = {}) {
           generation: imageGeneration, sourceVersion: imageSourceVersion,
         });
         if (slot.dataset.reservedHeight === '1') {
-          delete slot.dataset.reservedHeight;
-          slot.style.removeProperty('min-height');
+          clearReservedHeight(slot);
           restoreScrollAnchor(beforeResize || scrollAnchor);
         }
       },
@@ -1382,6 +1387,7 @@ export function mountReader(root, photoId, query, options = {}) {
         slot.dataset.mounted = '0';
         delete slot.dataset.generation;
         delete slot.dataset.objectUrl;
+        clearReservedHeight(slot);
         slot.replaceChildren(placeholderFor(idx));
         markError(idx, '图片数据损坏或浏览器无法解码');
       },
@@ -1465,6 +1471,7 @@ export function mountReader(root, photoId, query, options = {}) {
       slot.dataset.mounted = '0';
       delete slot.dataset.generation;
       delete slot.dataset.objectUrl;
+      clearReservedHeight(slot);
       slot.replaceChildren(placeholderFor(idx));
     }
   }
