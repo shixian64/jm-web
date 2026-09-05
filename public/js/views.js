@@ -1009,6 +1009,8 @@ export async function albumView(root, id, ctx) {
       h('div', { class: 'section-title chapter-section-title', style: 'margin-top:16px' },
         h('span', null, `章节 (${series.length})`),
         h('div', { class: 'chapter-download-tools' }, selectionText, selectAll, queueSelected)),
+      h('div', { class: 'hint chapter-ai-hint' },
+        '如服务器已配置 AI，符合条件的章节会在后台自动分析；缺失章节名时使用 AI 生成标题，剧情摘要暂不在界面显示。'),
     );
     const chapterList = h('div', { class: 'chapter-list' });
     series.forEach((s, i) => {

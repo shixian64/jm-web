@@ -1613,6 +1613,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 }
 .chapter-item:hover { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 42%, var(--line)); background: var(--primary-weak); transform: translateY(-1px); }
 .chapter-section-title { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+.chapter-ai-hint { margin: -4px 0 8px; color: var(--text-2); font-size: 12px; }
 .chapter-download-tools { display:flex; align-items:center; justify-content:flex-end; gap:7px; flex-wrap:wrap; }
 .chapter-download-tools .hint { margin:0; font-weight:400; }
 .chapter-download-tools .btn { min-height:32px; padding:5px 9px; font-size:12px; }
