@@ -1261,7 +1261,10 @@ export async function aiView(root, _m, _q, ctx) {
     saveAiSessions([current, ...all].slice(0, 50));
   };
   const renderSidebar = () => sidebar.replaceChildren(
-    h('button', { class: 'btn primary block', disabled: !!controller, onclick: () => {
+    h('div', { class: 'ai-sidebar-head' },
+      h('div', { class: 'ai-sidebar-title' }, h('span', { class: 'ai-spark' }, '✦'), h('span', null, 'AI 对话')),
+      h('span', { class: 'ai-sidebar-count' }, `${sessions.length} 个对话`)),
+    h('button', { class: 'btn primary block ai-new-session', disabled: !!controller, onclick: () => {
       if (controller) return; persist(); current = newAiSession(personaSel.value); persist(); renderAll(); input.focus();
     } }, '新建对话'),
     ...[current, ...getAiSessions().map(normalizeSession).filter((session) => session.id !== current.id)].map((session) => h('div', { class: `ai-session ${session.id === current.id ? 'on' : ''}` },
@@ -1372,12 +1375,19 @@ export async function aiView(root, _m, _q, ctx) {
     renderSidebar(); renderMessages();
   };
   page.append(sidebar, h('section', { class: 'ai-main' },
-    h('div', { class: 'ai-toolbar' }, personaSel,
+    h('div', { class: 'ai-toolbar' },
+      h('div', { class: 'ai-toolbar-title' }, h('span', { class: 'ai-toolbar-dot' }), h('div', null, h('strong', null, '智能助手'), h('small', null, cfg.enabled ? '在线 · 随时为你整理思路' : '等待配置 AI 服务'))),
+      h('div', { class: 'ai-toolbar-controls' }, personaSel,
       h('label', { class: 'ai-toolbar-toggle' }, think, h('span', null, '深度思考')),
       h('label', { class: 'ai-toolbar-toggle' }, web, h('span', null, '联网搜索')),
       h('button', { class: 'btn ghost', onclick: () => regenerate('回答更详细，并给出分点依据。') }, '更详细'),
-      h('button', { class: 'btn ghost', onclick: () => regenerate('回答更精简，只保留结论。') }, '更精简'), searchSettingsPanel),
-    conversation, h('div', { class: 'ai-composer' }, input, h('div', { class: 'ai-composer-actions' }, send, stop))));
+      h('button', { class: 'btn ghost', onclick: () => regenerate('回答更精简，只保留结论。') }, '更精简'), searchSettingsPanel)),
+    conversation, h('div', { class: 'ai-composer' },
+      h('div', { class: 'ai-composer-inner' },
+        h('div', { class: 'ai-input-label' }, h('span', null, '消息'), h('span', null, 'Enter 发送 · Shift + Enter 换行')),
+        input,
+        h('div', { class: 'ai-composer-actions' }, h('span', { class: 'ai-composer-hint' }, '内容会保存在本地对话记录中'), send, stop))
+    )));
   renderAll();
   return () => controller?.abort();
 }
