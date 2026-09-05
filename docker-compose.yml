@@ -2,6 +2,9 @@ services:
   translation-service:
     build:
       context: ./translation-service-poc
+      args:
+        DEBIAN_MIRROR_HOST: "${TRANSLATION_DEBIAN_MIRROR_HOST:-deb.debian.org}"
+        PYPI_INDEX_URL: "${TRANSLATION_PYPI_INDEX_URL:-https://pypi.org/simple}"
     container_name: jm-translation
     init: true
     restart: unless-stopped

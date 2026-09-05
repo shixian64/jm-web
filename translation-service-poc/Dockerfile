@@ -1,17 +1,21 @@
 FROM python:3.12-slim
 
+ARG DEBIAN_MIRROR_HOST=deb.debian.org
+ARG PYPI_INDEX_URL=https://pypi.org/simple
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     TRANSLATION_CACHE_DIR=/app/cache
 
-RUN apt-get update \
+RUN sed -i "s|deb.debian.org|${DEBIAN_MIRROR_HOST}|g" /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends libglib2.0-0 libgl1 libgomp1 fonts-wqy-zenhei \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --index-url "${PYPI_INDEX_URL}" -r requirements.txt
 
 COPY pipeline.py service.py ./
 RUN useradd --create-home --uid 10001 appuser \

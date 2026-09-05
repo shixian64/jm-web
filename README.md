@@ -217,6 +217,7 @@ docker compose --env-file .env \
 | `TRANSLATION_CPU_LIMIT` / `TRANSLATION_MEMORY_LIMIT` | `2.0` / `2g` | 翻译容器 CPU / 内存上限 |
 | `TRANSLATION_WORKERS` / `TRANSLATION_MAX_INFLIGHT` | `2` / `8` | 翻译工作线程数 / 在途任务上限 |
 | `TRANSLATION_SERVICE_TOKEN` | 空 | 翻译服务内部访问令牌，不下发浏览器 |
+| `TRANSLATION_DEBIAN_MIRROR_HOST` / `TRANSLATION_PYPI_INDEX_URL` | 官方源 | 翻译镜像构建时使用的 Debian/PyPI 源；网络受限时可切换到可用镜像 |
 | `TRANSLATION_MAX_PAGE_BYTES` | `26214400` | 翻译单页请求/响应大小上限（字节） |
 | `JMW_MAX_API_RESPONSE_BYTES` | `16777216` | 上游 API 单响应大小上限（字节，范围 1–32 MiB） |
 | `JMW_MAX_AI_STREAM_BYTES` | `16777216` | 单次 AI 流式响应大小上限（字节，范围 1–64 MiB） |
