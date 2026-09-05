@@ -778,7 +778,7 @@ body.reading #main { padding: 0; }
 .sign-grid .d.today { outline: 2px solid var(--primary); outline-offset: 1px; }
 .signin-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
 .signin-status { display: flex; align-items: center; gap: 9px; min-width: 0; }
-.signin-status-dot { width: 10px; height: 10px; flex: none; border-radius: 50%; background: var(--text-2); }
+.signin-status-dot { width: 10px; height: 10px; flex: none; display: block !important; margin: 0 !important; border-radius: 50%; background: var(--text-2); }
 .signin-status.ready { color: var(--primary); }
 .signin-status.ready .signin-status-dot { background: var(--primary); box-shadow: 0 0 0 4px var(--primary-weak); }
 .signin-status.done { color: var(--primary); }
