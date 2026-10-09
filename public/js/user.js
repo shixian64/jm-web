@@ -1,5 +1,5 @@
 // 用户与设置页面：登录 / 个人中心 / 签到 / 收藏 / 阅读历史 / 评论历史 / 本地记录 / 设置
-import { api, imgSrc, commentContentText, commentPageHasMore } from './api.js';
+import { api, imgSrc, commentContentText, commentPageHasMore, navigationState } from './api.js';
 import {
   h, toast, comicCard, infiniteList, installPullToRefresh, errorBox, loadingBox, installImageRetry,
 } from './ui.js';
@@ -389,7 +389,6 @@ function renderLogin(page, ctx, reload) {
         await api.login(username.value.trim(), password.value);
         if (isInactive(ctx)) return;
         toast('登录成功');
-        window.dispatchEvent(new CustomEvent('jmw-auth-changed'));
         await reload();
       } catch (err) {
         if (!isInactive(ctx) && !isAbort(err)) toast(err.message);
@@ -476,7 +475,6 @@ function renderProfile(page, me, ctx, reload, beforeReplace) {
           if (isInactive(ctx)) return;
           toast('已退出登录');
           beforeReplace?.();
-          window.dispatchEvent(new CustomEvent('jmw-auth-changed'));
           renderLogin(page, ctx, reload);
         } catch (e) {
           if (!isInactive(ctx) && !isAbort(e)) toast(e.message);
@@ -718,10 +716,29 @@ function signinSkeleton() {
 
 const FAV_ORDERS = [['mr', '收藏时间'], ['mp', '更新时间']];
 
-export function favoritesView(root, params) {
+export function favoritesView(root, params, ctx) {
   const o = params.get('o') || 'mr';
   const folderId = params.get('folder') || params.get('folder_id') || '0';
+  const cacheKey = navigationState.key(o, folderId);
+  const stateKey = `favorite-state:${cacheKey}:${ctx?.entryId ?? 'default'}`;
+  const cached = navigationState.get(cacheKey);
+  const savedState = ctx?.restoreScroll ? navigationState.get(stateKey)?.value : null;
+  let cacheToken = navigationState.token();
+  let cacheRevision = cached?.revision;
+  let rawPages = Array.isArray(cached?.value?.pages) ? cached.value.pages : [];
+  let fetchedAt = cached?.timestamp || Date.now();
+  let destroyed = false;
+  let hasUpdates = false;
+  let batchingCards = false;
+  let backgroundController = new AbortController();
+  const inactive = () => destroyed || isInactive(ctx);
+  const cancelBackground = () => backgroundController.abort();
+  ctx?.signal?.addEventListener('abort', cancelBackground, { once: true });
   const page = h('div', { class: 'page collect-page' });
+  const updateNotice = h('button', {
+    class: 'btn block navigation-update', type: 'button', hidden: true, 'aria-live': 'polite',
+    onclick: () => { if (ctx?.refresh) ctx.refresh(); else list?.refresh(); },
+  }, '收藏有更新，点击刷新');
   const scopeText = h('span', null, '正在确认收藏同步状态…');
   const scopeHint = h('div', { class: 'favorite-sync hint' }, icon('cloud', 14), scopeText);
   const folderWrap = h('nav', { class: 'chips favorite-folders', 'aria-label': '收藏夹' });
@@ -762,6 +779,15 @@ export function favoritesView(root, params) {
   let sessionFolderIds = new Set();
   const seenFavoriteItems = new Set();
   const seenFavoritePages = new Set();
+  if (savedState) {
+    localSearch.value = savedState.query || '';
+    (savedState.tags || []).forEach((value) => selectedTags.add(value));
+    (savedState.authors || []).forEach((value) => selectedAuthors.add(value));
+    filterLogic = savedState.logic === 'or' ? 'or' : 'and';
+    filterPanel.hidden = !savedState.expanded;
+    filterToggle.setAttribute('aria-expanded', String(!!savedState.expanded));
+    filterToggle.classList.toggle('active', !!savedState.expanded);
+  }
 
   const orderSwitch = h('div', { class: 'favorite-order', role: 'group', 'aria-label': '收藏排序' },
     FAV_ORDERS.map(([v, l]) => h('a', {
@@ -804,6 +830,7 @@ export function favoritesView(root, params) {
       }, icon('check-square', 15), '选择当前'),
     ),
     filterEmpty,
+    updateNotice,
   );
   root.append(page);
 
@@ -938,6 +965,7 @@ export function favoritesView(root, params) {
   }
 
   function filterCards() {
+    if (inactive() || batchingCards) return;
     const query = localSearch.value.trim().toLocaleLowerCase();
     let visible = 0;
     cards.forEach((card) => {
@@ -966,6 +994,7 @@ export function favoritesView(root, params) {
   }
 
   function renderFacets() {
+    if (inactive()) return;
     facetRenderQueued = false;
     const logic = h('select', { class: 'input', style: 'width:auto;min-width:100px' },
       h('option', { value: 'and', selected: filterLogic === 'and' }, '全部满足'),
@@ -996,7 +1025,7 @@ export function favoritesView(root, params) {
   function scheduleFacetRender() {
     if (facetRenderQueued) return;
     facetRenderQueued = true;
-    queueMicrotask(renderFacets);
+    queueMicrotask(() => { if (!inactive()) renderFacets(); });
   }
 
   function dropFavoriteCard(id) {
@@ -1059,8 +1088,7 @@ export function favoritesView(root, params) {
   renderFacets();
   renderFolders();
   let foldersHydrated = false;
-  list = infiniteList(async (p, signal) => {
-    const res = await api.favorites(o, p, folderId, signal);
+  function processFavoritePage(p, res) {
     const d = res.data || {};
     if (p === 1) {
       // infiniteList.refresh() 会把页码重置为 0；同步清空跨页状态，避免
@@ -1094,8 +1122,13 @@ export function favoritesView(root, params) {
     const source = filterComics(deduped.items, setting.blockedTagList || []);
     const declaredCount = finiteNonNegative(d.source_count);
     const sourceCount = Math.max(rawList.length, declaredCount ?? 0);
+    batchingCards = true;
+    let items;
+    try { items = source.map(decorateFavorite).filter(Boolean); }
+    finally { batchingCards = false; }
+    filterCards();
     return {
-      items: source.map(decorateFavorite).filter(Boolean),
+      items,
       // 本地收藏夹映射按上游分页后过滤，当前页为空不代表后续页也为空；
       // 但整页均为已见内容或上游重复末页时必须停止，防止无限请求。
       hasMore: userListPageHasMore({
@@ -1105,7 +1138,81 @@ export function favoritesView(root, params) {
         repeated: repeatedPage || (rawList.length > 0 && !deduped.hasNew),
       }),
     };
+  }
+
+  function saveSnapshot() {
+    if (!rawPages.length) return;
+    const nextRevision = navigationState.save(cacheKey, { pages: rawPages }, {
+      token: cacheToken, timestamp: fetchedAt, expectedRevision: cacheRevision,
+    });
+    if (nextRevision !== null) cacheRevision = nextRevision;
+  }
+
+  function showUpdate() {
+    if (inactive()) return;
+    hasUpdates = true;
+    updateNotice.hidden = false;
+  }
+
+  async function revalidateSnapshot() {
+    if (!rawPages.length || Date.now() - fetchedAt < 120_000) return;
+    const baseline = rawPages.slice();
+    const revision = cacheRevision;
+    const token = cacheToken;
+    const candidate = [];
+    const seen = new Set();
+    try {
+      // 同一查询的已加载分页整批替换；途中失败或取消，不提交半份快照。
+      for (let p = 1; p <= baseline.length; p++) {
+        const res = await navigationState.load(`revalidate:${cacheKey}:${p}`,
+          (signal) => api.favorites(o, p, folderId, signal), backgroundController.signal);
+        if (inactive() || token !== navigationState.token()) return;
+        candidate.push(res);
+        const d = res.data || {};
+        const items = Array.isArray(d.list) ? d.list : [];
+        if (!userListPageHasMore({ total: d.total, page: p,
+          sourceCount: Math.max(items.length, finiteNonNegative(d.source_count) ?? 0),
+          repeated: rememberSourcePage(sourcePageMarker(d, items), seen),
+        })) break;
+      }
+      const nextRevision = navigationState.save(cacheKey, { pages: candidate }, { token, expectedRevision: revision });
+      if (nextRevision === null) return;
+      if (JSON.stringify(candidate) !== JSON.stringify(baseline)) showUpdate();
+      else { cacheRevision = nextRevision; fetchedAt = Date.now(); }
+    } catch (error) {
+      // 弱网保留原快照；401 由集中失效订阅移除用户态内容。
+      if (!inactive() && !isAbort(error) && error.status !== 401) updateNotice.title = '后台更新失败，可下拉重试';
+    }
+  }
+
+  list = infiniteList(async (p, signal) => {
+    const token = cacheToken;
+    const res = await navigationState.load(`page:${cacheKey}:${p}`,
+      (sharedSignal) => api.favorites(o, p, folderId, sharedSignal), signal);
+    if (inactive() || token !== navigationState.token()) {
+      const error = new Error('Navigation changed'); error.name = 'AbortError'; throw error;
+    }
+    if (hasUpdates) throw new Error('收藏有更新，请点击刷新后继续加载');
+    const result = processFavoritePage(p, res);
+    if (p === 1) { rawPages = []; fetchedAt = Date.now(); }
+    rawPages[p - 1] = res;
+    saveSnapshot();
+    return result;
   }, {
+    initialPages: () => rawPages.map((res, index) => processFavoritePage(index + 1, res)),
+    canLoadMore: () => !hasUpdates && !inactive(),
+    onRefresh: () => {
+      backgroundController.abort();
+      backgroundController = new AbortController();
+      navigationState.invalidateFavorites();
+      cacheToken = navigationState.token();
+      cacheRevision = undefined;
+      rawPages = [];
+      fetchedAt = Date.now();
+      hasUpdates = false;
+      foldersHydrated = false;
+      updateNotice.hidden = true;
+    },
     empty: () => h('div', { class: 'favorite-empty', style: { gridColumn: '1/-1' } },
       h('div', { class: 'favorite-empty-icon' }, icon('star', 28)),
       h('h3', null, '收藏夹还是空的'),
@@ -1113,7 +1220,33 @@ export function favoritesView(root, params) {
       h('a', { class: 'btn primary', href: '#/' }, '去首页看看', icon('arrow-right', 15))),
   });
   page.append(list.root);
-  return list.destroy;
+  const unsubscribe = navigationState.subscribe((reason) => {
+    if (inactive()) return;
+    if (reason === 'unauthorized') {
+      list.destroy();
+      backgroundController.abort();
+      page.replaceChildren(errorBox('登录会话已失效，请重新登录'));
+    } else if (['auth', 'source', 'host', 'all'].includes(reason)) {
+      list.destroy();
+      backgroundController.abort();
+      page.replaceChildren(loadingBox());
+      ctx?.refresh?.();
+    } else if (reason === 'favorites') showUpdate();
+    else if (reason === 'album') cacheToken = navigationState.token();
+  });
+  queueMicrotask(() => { if (!inactive()) revalidateSnapshot(); });
+  return () => {
+    navigationState.save(stateKey, {
+      query: localSearch.value, tags: [...selectedTags], authors: [...selectedAuthors],
+      logic: filterLogic, expanded: !filterPanel.hidden,
+    }, { token: cacheToken });
+    saveSnapshot();
+    destroyed = true;
+    unsubscribe();
+    ctx?.signal?.removeEventListener('abort', cancelBackground);
+    backgroundController.abort();
+    list.destroy();
+  };
 }
 
 /* ============================== 云端阅读历史 ============================== */

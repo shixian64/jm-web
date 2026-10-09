@@ -292,10 +292,14 @@ function render(navigation = {}) {
         }
       };
       const ctx = {
+        entryId: targetEntryId,
         signal: controller.signal,
         isActive: () => !disposed && generation === renderGeneration,
         navigationType: navigation.historyTraversal === true ? 'history' : 'new',
         restoreScroll: navigation.historyTraversal === true || sameEntryRefresh,
+        refresh: () => {
+          if (!disposed && generation === renderGeneration) render({ entryId: targetEntryId, historyTraversal: true });
+        },
       };
       currentCleanup = dispose;
 

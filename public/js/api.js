@@ -1,11 +1,84 @@
 // 后端 API 封装：所有业务请求都走自部署的 /api/*（签名/解密/会话由服务端处理）
-import { setting } from './store.js';
+import { setting, onSettingChange } from './store.js';
+import { createNavigationCache, navigationAbortError } from './navigation-cache.js';
 
 export function selectedDataSource() {
   return ['builtin', 'network', 'mixed'].includes(setting.dataSource) ? setting.dataSource : 'builtin';
 }
 
+const navigationCache = createNavigationCache();
+const CACHE_SYNC_KEY = 'jmw_navigation_cache_invalidation';
+let lastIdentity;
+let identityEpoch = 0;
+let lastSource = selectedDataSource();
+
+function invalidateNavigation(kind = 'all', id = '', { remote = false, abortFlights = true } = {}) {
+  if (['all', 'auth', 'unauthorized', 'source', 'host'].includes(kind)) identityEpoch++;
+  const matches = (key) => kind === 'all' || kind === 'auth' || kind === 'unauthorized'
+    || kind === 'source' || kind === 'host'
+    || (kind === 'favorites' && (key.startsWith('favorites:') || key.startsWith('favorite-state:')
+      || (id && key === albumCacheKey(id))))
+    || (kind === 'album' && key === albumCacheKey(id));
+  navigationCache.invalidate(matches, kind, { abortFlights });
+  if (!remote && typeof window !== 'undefined') {
+    // 只广播失效通知，不存储账号、收藏、章节数据或 Cookie。
+    try { localStorage.setItem(CACHE_SYNC_KEY, JSON.stringify({ kind, id, nonce: `${Date.now()}-${Math.random()}` })); } catch (_) {}
+  }
+  if (kind === 'auth' && typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('jmw-auth-changed'));
+  }
+}
+
+function albumCacheKey(id) { return `album:${JSON.stringify([selectedDataSource(), String(id)])}`; }
+
+onSettingChange(() => {
+  const source = selectedDataSource();
+  if (source !== lastSource) { lastSource = source; invalidateNavigation('source'); }
+});
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (event) => {
+    if (event.key !== CACHE_SYNC_KEY || !event.newValue) return;
+    try {
+      const message = JSON.parse(event.newValue);
+      if (!['all', 'auth', 'unauthorized', 'source', 'host', 'favorites', 'album'].includes(message.kind)) return;
+      if (message.kind === 'auth' || message.kind === 'unauthorized') lastIdentity = undefined;
+      invalidateNavigation(message.kind, typeof message.id === 'string' ? message.id : '', { remote: true });
+    } catch (_) {}
+  });
+}
+
+// 收藏缓存按完整分页快照保存，绝不把新第一页拼到旧的后续页上。
+export const navigationState = {
+  token: navigationCache.token,
+  subscribe: navigationCache.subscribe,
+  key: (o, folder) => `favorites:${JSON.stringify([selectedDataSource(), o, String(folder)])}`,
+  get: (key, maxAge = 30 * 60_000) => navigationCache.get(key, maxAge),
+  save: (key, value, options) => navigationCache.put(key, value, options),
+  load: navigationCache.load,
+  invalidateFavorites: () => invalidateNavigation('favorites'),
+};
+
+async function mutation(path, opts, kind, id = '') {
+  try { return await request(path, opts); }
+  finally { invalidateNavigation(kind, String(id)); }
+}
+
+async function changeAuth(path, opts) {
+  // 开始变更就隔离旧在途请求；成功后的失效也不依赖页面仍处于活动路由。
+  invalidateNavigation('all');
+  const value = await request(path, opts);
+  lastIdentity = path === '/logout' ? null : identityOf(value?.data);
+  invalidateNavigation('auth');
+  return value;
+}
+
+function identityOf(user) {
+  if (!user) return null;
+  return String(user.id ?? user.uid ?? user.user_id ?? user.username ?? 'authenticated');
+}
+
 async function request(path, opts = {}) {
+  const requestEpoch = identityEpoch;
   let res;
   try {
     const { signal: callerSignal, ...fetchOpts } = opts;
@@ -30,6 +103,11 @@ async function request(path, opts = {}) {
     const err = new Error((json && json.error) || `请求失败（${res.status}）`);
     err.status = res.status;
     err.needAuth = json && json.needAuth;
+    if (res.status === 401 && requestEpoch === identityEpoch) {
+      // 保留当前请求的 401 错误，不用自己的 abort 将它遮成 AbortError。
+      lastIdentity = null;
+      invalidateNavigation('unauthorized', '', { abortFlights: false });
+    }
     throw err;
   }
   return json;
@@ -37,18 +115,31 @@ async function request(path, opts = {}) {
 
 export const api = {
   config: (signal) => request('/config', { signal }),
-  setApiHost: (apiHost, signal) => request('/config/api-host', { method: 'POST', body: JSON.stringify({ apiHost }), signal }),
+  setApiHost: (apiHost, signal) => mutation('/config/api-host', { method: 'POST', body: JSON.stringify({ apiHost }), signal }, 'host'),
   auth: (password) => request('/auth', { method: 'POST', body: JSON.stringify({ password }) }),
 
-  me: (signal) => request('/me', { signal }),
-  login: (username, password) => request('/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
-  logout: () => request('/logout', { method: 'POST' }),
+  me: async (signal) => {
+    const token = identityEpoch;
+    const value = await request('/me', { signal });
+    if (token !== identityEpoch) throw navigationAbortError();
+    const identity = identityOf(value?.user);
+    const changed = lastIdentity !== undefined && identity !== lastIdentity;
+    lastIdentity = identity;
+    if (changed) invalidateNavigation('auth');
+    return value;
+  },
+  login: (username, password) => changeAuth('/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
+  logout: () => changeAuth('/logout', { method: 'POST' }),
   daily: (userId, signal) => request(`/daily?user_id=${userId}`, { signal }),
   dailyCheck: (userId, dailyId) => request('/daily_chk', { method: 'POST', body: JSON.stringify({ user_id: userId, daily_id: dailyId }) }),
 
   home: (signal) => request('/home', { signal }),
   promoteList: (id, page, signal) => request(`/promote_list?id=${encodeURIComponent(id)}&page=${page}`, { signal }),
   album: (id, signal) => request(`/album?id=${id}`, { signal }),
+  cachedAlbum: (id, signal, options = {}) => navigationCache.read(
+    albumCacheKey(id), (sharedSignal) => request(`/album?id=${id}`, { signal: sharedSignal }),
+    { ...options, signal, validate: (value) => value?.data && typeof value.data === 'object' && !Array.isArray(value.data) },
+  ),
   chapter: (id, shunt, signal) => request(`/chapter?id=${id}&shunt=${shunt || 1}`, { signal }),
   chapterAi: (aid, photoId, signal) => request(`/chapter-ai?aid=${encodeURIComponent(aid)}${photoId ? `&photoId=${encodeURIComponent(photoId)}` : ''}`, { signal }),
   search: (q, o, page, signal) => request(`/search?q=${encodeURIComponent(q)}&o=${o}&page=${page}`, { signal }),
@@ -62,14 +153,14 @@ export const api = {
     request('/comment', { method: 'POST', body: JSON.stringify({ aid, content, status, comment_id: commentId }) }),
   commentVote: (commentId, voteType = 'up') =>
     request('/comment_vote', { method: 'POST', body: JSON.stringify({ comment_id: commentId, vote_type: voteType }) }),
-  like: (id) => request(`/like?id=${id}`, { method: 'POST' }),
-  favorite: (aid) => request(`/favorite?aid=${aid}`, { method: 'POST' }),
+  like: (id) => mutation(`/like?id=${id}`, { method: 'POST' }, 'album', id),
+  favorite: (aid) => mutation(`/favorite?aid=${aid}`, { method: 'POST' }, 'favorites', aid),
   favorites: (o, page, folderId = 0, signal) => request(`/favorites?o=${o}&page=${page}&folder_id=${folderId}`, { signal }),
   favoriteFolder: (type, folderId = '', folderName = '', aid = '') =>
-    request('/favorite_folder', {
+    mutation('/favorite_folder', {
       method: 'POST',
       body: JSON.stringify({ type, folder_id: folderId, folder_name: folderName, aid }),
-    }),
+    }, 'favorites', aid),
   history: (page, signal) => request(`/history?page=${page}`, { signal }),
   deleteHistory: (id) => request('/history/delete', { method: 'POST', body: JSON.stringify({ id }) }),
 };

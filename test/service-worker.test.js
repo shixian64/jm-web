@@ -150,6 +150,7 @@ function verifyShellInventory(shell) {
   const shellSet = new Set(shell);
   assert.strictEqual(shellSet.size, shell.length, 'SHELL 不得包含重复缓存键');
   assert(shellSet.has('/js/navigation.js'), 'SHELL 必须包含 app.js 的 navigation.js 依赖');
+  assert(shellSet.has('/js/navigation-cache.js'), 'SHELL 必须包含返回导航缓存模块');
 
   for (const url of shell) {
     const pathname = url === '/' ? '/index.html' : new URL(url, ORIGIN).pathname;

@@ -332,8 +332,28 @@ export function infiniteList(loader, options = {}) {
   let refreshPromise = null;
   let removePullRefresh = null;
 
+  function appendPage({ items, hasMore }, next) {
+    page = next;
+    grid.querySelectorAll(':scope > .skeleton-card').forEach((node) => node.remove());
+    if (!items.length && page === 1) {
+      const customEmpty = typeof options.empty === 'function' ? options.empty() : null;
+      const empty = customEmpty || h('div', { class: 'empty', style: { gridColumn: '1/-1' } },
+        h('div', { class: 'big' }, icon('inbox', 40)), '这里什么都没有');
+      empty.dataset.listEmpty = '1';
+      grid.replaceChildren(empty);
+    }
+    if (items.length) grid.querySelector(':scope > [data-list-empty]')?.remove();
+    grid.append(...items);
+    if (!hasMore) {
+      finished = true;
+      if (page > 1) sentinel.replaceChildren(h('div', { style: 'text-align:center;color:var(--text-2);font-size:12px;padding:14px' }, '· 已经到底了 ·'));
+      else sentinel.replaceChildren();
+    }
+  }
+
   async function loadMore() {
     if (destroyed || loading || finished || failed) return;
+    if (options.canLoadMore && !options.canLoadMore()) return;
     loading = true;
     failed = false;
     if (obs) obs.disconnect();
@@ -345,22 +365,7 @@ export function infiniteList(loader, options = {}) {
       const next = page + 1;
       const { items, hasMore } = await loader(next, requestController.signal);
       if (destroyed || requestController.signal.aborted) return;
-      page = next;
-      grid.querySelectorAll(':scope > .skeleton-card').forEach((node) => node.remove());
-      if (!items.length && page === 1) {
-        const customEmpty = typeof options.empty === 'function' ? options.empty() : null;
-        const empty = customEmpty || h('div', { class: 'empty', style: { gridColumn: '1/-1' } },
-          h('div', { class: 'big' }, icon('inbox', 40)), '这里什么都没有');
-        empty.dataset.listEmpty = '1';
-        grid.replaceChildren(empty);
-      }
-      if (items.length) grid.querySelector(':scope > [data-list-empty]')?.remove();
-      grid.append(...items);
-      if (!hasMore) {
-        finished = true;
-        if (page > 1) sentinel.replaceChildren(h('div', { style: 'text-align:center;color:var(--text-2);font-size:12px;padding:14px' }, '· 已经到底了 ·'));
-        else sentinel.replaceChildren();
-      }
+      appendPage({ items, hasMore }, next);
     } catch (e) {
       if (destroyed || requestController.signal.aborted || (e && e.name === 'AbortError')) return;
       failed = true;
@@ -412,6 +417,8 @@ export function infiniteList(loader, options = {}) {
       controller?.abort();
       while (loading && !destroyed) await new Promise((resolve) => setTimeout(resolve, 0));
       if (destroyed) return;
+      await options.onRefresh?.();
+      if (destroyed) return;
       page = 0;
       failed = false;
       finished = false;
@@ -424,7 +431,8 @@ export function infiniteList(loader, options = {}) {
 
   async function loadAll(maxPages = 200) {
     let attempts = 0;
-    while (!destroyed && !finished && !failed && attempts < maxPages) {
+    while (!destroyed && !finished && !failed && attempts < maxPages
+        && (!options.canLoadMore || options.canLoadMore())) {
       if (loading) await new Promise((resolve) => setTimeout(resolve, 40));
       else { attempts++; await loadMore(); }
     }
@@ -432,8 +440,14 @@ export function infiniteList(loader, options = {}) {
   }
 
   removePullRefresh = installPullToRefresh(root, refresh);
-  retryObserve();
-  queueMicrotask(loadMore);
+  // 返回导航直接恢复连续的完整分页，不依赖 Observer 一页页“长回来”。
+  const initialPages = typeof options.initialPages === 'function' ? options.initialPages() : (options.initialPages || []);
+  for (const result of initialPages) {
+    if (finished) break;
+    appendPage(result, page + 1);
+  }
+  if (!finished) retryObserve();
+  if (!page) queueMicrotask(loadMore);
   return { root, destroy, loadAll, refresh };
 }
 

@@ -1,6 +1,6 @@
 // 浏览类页面：首页 / 搜索 / 分类 / 每周必看 / 漫画详情
 import {
-  api, imgSrc, commentAvatarSrc, commentContentText, commentPageCount, isCommentSpoiler,
+  api, imgSrc, commentAvatarSrc, commentContentText, commentPageCount, isCommentSpoiler, navigationState,
 } from './api.js';
 import {
   h, toast, comicCard, comicSkeletons, infiniteList, installPullToRefresh, errorBox, loadingBox,
@@ -808,14 +808,21 @@ export async function albumView(root, id, ctx) {
   const page = h('div', { class: 'page-wide' });
   page.append(loadingBox());
   root.append(page);
+  const refreshNotice = h('button', {
+    class: 'btn block navigation-update', type: 'button', hidden: true, 'aria-live': 'polite',
+    onclick: () => ctx?.refresh?.(),
+  }, '章节或详情有更新，点击刷新');
 
   let data;
   try {
-    const res = await api.album(id, ctx && ctx.signal);
+    const res = await api.cachedAlbum(id, ctx && ctx.signal, {
+      onUpdate: () => { if (!isInactive(ctx)) refreshNotice.hidden = false; },
+    });
     if (isInactive(ctx)) return;
     data = res && res.data;
   } catch (e) {
-    if (isInactive(ctx) || isAbort(e)) return;
+    if (isInactive(ctx)) return;
+    if (isAbort(e)) { ctx?.refresh?.(); return; }
     page.replaceChildren(errorBox(e.message));
     return;
   }
@@ -881,6 +888,7 @@ export async function albumView(root, id, ctx) {
   );
 
   const body = h('div', { class: 'album-body' });
+  body.append(refreshNotice);
 
   // 操作按钮
   const likeBtn = h('button', { class: 'btn like', onclick: onLike });
@@ -939,7 +947,18 @@ export async function albumView(root, id, ctx) {
     }, icon('history', 16), `继续阅读：${localRec.name || ''} 第 ${Number(localRec.page || 0) + 1} 页`));
   }
 
-  body.append(h('div', { class: 'action-bar' }, readBtn, downloadBtn, favBtn, likeBtn));
+  const refreshBtn = h('button', {
+    class: 'btn', type: 'button',
+    onclick: async () => {
+      refreshBtn.disabled = true;
+      try {
+        await api.cachedAlbum(id, ctx?.signal, { force: true });
+        if (!isInactive(ctx)) ctx?.refresh?.();
+      } catch (error) { if (!isInactive(ctx) && !isAbort(error)) toast(error.message); }
+      finally { if (!isInactive(ctx)) refreshBtn.disabled = false; }
+    },
+  }, '刷新章节');
+  body.append(h('div', { class: 'action-bar' }, readBtn, downloadBtn, favBtn, likeBtn, refreshBtn));
 
   // 简介
   if (description) {
@@ -1054,6 +1073,15 @@ export async function albumView(root, id, ctx) {
 
   page.append(hero, body);
   page.querySelector('.spinner')?.closest('.empty')?.remove();
+  const unsubscribe = navigationState.subscribe((reason) => {
+    if (isInactive(ctx)) return;
+    if (reason === 'unauthorized') page.replaceChildren(errorBox('登录会话已失效，请重新登录'));
+    else if (['auth', 'source', 'host', 'all'].includes(reason)) {
+      page.replaceChildren(loadingBox());
+      ctx?.refresh?.();
+    }
+  });
+  ctx?.signal?.addEventListener('abort', unsubscribe, { once: true });
 
   async function onLike() {
     if (likeBtn.disabled) return;
@@ -1119,6 +1147,10 @@ export async function albumView(root, id, ctx) {
       }
     }
   }
+  return () => {
+    unsubscribe();
+    ctx?.signal?.removeEventListener('abort', unsubscribe);
+  };
 }
 
 function chapterName(chapter, index) {

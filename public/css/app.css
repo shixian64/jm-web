@@ -164,6 +164,8 @@ body.no-tab #main { padding-bottom: 24px; }
 .btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
 .btn.ghost { background: transparent; }
 .btn.block { width: 100%; }
+.navigation-update { margin-bottom: 12px; }
+.navigation-update[hidden] { display: none; }
 /* 爱心/收藏按钮选中态：图标填充 + 主色描边 */
 .btn.like.on, .btn.fav.on { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 45%, var(--line)); background: color-mix(in srgb, var(--primary) 10%, var(--card)); }
 .btn.like.on svg, .btn.fav.on svg { fill: currentColor; }

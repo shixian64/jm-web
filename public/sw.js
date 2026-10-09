@@ -4,7 +4,7 @@
 
 'use strict';
 
-const CACHE_VERSION = 'jmw-shell-v14';
+const CACHE_VERSION = 'jmw-shell-v15';
 const SHELL = [
   '/',
   '/index.html',
@@ -30,6 +30,7 @@ const SHELL = [
   '/js/icons.js',
   '/js/md5.js',
   '/js/navigation.js',
+  '/js/navigation-cache.js',
   '/js/offline.js',
   '/js/reader.js',
   '/js/reader-settings.js',
