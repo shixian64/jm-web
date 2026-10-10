@@ -161,6 +161,21 @@ export function backfillReaderImageDimensions({ image, slot, index, record, stat
   return true;
 }
 
+/**
+ * 重建解码记录时保留缓存的已验证尺寸：raws LRU 重用/重看不解扰原图时，
+ * 沿用早先由 <img> onload 或解扰结果回填的宽高，避免占位比例跳动；
+ * 没有已验证尺寸时不伪造（undefined），由挂载后的 onload 回填。
+ */
+export function readerDecodedRecord({ url, generation, sourceVersion, dims }) {
+  return {
+    url,
+    generation,
+    sourceVersion,
+    width: dims?.width,
+    height: dims?.height,
+  };
+}
+
 export function mountReader(root, photoId, query, options = {}) {
   const aid = query.get('aid') || '';
   const requestedPage = query.get('page');
@@ -1267,12 +1282,9 @@ export function mountReader(root, photoId, query, options = {}) {
         displayUrl = URL.createObjectURL(displayBlob);
       }
       const url = displayUrl;
-      const dims = state.dims.get(idx);
-      const rec = {
-        url, generation, sourceVersion,
-        width: dims?.width,
-        height: dims?.height,
-      };
+      const rec = readerDecodedRecord({
+        url, generation, sourceVersion, dims: state.dims.get(idx),
+      });
       retireDecoded(state.decoded.get(idx));
       state.decoded.set(idx, rec);
       // 原图不为获取尺寸而预先完整解码；由最终挂载的 <img> 在 onload 后回填。

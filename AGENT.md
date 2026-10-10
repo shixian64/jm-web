@@ -50,7 +50,10 @@ jm-web/
 │   ├── photo.js              chapter_view_template HTML 解析
 │   ├── sessions.js           会话、按 Origin 隔离的 Cookie Jar、磁盘持久化
 │   ├── settings.js           API/图片 Host 与服务端设置
-│   └── features.js           DoH、AI、搜索、更新检查和运行日志
+│   ├── features.js           DoH、AI、搜索、更新检查和运行日志
+│   ├── chapter-ai.js         章节视觉分析：容量有界的队列/记录、合并写盘与任务预算
+│   ├── translation-proxy.js  /api/translation/page 代理：准入先于上传、整体截止时间
+│   └── origin-guard.js       非幂等 API 集中同源校验与可信代理解析（clientIp/Secure）
 ├── public/
 │   ├── index.html            应用入口
 │   ├── sw.js                 离线外壳 Service Worker
@@ -129,6 +132,7 @@ jm-web/
 - DNS 结果出现环回、私网、链路本地或其他非公网地址时必须拒绝。
 - 安全校验后的地址必须固定到真实 TLS socket；不得删除 pinned lookup 或关闭证书校验。
 - API 和图片重定向不得自动跟随；每一跳重新验证。
+- 非幂等 API 请求经集中同源校验（`lib/origin-guard.js` 的 `checkSameOrigin`，server.js 在方法白名单后统一调用）：跨源、same-site 但不同 origin、`Origin: null`、`Sec-Fetch-Site: cross-site/same-site` 一律 403；无任何来源证据的请求（curl/脚本/老浏览器）放行但认证要求不变，SameSite=Lax 与 JSON Content-Type 仍是该场景防线。`JMW_TRUST_PROXY` 只接受精确 IP/CIDR，不默认信任私网段；不可信对端的 `X-Forwarded-For`/`X-Forwarded-Proto` 不改变 clientIp 与 Secure 判定。
 - 上游 Cookie 只发送给服务端明确受信的精确 Origin。
 - GET 和非幂等 POST 的重试语义不同：POST 只有确定未送达时才允许换 Host 重发。
 - 5xx、DNS、TLS、内部路径和上游原文默认不得回显给浏览器。
@@ -147,14 +151,26 @@ test/backend.test.js 或 test/deployment.test.js
 
 当前图片相关默认保护为：单章节最多 2000 张、单文件 25 MiB、全局代理并发 12、
 单客户端代理并发 6；封面进程内缓存总计 64 MiB、单项 2 MiB、TTL 24 小时，
-图片等待队列最多 96 项、单项排队 3 秒。前端原图缓存按设备内存计算字节预算，解扰优先使用模块
+图片等待队列最多 96 项、单项排队 3 秒。chapter-ai 状态默认上限为队列 1000 条、
+记录 5000 条、热度 2000 条、状态文件 8 MiB；单任务预算为 60 页、累计 24 MiB 编码
+图片、单图 40M 像素、10 分钟完整截止期限（含元数据读取）与 4 MiB 模型响应体；未配置 AI Key 时章节分析
+禁用且普通浏览不产生热度写盘。前端原图缓存按设备内存计算字节预算，解扰优先使用模块
 Worker/OffscreenCanvas，且申请画布前检查像素、单轴尺寸与估算工作集；调整这些值时
 必须重新做移动端和长条图回归。
+
+chapter-ai 每个已接受任务预留 4 KiB 队列/运行/重试记录空间，固定元数据另留
+4 KiB；有效队列上限为 `min(队列配置, 记录上限, floor((文件预算 - 4096) / 4096))`，
+默认仍为 1000，64 KiB 预算为 15。不可淘汰的任务不能突破记录/字节上限；写盘先淘汰
+非任务缓存与低价值热度，必要时仅移除旧重试记录的结果缓存，保留任务/次数/错误。
+无法收敛时拒写，保留旧文件与 dirty 待重试更新、暂停新任务准入，成功写盘后恢复；
+不得“告警后超限写盘”或静默丢弃新接受任务。配置接口提供有效 `maxQueueEntries`
+和 `capacityBlocked`。
 
 ## 6. 前端实现不变量
 
 - 来自上游、用户或存储的数据必须使用 `textContent`/安全 DOM 构造，禁止直接拼接到 `innerHTML`。
 - 异步 View 必须使用路由 `ctx.signal`/`ctx.isActive()`，离开路由后停止更新 DOM，并释放监听器、Observer、RAF、Timer、Object URL 和网络请求。
+- 401 必须区分两类失效：`needAuth: true` 的站点门禁失效触发**单实例**重新验证（`jmw-access-required`，验证成功后只刷新头像并恢复当前路由）；JM 登录失效清旧账号 UI 并引导重登（`jmw-auth-changed`，仅在有既有登录态时派发一次，防止 me 请求循环）。
 - 添加新的 JS/CSS/图标等静态文件时，同步更新 `public/sw.js` 的 `SHELL`、缓存版本和对应测试。
 - 不在启动、`focus` 或 `visibilitychange` 中被动调用 `navigator.clipboard.readText()`；只能在明确用户手势或真实 `paste` 事件中访问剪贴板。
 - 密码、应用锁和备份口令字段必须排除全局粘贴检测。
@@ -167,7 +183,7 @@ Worker/OffscreenCanvas，且申请画布前检查像素、单轴尺寸与估算�
 
 ## 7. 持久化状态与秘密
 
-翻译生成结果单独保存到 Compose 命名卷 `translation-cache`（容器内 `/app/cache`），不覆盖原图或主站 `data/`。普通停止、重启、`down` 不删除缓存；不要用 `down -v` 进行升级。两个服务共享根 `.env` 的 `TRANSLATION_SERVICE_TOKEN`，翻译端口不发布到宿主机。
+翻译生成结果单独保存到 Compose 命名卷 `translation-cache`（容器内 `/app/cache`），不覆盖原图或主站 `data/`。普通停止、重启、`down` 不删除缓存；不要用 `down -v` 进行升级。两个服务共享根 `.env` 的 `TRANSLATION_SERVICE_TOKEN`，翻译端口不发布到宿主机。`TRANSLATION_SERVICE_TOKEN` 为空时双方一致禁用翻译能力并明确提示（主站 `/api/config` 报告不可用、代理返回 503；翻译容器 `/v1/*` 返回 503 disabled），`/readyz` 不因此失败、不阻断整站启动；严格部署可用 `TRANSLATION_REQUIRE_TOKEN=1` 让翻译容器拒绝启动。主站翻译代理在读取上传体之前获取全局/单客户端槽位（等待有界），整体截止时间覆盖上传到结果回传全程。
 
 容器内状态目录：
 
@@ -176,6 +192,9 @@ Worker/OffscreenCanvas，且申请画布前检查像素、单轴尺寸与估算�
 ├── .secret
 ├── settings.json
 ├── features.json
+├── chapter-ai/
+│   ├── state.json                    活动章节分析状态（容量有界）
+│   └── state.capacity-recovery.json  旧队列超限时的完整原始恢复副本
 └── sessions/*.json
 ```
 
@@ -194,6 +213,7 @@ Worker/OffscreenCanvas，且申请画布前检查像素、单轴尺寸与估算�
 - 生产目录应由 `1000:1000` 使用，目录建议 `0700`，Session 文件按敏感凭据处理。
 - 备份必须同时保护 `.secret`、Session 和生产 `.env`；一致性备份应停服或先完成状态 flush。
 - 代码回滚不等于数据回滚。执行递归清理、`rsync --delete` 或迁移前，必须单独确认数据目录。
+- chapter-ai 旧队列超过有效容量时，先以独占创建方式保存 `state.capacity-recovery.json`，再保留最高优先级的活动任务；副本保留全部原任务，不自动回灌，也不受活动文件字节上限约束。副本已有或创建失败时拒绝启动且不改写原状态，不能覆盖旧副本。再次缩容前由运维安全归档副本，分批恢复任务；开发测试只使用临时目录，不能替生产执行归档/恢复。
 
 浏览器侧还包含 localStorage 和 IndexedDB。备份恢复、应用锁或 schema 修改不能只验证新浏览器，必须验证旧状态升级。
 
@@ -276,6 +296,7 @@ README.md
 docker-compose.yml
 lib/
 package.json
+package-lock.json
 public/
 server.js
 translation-service-poc/.dockerignore
@@ -349,7 +370,7 @@ docker compose --env-file .env.example \
 
 ### 性能与前端
 
-- 阅读器当前可能等待详情元数据后才渲染已就绪的章节图片，慢详情会阻塞首图。
+- 阅读器已先渲染已就绪的章节图片、详情元数据（标题/封面/章节抽屉）由并行请求后台补齐，慢详情不再阻塞首图；该行为有测试锁定，修改启动顺序前先复现回归。
 - 首页一次创建大量卡片；封面现由 IntersectionObserver、有界图片队列和后端缓存共同控制，仍需持续观察低端移动设备的首屏加载水位。
 - `app.js` 静态导入阅读器、下载、高级和用户模块，首屏模块图偏大；路由级动态导入需单独设计应用锁和 SW 升级兼容。
 - 长章节滚动定位会遍历页面槽位；预取应只在页码实际变化时触发。
@@ -359,9 +380,9 @@ docker compose --env-file .env.example \
 ### 后端与安全
 
 - API Host 缺少完善的跨请求熔断/成功线路提升，坏首线路可能让每个请求重复等待。
-- 图片路径代理已对超时/DNS/429/5xx 做短期负缓存，并对相同封面启用 single-flight；若上游线路继续频繁切换，仍需补充跨请求熔断和指标。
+- 图片路径代理已对超时/DNS/429/5xx 做短期负缓存，对相同封面启用 single-flight，并已实现跨请求指数退避熔断、EWMA 延迟/失败打分与半开探测；仍缺的是熔断与命中率的指标观测。
 - 普通上游 API 缺少统一并发准入；图片、AI 和搜索已有独立上限。
-- 非幂等 API 仍需统一的精确同源 CSRF 防护。
+- 非幂等 API 已实现集中同源校验（见第 5 节），待生产验收后从债项移除；无来源证据的脚本请求仍依赖 SameSite=Lax 与 JSON Content-Type 防线。
 - `ACCESS_PASSWORD` 同时授予实例运维能力；若向非互信用户开放，需要独立管理员认证和 AI 配额，而不是只分享访问口令。
 - `/healthz` 不是 readiness；生产数据不可写或上游全挂时仍可能显示 healthy。
 

@@ -105,8 +105,16 @@ async function request(path, opts = {}) {
     err.needAuth = json && json.needAuth;
     if (res.status === 401 && requestEpoch === identityEpoch) {
       // 保留当前请求的 401 错误，不用自己的 abort 将它遮成 AbortError。
+      // needAuth 401 = 站点访问门禁失效：只派发重新验证事件，由应用单实例
+      // 拉起 gate；其余 401 = JM 登录失效：清旧账号 UI（头像等）。只有此前
+      // 确实处于登录态时才派发 jmw-auth-changed，避免 me→401→通知→me 循环。
+      const wasIdentified = lastIdentity !== null && lastIdentity !== undefined;
       lastIdentity = null;
       invalidateNavigation('unauthorized', '', { abortFlights: false });
+      if (typeof window !== 'undefined') {
+        if (json && json.needAuth) window.dispatchEvent(new CustomEvent('jmw-access-required'));
+        else if (wasIdentified) window.dispatchEvent(new CustomEvent('jmw-auth-changed'));
+      }
     }
     throw err;
   }
@@ -116,7 +124,14 @@ async function request(path, opts = {}) {
 export const api = {
   config: (signal) => request('/config', { signal }),
   setApiHost: (apiHost, signal) => mutation('/config/api-host', { method: 'POST', body: JSON.stringify({ apiHost }), signal }, 'host'),
-  auth: (password) => request('/auth', { method: 'POST', body: JSON.stringify({ password }) }),
+  auth: async (password) => {
+    const value = await request('/auth', { method: 'POST', body: JSON.stringify({ password }) });
+    // 门禁验证成功即切换认证世代：验证前发出的旧请求迟到返回 needAuth 401
+    // 时（requestEpoch 已过期）不再派发 jmw-access-required，gate 不会重开。
+    // 同时清除验证前积累的未授权缓存状态。
+    invalidateNavigation('all');
+    return value;
+  },
 
   me: async (signal) => {
     const token = identityEpoch;

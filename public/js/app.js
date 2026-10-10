@@ -1,7 +1,7 @@
 // 应用外壳与路由：顶栏（桌面导航）/ 底部 Tab（手机）/ 各页面挂载
 import { applyTheme, setting } from './store.js';
 import { api } from './api.js';
-import { h, toast, errorBox } from './ui.js';
+import { h, toast, errorBox, routeErrorMessage } from './ui.js';
 import { icon } from './icons.js';
 import { homeView, searchView, categoryView, categoryListView, promoteListView, weekView, albumView } from './views.js';
 import { mountReader } from './reader.js';
@@ -118,17 +118,27 @@ let currentRouteKey = null;
 let currentRouteIsFullScreen = false;
 let cancelScheduledScroll = null;
 
-// 异步 View 的异常可能来自网络、上游数据或浏览器能力。路由层只向用户呈现
-// 稳定的提示，不把内部堆栈、文件路径或第三方响应原样暴露到页面。
-function routeErrorMessage(error) {
-  const status = Number(error?.status);
-  if (status === 401) return '需要访问口令，请先完成验证。';
-  if (status === 403) return '当前操作需要站点管理员权限。';
-  if (status === 404) return '请求的内容不存在或已下线。';
-  if (status === 429) return '请求过于频繁，请稍后重试。';
-  if (status >= 500 && status <= 599) return '服务暂时不可用，请稍后重试。';
-  return '页面加载失败，请稍后重试。';
+// 站点访问门禁在运行期失效（任意 API 返回 401 + needAuth）时单实例拉起
+// 重新验证：并发 401 只建一个 gate；验证成功后只刷新头像并恢复当前路由，
+// 不重复添加监听器、不重启应用。
+let accessGateOpen = false;
+async function revalidateAccess() {
+  if (accessGateOpen) return;
+  accessGateOpen = true;
+  let passwordGate;
+  try {
+    ({ passwordGate } = await import('./gate.js'));
+  } catch (_) {
+    accessGateOpen = false;
+    return;
+  }
+  passwordGate(() => {
+    accessGateOpen = false;
+    refreshAvatar();
+    render(prepareHashNavigation());
+  });
 }
+window.addEventListener('jmw-access-required', revalidateAccess);
 
 // Hash SPA 自己管理滚动位置，避免浏览器原生恢复与异步 View 渲染互相抢写。
 if ('scrollRestoration' in history) history.scrollRestoration = 'manual';

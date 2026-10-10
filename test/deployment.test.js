@@ -29,6 +29,7 @@ mustMatch(
 mustMatch(dockerfile, /^FROM \$\{NODE_IMAGE\}$/m, 'Dockerfile 必须通过受控构建参数选择基础镜像');
 for (const [pattern, source] of [
   [/^COPY --chown=node:node package\.json server\.js LICENSE \.\/$/m, '入口文件'],
+  [/^COPY --chown=node:node package-lock\.json \.\/$/m, '锁文件'],
   [/^COPY --chown=node:node lib \.\/lib$/m, '后端模块'],
   [/^COPY --chown=node:node public \.\/public$/m, '前端资源'],
 ]) mustMatch(dockerfile, pattern, `Dockerfile 必须显式把${source}归非 root 运行用户所有`);
@@ -37,6 +38,7 @@ mustMatch(dockerfile, /chmod 0700 \/app\/data/, '/app/data 必须限制为容器
 mustMatch(dockerfile, /^USER node$/m, '镜像最终进程必须使用非 root 用户');
 mustMatch(server, /const HOST = process\.env\.HOST \|\| '127\.0\.0\.1';/, '直接运行必须默认仅监听回环地址');
 mustMatch(readme, /默认仅监听 `?127\.0\.0\.1:3210`?/, 'README 必须与安全监听默认值一致');
+mustMatch(readme, /npm ci --omit=dev/, 'README 直接运行路径必须先按锁文件安装依赖（sharp）');
 assert.ok(
   dockerfile.indexOf('chown node:node /app/data') < dockerfile.indexOf('USER node'),
   '必须先准备可写数据目录，再切换非 root 用户',
@@ -86,18 +88,75 @@ mustMatch(
   'GHCR Compose 覆盖必须提供默认预构建镜像地址',
 );
 mustMatch(ghcrCompose, /build: !reset null/, 'GHCR Compose 覆盖必须禁用本地构建');
+assert.strictEqual(
+  (ghcrCompose.match(/build: !reset null/g) || []).length, 2,
+  'GHCR 覆盖必须同时禁用 jm-web 与 translation 两个服务的本地构建（首次部署前两镜像都来自 GHCR）',
+);
 mustMatch(workflow, /linux\/amd64,linux\/arm64/, '镜像 workflow 必须发布 x86_64 和 arm64');
 mustMatch(workflow, /packages:\s*write/, '镜像 workflow 必须允许写入 GHCR');
 mustMatch(workflow, /docker\/build-push-action@v6/, '镜像 workflow 必须使用 Buildx 发布');
 mustMatch(workflow, /if: github\.event_name != 'pull_request'/, 'Pull Request 不得发布镜像');
-assert.ok(fs.statSync(artifactValidator).mode & 0o111, '制品校验脚本必须可执行');
+mustMatch(workflow, /run: npm ci/, 'CI 必须在测试前按锁文件安装依赖，否则干净 runner 必然失败');
 mustMatch(read('package.json'), /"validate:artifact"\s*:/, 'package.json 必须提供制品校验入口');
 
-// 制品校验必须只在构建成功标志明确存在时生成 PASS，并拒绝缺失运行文件。
+// 平台契约：Windows 文件系统不承载 POSIX 可执行位，不能把位缺失当作脚本业务错误。
+// git 索引是 Linux 检出获得执行位的权威记录，所有平台都验证它；能承载 POSIX 位的平台
+// 再额外断言文件系统当前状态。
+const trackedValidatorMode = execFileSync(
+  'git',
+  ['ls-files', '-s', '--', 'scripts/validate-release-artifact.sh'],
+  { cwd: root, encoding: 'utf8' },
+).trim();
+assert.ok(
+  trackedValidatorMode.startsWith('100755 '),
+  `git 索引必须把制品校验脚本记录为可执行（100755），实际: ${trackedValidatorMode || '(未跟踪)'}`,
+);
+if (process.platform !== 'win32') {
+  assert.ok(fs.statSync(artifactValidator).mode & 0o111, '制品校验脚本必须可执行');
+}
+
+// 校验脚本是 bash 脚本：win32 无 .sh 执行关联，统一经 bash 运行全部业务规则；
+// 缺少 bash 时此处会显式失败（明确环境阻碍），而不是静默跳过制品安全测试。
+const toPosixPath = (dir) => (process.platform === 'win32' ? String(dir).replace(/\\/g, '/') : String(dir));
+const runValidator = (dir, extraEnv = {}) => {
+  const env = { ...process.env, RELEASE_BUILD_STATUS: 'PASS', ...extraEnv };
+  if (process.platform === 'win32') {
+    return execFileSync('bash', [toPosixPath(artifactValidator), toPosixPath(dir)], {
+      env, encoding: 'utf8',
+    });
+  }
+  return execFileSync(artifactValidator, [String(dir)], { env, encoding: 'utf8' });
+};
+const expectValidatorFailure = (dir, { env: extraEnv, code, message } = {}) => {
+  let caught;
+  try {
+    runValidator(dir, extraEnv);
+  } catch (error) {
+    caught = error;
+  }
+  assert.ok(caught, '制品校验必须失败');
+  if (code !== undefined) {
+    assert.strictEqual(
+      caught.status, code,
+      `期望校验器退出码 ${code}，实际 ${caught.status}`,
+    );
+  }
+  if (message) {
+    const output = `${caught.message}\n${caught.stderr ? caught.stderr.toString() : ''}`;
+    assert.match(output, message);
+  }
+  return caught;
+};
+// 与校验脚本相同的路径规范化（bash pwd -P），用于构造能命中阻断分支的受保护前缀。
+const normalizeViaBash = (dir) => execFileSync(
+  'bash', ['-c', `cd -- "${toPosixPath(dir).replace(/"/g, '\\"')}" && pwd -P`], { encoding: 'utf8' },
+).trim();
+
+// 制品校验必须只在构建成功标志明确存在时生成 PASS，并拒绝缺失运行文件（含锁文件）。
 const artifact = fs.mkdtempSync(path.join(os.tmpdir(), 'jmw-release-artifact-test-'));
 try {
   for (const item of ['.dockerignore', '.env.example', 'AGENT.md', 'AGENTS.md', 'Dockerfile',
-    'LICENSE', 'README.md', 'docker-compose.yml', 'package.json', 'server.js']) {
+    'LICENSE', 'README.md', 'docker-compose.yml', 'package.json', 'package-lock.json', 'server.js']) {
     fs.cpSync(path.join(root, item), path.join(artifact, item), { recursive: true });
   }
   for (const dir of ['lib', 'public']) fs.cpSync(path.join(root, dir), path.join(artifact, dir), { recursive: true });
@@ -105,53 +164,95 @@ try {
   for (const item of ['.dockerignore', 'Dockerfile', 'requirements.txt', 'pipeline.py', 'service.py']) {
     fs.copyFileSync(path.join(root, 'translation-service-poc', item), path.join(artifact, 'translation-service-poc', item));
   }
-  const output = execFileSync(artifactValidator, [artifact], {
-    env: { ...process.env, RELEASE_BUILD_STATUS: 'PASS' }, encoding: 'utf8',
-  });
+  const output = runValidator(artifact);
   assert.match(output, /RELEASE-MANIFEST: PASS/);
+
   const pipelinePath = path.join(artifact, 'translation-service-poc', 'pipeline.py');
   fs.rmSync(pipelinePath);
-  assert.throws(
-    () => execFileSync(artifactValidator, [artifact], {
-      env: { ...process.env, RELEASE_BUILD_STATUS: 'PASS' }, encoding: 'utf8',
-    }),
-    /status|exited with|pipeline\.py/i,
-    '缺少翻译运行源码的制品不得通过',
-  );
+  expectValidatorFailure(artifact, { code: 68, message: /pipeline\.py/ });
   fs.copyFileSync(path.join(root, 'translation-service-poc', 'pipeline.py'), pipelinePath);
-  assert.throws(
-    () => execFileSync(artifactValidator, [artifact], { env: { ...process.env }, encoding: 'utf8' }),
-    /status|exited with|package\.json/i,
-    '未确认构建成功不得生成 PASS',
-  );
-  fs.rmSync(path.join(artifact, 'package.json'));
-  assert.throws(
-    () => execFileSync(artifactValidator, [artifact], {
-      env: { ...process.env, RELEASE_BUILD_STATUS: 'PASS' }, encoding: 'utf8',
-    }),
-    /status|exited with|package\.json/i,
-    '缺少 package.json 的失败制品不得通过',
-  );
 
-  // 禁止内容检查必须递归，不能通过把生产状态放入嵌套目录绕过门禁。
-  fs.writeFileSync(path.join(artifact, 'package.json'), JSON.stringify({ name: 'jm-web' }));
+  expectValidatorFailure(artifact, {
+    env: { RELEASE_BUILD_STATUS: '' },
+    code: 66,
+    message: /构建状态未确认/,
+  });
+
+  const packagePath = path.join(artifact, 'package.json');
+  fs.rmSync(packagePath);
+  expectValidatorFailure(artifact, { code: 68, message: /package\.json/ });
+  fs.copyFileSync(path.join(root, 'package.json'), packagePath);
+
+  const lockPath = path.join(artifact, 'package-lock.json');
+  fs.rmSync(lockPath);
+  expectValidatorFailure(artifact, {
+    code: 68,
+    message: /package-lock\.json/,
+  });
+  fs.copyFileSync(path.join(root, 'package-lock.json'), lockPath);
+
+  // 禁止内容检查必须递归：顶层允许清单先拦下未知目录，但把生产状态藏进
+  // 允许目录（lib/）内部的嵌套路径同样必须被递归 walk 拒绝。
   fs.mkdirSync(path.join(artifact, 'nested', 'data'), { recursive: true });
-  assert.throws(
-    () => execFileSync(artifactValidator, [artifact], {
-      env: { ...process.env, RELEASE_BUILD_STATUS: 'PASS' }, encoding: 'utf8',
-    }),
-    /禁止内容|nested\/data/i,
-    '嵌套 data 目录不得进入发布制品',
-  );
+  expectValidatorFailure(artifact, { code: 72, message: /顶层内容.*nested|nested.*顶层/ });
+  fs.rmSync(path.join(artifact, 'nested'), { recursive: true, force: true });
+  fs.mkdirSync(path.join(artifact, 'lib', 'nested', 'data'), { recursive: true });
+  expectValidatorFailure(artifact, { code: 72, message: /nested\/data/ });
+  fs.rmSync(path.join(artifact, 'lib', 'nested'), { recursive: true, force: true });
 
-  // 路径规范化后仍须阻断旧生产目录；这里只验证不存在的变体不会被误判
-  // 为制品，实际生产目录由部署流程单独保护。
-  assert.throws(
-    () => execFileSync(artifactValidator, ['/srv/jm-web/../jm-web'], {
-      env: { ...process.env, RELEASE_BUILD_STATUS: 'PASS' }, encoding: 'utf8',
-    }),
-    /目录不存在|生产路径|exited with/i,
-  );
+  // 生产会话目录无论出现在顶层还是嵌套路径都不得进入制品。
+  fs.mkdirSync(path.join(artifact, 'sessions'), { recursive: true });
+  expectValidatorFailure(artifact, { code: 72, message: /sessions/ });
+  fs.rmSync(path.join(artifact, 'sessions'), { recursive: true, force: true });
+  fs.mkdirSync(path.join(artifact, 'lib', 'sessions'), { recursive: true });
+  fs.writeFileSync(path.join(artifact, 'lib', 'sessions', 'session.json'), '{}');
+  expectValidatorFailure(artifact, { code: 72, message: /lib\/sessions/ });
+  fs.rmSync(path.join(artifact, 'lib', 'sessions'), { recursive: true, force: true });
+
+  // 密钥、环境备份与归档后缀不得出现在制品任意层级。
+  fs.writeFileSync(path.join(artifact, 'lib', 'deploy.pem'), '-----BEGIN PRIVATE KEY-----\n');
+  expectValidatorFailure(artifact, { code: 72, message: /deploy\.pem/ });
+  fs.rmSync(path.join(artifact, 'lib', 'deploy.pem'));
+  fs.writeFileSync(path.join(artifact, 'public', 'uploads.env'), 'ACCESS_PASSWORD=x\n');
+  expectValidatorFailure(artifact, { code: 72, message: /uploads\.env/ });
+  fs.rmSync(path.join(artifact, 'public', 'uploads.env'));
+  fs.writeFileSync(path.join(artifact, 'public', 'backup.zip'), 'PK');
+  expectValidatorFailure(artifact, { code: 72, message: /backup\.zip/ });
+  fs.rmSync(path.join(artifact, 'public', 'backup.zip'));
+
+  // 发布目录采用明确允许清单：清单之外的顶层条目与翻译目录多余文件都必须拒绝。
+  fs.writeFileSync(path.join(artifact, 'notes.txt'), 'extra');
+  expectValidatorFailure(artifact, { code: 72, message: /notes\.txt/ });
+  fs.rmSync(path.join(artifact, 'notes.txt'));
+  fs.writeFileSync(path.join(artifact, 'translation-service-poc', 'NOTES.md'), 'extra');
+  expectValidatorFailure(artifact, { code: 72, message: /NOTES\.md/ });
+  fs.rmSync(path.join(artifact, 'translation-service-poc', 'NOTES.md'));
+
+  // 不存在的路径命中“目录不存在”分支（67）；这是独立分支，
+  // 不得被当作已经测到生产路径阻断（65）的证据。
+  expectValidatorFailure('/srv/jm-web/../jm-web', {
+    code: 67,
+    message: /目录不存在/,
+  });
+
+  // 生产路径阻断分支必须有真实存在的目录命中：通过仅增不减排除法注入受保护前缀，
+  // 用隔离临时目录验证规范化后的阻断逻辑（65），不依赖生产目录真实存在。
+  const blockedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'jmw-blocked-root-'));
+  try {
+    const inner = path.join(blockedRoot, 'inner');
+    fs.mkdirSync(inner, { recursive: true });
+    const blockedPrefix = normalizeViaBash(blockedRoot);
+    expectValidatorFailure(inner, {
+      env: { JMW_RELEASE_EXTRA_BLOCKED_PATHS: blockedPrefix },
+      code: 65,
+      message: /生产路径/,
+    });
+  } finally {
+    fs.rmSync(blockedRoot, { recursive: true, force: true });
+  }
+
+  // 负向用例全部还原后，最小合法制品必须重新通过校验。
+  assert.match(runValidator(artifact), /RELEASE-MANIFEST: PASS/);
 } finally {
   fs.rmSync(artifact, { recursive: true, force: true });
 }

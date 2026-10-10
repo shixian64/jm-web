@@ -29,6 +29,11 @@ jobs:
         with:
           node-version: '22.23.2'
 
+      # 干净 runner 上必须先按锁文件安装依赖（sharp 等），
+      # 否则 npm test 以 MODULE_NOT_FOUND 失败，测试门禁无法转绿。
+      - name: Install dependencies from lockfile
+        run: npm ci
+
       - name: Run tests
         run: npm test
 

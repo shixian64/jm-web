@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import sys
 import time
 from pathlib import Path
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -127,3 +130,174 @@ def test_limits_and_sha_validation(tmp_path):
         headers["Content-Type"] = "image/png"
         headers["X-Source-SHA256"] = "0" * 64
         assert client.post("/v1/translate/page", content=image_bytes(), headers=headers).status_code == 400
+
+
+class _SlowStreamRequest:
+    """最小 Request 替身：headers + 逐块慢速异步流，用于直接测上传期限。"""
+
+    def __init__(self, chunks, delay, headers=None):
+        self.headers = headers or {}
+        self._chunks = chunks
+        self._delay = delay
+
+    def stream(self):
+        async def iterator():
+            for chunk in self._chunks:
+                await asyncio.sleep(self._delay)
+                yield chunk
+
+        return iterator()
+
+
+def test_read_limited_enforces_upload_deadline():
+    from service import _read_limited
+
+    request = _SlowStreamRequest([b"a" * 1024] * 50, delay=0.05)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(_read_limited(request, limit=1024 * 1024, timeout_seconds=0.1))
+    assert exc.value.status_code == 408
+
+
+def test_empty_token_disables_translation_but_keeps_liveness(tmp_path):
+    config = ServiceConfig(cache_dir=tmp_path, workers=1, service_token="")
+    manager = TranslationJobManager(config, pipeline=FakePipeline())
+    app = create_app(config=config, manager=manager)
+    with TestClient(app) as client:
+        health = client.get("/healthz")
+        assert health.status_code == 200
+        assert health.json()["auth"] == "disabled"
+        ready = client.get("/readyz")
+        assert ready.status_code == 200, "空 token 属部署选择，不得阻断整站启动"
+        disabled = client.post(
+            "/v1/translate/page", content=image_bytes(), headers={"Content-Type": "image/png"}
+        )
+        assert disabled.status_code == 503
+        assert disabled.json()["detail"].startswith("翻译服务未配置访问令牌")
+
+
+def test_strict_mode_refuses_to_start_without_token(tmp_path, monkeypatch):
+    config = ServiceConfig(cache_dir=tmp_path, workers=1, service_token="")
+    manager = TranslationJobManager(config, pipeline=FakePipeline())
+    monkeypatch.setenv("TRANSLATION_REQUIRE_TOKEN", "1")
+    app = create_app(config=config, manager=manager)
+    with pytest.raises(RuntimeError, match="TRANSLATION_REQUIRE_TOKEN"):
+        with TestClient(app):
+            pass
+
+
+def test_readyz_fails_and_translate_rejects_after_warmup_error(tmp_path):
+    config = ServiceConfig(cache_dir=tmp_path, workers=1, service_token="secret")
+    manager = TranslationJobManager(config, pipeline=FakePipeline())
+
+    def broken_loader():
+        raise RuntimeError("ocr model missing")
+
+    manager.pipeline._get_ocr = broken_loader
+    app = create_app(config=config, manager=manager)
+    with TestClient(app) as client:
+        # lifespan 已触发 warmup 并记录失败：liveness 仍 200，readiness 503。
+        assert client.get("/healthz").status_code == 200
+        ready = client.get("/readyz")
+        assert ready.status_code == 503
+        assert ready.json()["ready"] is False
+        assert ready.json()["reason"] == "RuntimeError"
+        rejected = client.post(
+            "/v1/translate/page",
+            content=image_bytes(),
+            headers={"Authorization": "Bearer secret", "Content-Type": "image/png"},
+        )
+        assert rejected.status_code == 503
+        assert "未就绪" in rejected.json()["detail"]
+
+
+def test_upload_gate_returns_busy_when_exhausted(tmp_path):
+    import httpx
+
+    config = ServiceConfig(
+        cache_dir=tmp_path, workers=1, service_token="secret",
+        max_upload_connections=1, upload_wait_seconds=0.05,
+    )
+    manager = TranslationJobManager(config, pipeline=FakePipeline())
+    app = create_app(config=config, manager=manager)
+
+    async def scenario():
+        # 与应用共享同一事件循环：真实占用闸门，验证 429 与释放后的恢复。
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            gate = app.state.translation_upload_gate
+            assert gate is not None
+            await gate.acquire()
+            try:
+                busy = await client.post(
+                    "/v1/translate/page?waitMs=0",
+                    content=image_bytes(),
+                    headers={"Authorization": "Bearer secret", "Content-Type": "image/png"},
+                )
+                assert busy.status_code == 429
+                assert busy.json()["error"] == "upload_queue_full"
+            finally:
+                gate.release()
+            ok = await client.post(
+                "/v1/translate/page?waitMs=0",
+                content=image_bytes(),
+                headers={"Authorization": "Bearer secret", "Content-Type": "image/png"},
+            )
+            assert ok.status_code in {200, 202}
+
+    asyncio.run(scenario())
+
+
+def test_stalled_upload_is_interrupted_and_gate_released(tmp_path):
+    """停传连接必须在期限处被取消并归还上传闸门（issue #1）。"""
+    import httpx
+
+    config = ServiceConfig(
+        cache_dir=tmp_path, workers=1, service_token="secret",
+        max_upload_connections=1, upload_wait_seconds=0.05, upload_timeout_seconds=0.2,
+    )
+    manager = TranslationJobManager(config, pipeline=FakePipeline())
+    app = create_app(config=config, manager=manager)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            gate = app.state.translation_upload_gate
+
+            async def stalled_body():
+                yield b"x" * 1024
+                await asyncio.sleep(30)  # 模拟客户端停传
+                yield b"y" * 1024
+
+            response = await client.post(
+                "/v1/translate/page?waitMs=0",
+                content=stalled_body(),
+                headers={"Authorization": "Bearer secret", "Content-Type": "image/png"},
+            )
+            assert response.status_code == 408, "停传连接必须被上传期限中断"
+            ok = await client.post(
+                "/v1/translate/page?waitMs=0",
+                content=image_bytes(),
+                headers={"Authorization": "Bearer secret", "Content-Type": "image/png"},
+            )
+            assert ok.status_code in {200, 202}, "取消后上传闸门必须已归还"
+
+    asyncio.run(scenario())
+
+
+def test_empty_token_skips_warmup_so_readyz_stays_ok(tmp_path, monkeypatch):
+    """空 token 禁用翻译时跳过 warmup：OCR 失败不得经 readyz 阻断整站（issue #2）。"""
+    config = ServiceConfig(cache_dir=tmp_path, workers=1, service_token="")
+    manager = TranslationJobManager(config, pipeline=FakePipeline())
+
+    def broken_loader():
+        raise RuntimeError("ocr model missing")
+
+    manager.pipeline._get_ocr = broken_loader
+    monkeypatch.setenv("TRANSLATION_WARMUP", "1")
+    monkeypatch.setenv("TRANSLATION_REQUIRE_TOKEN", "0")
+    app = create_app(config=config, manager=manager)
+    with TestClient(app) as client:
+        assert client.get("/healthz").json()["auth"] == "disabled"
+        ready = client.get("/readyz")
+        assert ready.status_code == 200, "空 token 禁用模式下 warmup 失败不得让 readiness 失败"
+        assert ready.json()["ready"] is True

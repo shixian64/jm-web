@@ -38,12 +38,13 @@
 
 ### 方式一：直接运行（推荐）
 
-服务器需有 Node.js **20.0.0 或更高**版本（零运行时依赖，无需 `npm install`）。生产环境建议使用仍在安全维护期内的 LTS 版本；项目 Docker 构建基线固定为 `node:22.23.2-alpine3.24`，升级需经过显式评审与回归：
+服务器需有 Node.js **20.0.0 或更高**版本。后端仅一个运行依赖 `sharp`（服务端章节视觉分析用的图片编解码库，随 `package-lock.json` 锁定版本），需先安装再启动；生产环境建议使用仍在安全维护期内的 LTS 版本；项目 Docker 构建基线固定为 `node:22.23.2-alpine3.24`，升级需经过显式评审与回归：
 
 ```bash
 git clone <本项目目录> jm-web   # 或直接上传 jm-web 文件夹
 cd jm-web
-node server.js                 # 默认仅监听 127.0.0.1:3210
+npm ci --omit=dev               # 按锁文件安装运行依赖（sharp）
+node server.js                  # 默认仅监听 127.0.0.1:3210
 ```
 
 启用访问口令或修改端口时，按当前 Shell 设置环境变量：
@@ -129,7 +130,7 @@ docker compose restart
 docker compose down
 ```
 
-翻译容器只加入 Compose 内部网络，不对宿主机发布 8091 端口；`jm-web` 通过 `http://translation-service:8091` 访问。设置 `TRANSLATION_SERVICE_URL=` 可关闭主站翻译调用，但翻译容器仍会随 Compose 启动。当前后端仅覆盖繁体中文到简体中文的 `fast` 路径；复杂背景会安全回退原图。翻译结果保存在 Docker 命名卷 `translation-cache` 中。
+翻译容器只加入 Compose 内部网络，不对宿主机发布 8091 端口；`jm-web` 通过 `http://translation-service:8091` 访问。设置 `TRANSLATION_SERVICE_URL=` 可关闭主站翻译调用，但翻译容器仍会随 Compose 启动。**安全契约：`TRANSLATION_SERVICE_TOKEN` 为空时，主站与翻译容器都会禁用翻译能力并明确提示（不再默认放行）**；需要翻译时请在 `.env` 为两侧配置同一个强随机令牌。主站代理在读取上传体之前获取有界并发槽位，且单请求受整体截止时间约束（`TRANSLATION_MAX_CONCURRENT` 等可调）；翻译容器 `/healthz` 为存活探针、`/readyz` 为就绪探针（OCR 初始化失败时返回 503），Compose 健康检查使用 `/readyz`。当前后端仅覆盖繁体中文到简体中文的 `fast` 路径；复杂背景会安全回退原图。翻译结果保存在 Docker 命名卷 `translation-cache` 中。
 
 已有部署请保留原 `.env`，将其中的 `TRANSLATION_SERVICE_URL` 改为 `http://translation-service:8091`，再执行 `docker compose up -d --build`；不要用示例覆盖生产配置。第一次构建需要下载 Python/OCR 依赖。翻译容器默认上限为 2 CPU、2 GiB 内存，2 个工作线程、8 个在途任务，可通过 `.env` 的 `TRANSLATION_*` 调整。
 
@@ -217,9 +218,14 @@ docker compose --env-file .env \
 | `TRANSLATION_IMAGE` | GHCR 覆盖默认为 `ghcr.io/shixian64/jm-web-translation:latest` | 翻译预构建镜像地址，可指定版本或 digest |
 | `TRANSLATION_CPU_LIMIT` / `TRANSLATION_MEMORY_LIMIT` | `2.0` / `2g` | 翻译容器 CPU / 内存上限 |
 | `TRANSLATION_WORKERS` / `TRANSLATION_MAX_INFLIGHT` | `2` / `8` | 翻译工作线程数 / 在途任务上限 |
-| `TRANSLATION_SERVICE_TOKEN` | 空 | 翻译服务内部访问令牌，不下发浏览器 |
+| `TRANSLATION_SERVICE_TOKEN` | 空 | 翻译服务内部访问令牌，不下发浏览器；**为空时双方禁用翻译能力** |
 | `TRANSLATION_DEBIAN_MIRROR_HOST` / `TRANSLATION_PYPI_INDEX_URL` | 官方源 | 翻译镜像构建时使用的 Debian/PyPI 源；网络受限时可切换到可用镜像 |
 | `TRANSLATION_MAX_PAGE_BYTES` | `26214400` | 翻译单页请求/响应大小上限（字节） |
+| `TRANSLATION_MAX_CONCURRENT` / `TRANSLATION_MAX_CONCURRENT_PER_CLIENT` | `4` / `2` | 主站翻译代理全局/单客户端并发槽位（读取上传体之前获取） |
+| `TRANSLATION_WAIT_QUEUE_LIMIT` / `TRANSLATION_WAIT_TIMEOUT_MS` | `16` / `5000` | 等待队列上限与等待超时（超时返回 429） |
+| `TRANSLATION_UPLOAD_TIMEOUT_MS` / `TRANSLATION_DEADLINE_MS` | `30000` / `120000` | 上传读取期限 / 覆盖上传到结果回传的整体截止时间 |
+| `TRANSLATION_MAX_UPLOAD_CONNECTIONS` / `TRANSLATION_UPLOAD_TIMEOUT_SECONDS` | `8` / `60` | 翻译容器上传阶段准入与慢速上传总期限 |
+| `TRANSLATION_REQUIRE_TOKEN` | `0` | 严格模式：置 `1` 时翻译容器在空令牌下拒绝启动 |
 | `JMW_MAX_API_RESPONSE_BYTES` | `16777216` | 上游 API 单响应大小上限（字节，范围 1–32 MiB） |
 | `JMW_MAX_AI_STREAM_BYTES` | `16777216` | 单次 AI 流式响应大小上限（字节，范围 1–64 MiB） |
 | `JMW_MAX_AI_CONCURRENCY` | `4` | AI 流式请求并发上限（范围 1–20） |
@@ -232,10 +238,23 @@ docker compose --env-file .env \
 | `CHAPTER_AI_INTERVAL_MS` | `30000` | 后台章节视觉分析轮询间隔；与用户无关 |
 | `CHAPTER_AI_CONCURRENCY` | `1` | 后台章节视觉分析全局模型并发（部署时可调，默认 1） |
 | `CHAPTER_AI_MAX_RETRIES` | `3` | 章节视觉分析失败后的最大重试次数（指数退避） |
+| `CHAPTER_AI_MAX_QUEUE_ENTRIES` | `1000` | 队列配置上限；实际准入还受记录/字节预留限制，满后手工入队返回 429、自动入队跳过 |
+| `CHAPTER_AI_MAX_RECORDS` | `5000` | 分析记录硬上限：排队/运行记录不可淘汰，其余按失败 → 孤儿 → 旧版本 → 最旧完成顺序淘汰 |
+| `CHAPTER_AI_MAX_STATS` | `2000` | 热度统计条数上限（淘汰调度价值最小的条目） |
+| `CHAPTER_AI_MAX_STATE_BYTES` | `8388608` | 状态文件字节硬上限（最小 64 KiB）；不可收敛时拒写并保留待重试更新 |
+| `CHAPTER_AI_MAX_TASK_PAGES` | `60` | 单任务页数预算：超限整章明确失败，不截断、不重试 |
+| `CHAPTER_AI_MAX_TASK_IMAGE_BYTES` | `25165824` | 单任务累计编码图片字节预算（约 24 MiB） |
+| `CHAPTER_AI_MAX_TASK_IMAGE_PIXELS` | `40000000` | 单张图片像素预算（先读元数据判定，再重编码） |
+| `CHAPTER_AI_MAX_TASK_DURATION_MS` | `600000` | 单任务完整截止期限，覆盖下载、元数据读取、解扰、编码及模型响应体读取 |
+| `CHAPTER_AI_MAX_MODEL_RESPONSE_BYTES` | `4194304` | 模型单次响应体字节上限 |
 | `TAVILY_API_KEY` | 空 | 可选：启用 Tavily 搜索提供商；Key 仅保存在服务器 |
 | `SEARXNG_BASE_URL` | 空 | 可选：自建 SearXNG 的 HTTPS 基址，不含 `/search`；必须通过后端公网地址安全检查 |
 | `SEARCH_TIMEOUT` | `35000` | 联网搜索总时间预算（正整数毫秒，最大 60000） |
 | `JMW_UPDATE_REPO` | 空 | 可选：用于更新检查的 GitHub `owner/repo` |
+
+章节分析容量按**已接受任务未来可能产生的重试记录**预留，而非只计算当前队列 JSON：有效队列上限为 `min(队列配置, 记录上限, floor((状态字节上限 - 4096) / 4096))`。默认配置仍允许 1000 条任务；64 KiB 文件预算最多允许 15 条；记录上限为 2 时至多接受 2 条。`/api/ai/config` 的 `chapterAnalysis` 返回实际 `maxQueueEntries` 与 `capacityBlocked`。写盘优先淘汰非任务缓存；若异常旧状态仍不可收敛，保留原文件及待重试更新并暂停新任务准入，成功重试写盘后恢复。
+
+降低容量或升级时，若旧队列超过有效上限，会先独占创建 `data/chapter-ai/state.capacity-recovery.json` 保存**完整原始状态**，再保留优先级最高的活动任务；超额任务留在恢复副本，不会自动全部重入队。该副本不是活动状态文件，不受活动文件字节上限约束，也不会自动覆盖/生成多代备份。如果无法保存副本（包括副本已存在），启动失败且原状态不改写；再次降低容量前应由运维先安全归档旧副本，并按新容量分批恢复任务，禁止直接覆盖生产状态。
 
 容器及反向代理可使用 `GET`/`HEAD /healthz` 做健康检查。该接口不需要访问口令、不会创建会话，也不会请求上游服务；镜像已内置健康检查。启动后可用 `docker compose ps` 查看状态，或执行 `curl -fsS http://127.0.0.1:3210/healthz` 验证。
 
@@ -278,7 +297,7 @@ JMW_TRUST_PROXY=172.18.0.5,172.19.0.0/24
 
 | 层 | 说明 |
 | --- | --- |
-| 后端 | 零依赖 Node.js（≥20），`server.js` + `lib/` |
+| 后端 | Node.js（≥20）内建模块实现 HTTP 服务；唯一运行依赖 `sharp`（章节视觉分析） |
 | API 协议 | 与 jm-mobile 一致：`token` / `tokenparam` 请求头签名，响应 `data` 字段 AES-256-ECB 解密 |
 | 会话 | 每个浏览器一个 Cookie Jar（AVS 等），持久化到 `data/sessions/`，重启不丢登录态；空会话 7 天、登录会话默认 365 天自动清理，可由 `JMW_SESSION_TTL_SECONDS` 调整（7 天至 2 年） |
 | 图片 | 服务端按 HTTPS 域名白名单逐跳流式代理并限制大小/并发；解扰由浏览器 Worker/Canvas 完成 |
@@ -289,7 +308,7 @@ JMW_TRUST_PROXY=172.18.0.5,172.19.0.0/24
 
 ```text
 jm-web/
-├── server.js            零依赖 HTTP 服务器（API 代理 + 静态文件）
+├── server.js            HTTP 服务器（内建模块实现；章节分析经 lib/ 引入 sharp）
 ├── lib/
 │   ├── jm-api.js        上游 API 客户端（签名 / AES 解密 / 域名故障切换）
 │   ├── photo.js         chapter_view_template HTML 解析

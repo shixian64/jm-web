@@ -19,20 +19,27 @@ if [[ ! -d "$artifact" || -L "$artifact" ]]; then
 fi
 # 规范化后再做路径阻断，避免通过 `..` 或相对路径绕过生产目录保护。
 artifact="$(cd -- "$artifact" && pwd -P)"
-case "$artifact" in
-  /srv/jm-web|/srv/jm-web/*)
-    echo "拒绝已停用的生产路径: $artifact" >&2
+blocked_prefixes=(
+  "/srv/jm-web"
+  "/home/shixian/project/jm-web/current"
+)
+# 仅供自动化测试注入额外受保护前缀（换行分隔）；
+# 只会追加阻断目标，不能替换或移除内置的生产路径。
+if [[ -n "${JMW_RELEASE_EXTRA_BLOCKED_PATHS:-}" ]]; then
+  while IFS= read -r extra; do
+    [[ -n "$extra" ]] && blocked_prefixes+=("$extra")
+  done <<< "$JMW_RELEASE_EXTRA_BLOCKED_PATHS"
+fi
+for prefix in "${blocked_prefixes[@]}"; do
+  if [[ "$artifact" == "$prefix" || "$artifact" == "$prefix"/* ]]; then
+    echo "拒绝已停用或受保护的生产路径: $artifact" >&2
     exit 65
-    ;;
-  /home/shixian/project/jm-web/current|/home/shixian/project/jm-web/current/*)
-    echo "拒绝正在运行的生产 current: $artifact" >&2
-    exit 65
-    ;;
-esac
+  fi
+done
 
 required=(
   .dockerignore .env.example AGENT.md AGENTS.md Dockerfile LICENSE README.md
-  docker-compose.yml lib package.json public server.js
+  docker-compose.yml lib package.json package-lock.json public server.js
   translation-service-poc/.dockerignore translation-service-poc/Dockerfile
   translation-service-poc/requirements.txt translation-service-poc/pipeline.py
   translation-service-poc/service.py
@@ -54,22 +61,50 @@ if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg) || typeof pkg.name !==
   throw new Error('package.json 不是有效运行清单');
 }
 
-// 递归检查路径，不能只看制品根目录：嵌套 data/.git/.env 同样可能携带
+// 发布制品使用明确的顶层允许清单：清单之外的任何顶层条目（含整个 .github/、
+// 压缩包、备份）都视为多余内容拒绝，而不是仅依赖后缀黑名单猜异常文件。
+const allowedTopLevel = new Set([
+  '.dockerignore', '.env.example', 'AGENT.md', 'AGENTS.md', 'Dockerfile', 'LICENSE',
+  'README.md', 'docker-compose.yml', 'lib', 'package.json', 'package-lock.json',
+  'public', 'server.js', 'translation-service-poc',
+]);
+const allowedTranslation = new Set([
+  '.dockerignore', 'Dockerfile', 'requirements.txt', 'pipeline.py', 'service.py',
+]);
+for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+  if (!allowedTopLevel.has(entry.name)) {
+    throw new Error(`制品包含发布清单之外的顶层内容: ${entry.name}`);
+  }
+}
+const translationDir = path.join(root, 'translation-service-poc');
+for (const entry of fs.readdirSync(translationDir, { withFileTypes: true })) {
+  if (!allowedTranslation.has(entry.name)) {
+    throw new Error(`translation-service-poc 含非运行文件: ${entry.name}`);
+  }
+}
+
+// 递归检查路径，不能只看制品根目录：嵌套 data/sessions/.git/.env 同样可能携带
 // 生产状态或凭据。符号链接一律拒绝，避免校验路径与实际打包内容不一致。
-const forbiddenDirs = new Set(['.git', 'data', 'test', 'tests', 'node_modules', '__pycache__', '.pytest_cache', 'cache']);
+const forbiddenDirs = new Set([
+  '.git', 'data', 'test', 'tests', 'node_modules', '__pycache__',
+  '.pytest_cache', 'cache', 'sessions',
+]);
+const isForbiddenFile = (name) => name === '.env'
+  || name.endsWith('.env') // 覆盖 prod.env / production.env 等非点前缀环境备份
+  || (name.startsWith('.env.') && name !== '.env.example')
+  || /(?:\.log|\.secret|\.jsonl|\.pem|\.key|\.sql)$/i.test(name)
+  || /(?:\.zip|\.tar|\.gz|\.tgz|\.7z|\.rar|\.xz|\.bz2)$/i.test(name) // 归档不进制品
+  || /^id_(?:rsa|dsa|ecdsa|ed25519)(?:\.|$)/.test(name); // SSH 私钥材料
 const walk = (dir, relative = '') => {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const childRelative = relative ? `${relative}/${entry.name}` : entry.name;
     const child = path.join(dir, entry.name);
     if (entry.isSymbolicLink()) throw new Error(`制品不得包含符号链接: ${childRelative}`);
-    if (forbiddenDirs.has(entry.name) || entry.name === '.env'
-        || (entry.name.startsWith('.env.') && entry.name !== '.env.example')) {
-      throw new Error(`制品包含禁止内容: ${childRelative}`);
+    if (forbiddenDirs.has(entry.name)) throw new Error(`制品包含禁止目录: ${childRelative}`);
+    if (entry.isFile() && isForbiddenFile(entry.name)) {
+      throw new Error(`制品包含日志、秘密或归档文件: ${childRelative}`);
     }
     if (entry.isDirectory()) walk(child, childRelative);
-    else if (entry.isFile() && /(?:\.log|\.secret|\.jsonl)$/i.test(entry.name)) {
-      throw new Error(`制品包含日志或秘密文件: ${childRelative}`);
-    }
   }
 };
 walk(root);
@@ -77,6 +112,7 @@ walk(root);
 const docker = fs.readFileSync(path.join(root, 'Dockerfile'), 'utf8');
 for (const [pattern, label] of [
   [/^COPY --chown=node:node package\.json server\.js LICENSE \.\/$/m, '入口文件'],
+  [/^COPY --chown=node:node package-lock\.json \.\/$/m, '锁文件'],
   [/^COPY --chown=node:node lib \.\/lib$/m, 'lib'],
   [/^COPY --chown=node:node public \.\/public$/m, 'public'],
 ]) {

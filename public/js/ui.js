@@ -2,6 +2,23 @@
 import { icon } from './icons.js';
 
 /**
+ * 路由层错误文案：只呈现稳定提示，不把内部堆栈、文件路径或第三方响应
+ * 暴露到页面。401 必须区分“站点访问门禁失效”与“JM 登录失效”，前者由
+ * 应用拉起 gate 重新验证，后者引导用户重新登录 JM 账号。
+ */
+export function routeErrorMessage(error) {
+  const status = Number(error?.status);
+  if (status === 401) {
+    return error?.needAuth ? '需要访问口令，请先完成验证。' : 'JM 登录已失效，请重新登录。';
+  }
+  if (status === 403) return '当前操作需要站点管理员权限。';
+  if (status === 404) return '请求的内容不存在或已下线。';
+  if (status === 429) return '请求过于频繁，请稍后重试。';
+  if (status >= 500 && status <= 599) return '服务暂时不可用，请稍后重试。';
+  return '页面加载失败，请稍后重试。';
+}
+
+/**
  * 是否允许页面在没有直接用户手势时自动聚焦可编辑控件。
  *
  * iOS/WebKit（包括 iPhone 上的 Edge）会把脚本触发的输入框聚焦视为编辑

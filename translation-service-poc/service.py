@@ -59,12 +59,24 @@ class ServiceConfig:
     job_ttl_seconds: int = 3600
     result_max_age_seconds: int = 86400
     service_token: str = ""
+    # 连接级准入在上传之前：max_inflight 只统计已提交任务，无法阻止大量
+    # 并发慢速上传占满内存；上传闸门先于读取请求体获取。
+    max_upload_connections: int = 8
+    upload_wait_seconds: float = 5.0
+    upload_timeout_seconds: float = 60.0
 
     @classmethod
     def from_env(cls, cache_dir: str | Path | None = None) -> ServiceConfig:
         def integer(name: str, default: int, minimum: int, maximum: int) -> int:
             try:
                 value = int(os.getenv(name, str(default)))
+            except (TypeError, ValueError):
+                value = default
+            return max(minimum, min(maximum, value))
+
+        def number(name: str, default: float, minimum: float, maximum: float) -> float:
+            try:
+                value = float(os.getenv(name, str(default)))
             except (TypeError, ValueError):
                 value = default
             return max(minimum, min(maximum, value))
@@ -85,6 +97,9 @@ class ServiceConfig:
             job_ttl_seconds=integer("TRANSLATION_JOB_TTL_SECONDS", 3600, 60, 7 * 24 * 3600),
             result_max_age_seconds=integer("TRANSLATION_RESULT_MAX_AGE_SECONDS", 86400, 60, 30 * 24 * 3600),
             service_token=os.getenv("TRANSLATION_SERVICE_TOKEN", ""),
+            max_upload_connections=integer("TRANSLATION_MAX_UPLOAD_CONNECTIONS", 8, 1, 64),
+            upload_wait_seconds=number("TRANSLATION_UPLOAD_WAIT_SECONDS", 5.0, 0.0, 60.0),
+            upload_timeout_seconds=number("TRANSLATION_UPLOAD_TIMEOUT_SECONDS", 60.0, 1.0, 300.0),
         )
 
 
@@ -380,7 +395,7 @@ def _authorised(request: Request, token: str) -> bool:
     return bool(supplied) and hmac.compare_digest(supplied, token)
 
 
-async def _read_limited(request: Request, limit: int) -> bytes:
+async def _read_limited(request: Request, limit: int, timeout_seconds: float | None = None) -> bytes:
     content_length = request.headers.get("content-length")
     if content_length:
         try:
@@ -391,16 +406,27 @@ async def _read_limited(request: Request, limit: int) -> bytes:
                 raise HTTPException(status_code=413, detail="图片文件超过大小限制")
         except ValueError:
             raise HTTPException(status_code=400, detail="Content-Length 无效")
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > limit:
-            raise HTTPException(status_code=413, detail="图片文件超过大小限制")
-        chunks.append(chunk)
-    if not chunks:
-        raise HTTPException(status_code=400, detail="请求体为空")
-    return b"".join(chunks)
+
+    async def read_all() -> bytes:
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > limit:
+                raise HTTPException(status_code=413, detail="图片文件超过大小限制")
+            chunks.append(chunk)
+        if not chunks:
+            raise HTTPException(status_code=400, detail="请求体为空")
+        return b"".join(chunks)
+
+    if timeout_seconds is None:
+        return await read_all()
+    # 期限必须覆盖整个读取过程：客户端停传（不再发任何块）时逐块检查永远
+    # 不会触发，wait_for 会取消读取任务并归还上传闸门，连接不会无限占用。
+    try:
+        return await asyncio.wait_for(read_all(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=408, detail="上传超时")
 
 
 def _metadata(request: Request) -> dict[str, str]:
@@ -441,38 +467,90 @@ def create_app(
     service_config = config or (manager.config if manager is not None else ServiceConfig.from_env())
     service_manager = manager or TranslationJobManager(service_config)
 
+    # 空 token 契约：默认部署（未配置令牌）禁用全部翻译能力并明确提示，
+    # 不再默认放行；TRANSLATION_REQUIRE_TOKEN=1 时进一步拒绝启动，供严格
+    # 部署模式选用。两种模式都不生成或猜测令牌。
+    token_disabled = not service_config.service_token
+    strict_token = os.getenv("TRANSLATION_REQUIRE_TOKEN", "0").lower() in {"1", "true", "yes"}
+    # 上传阶段准入：先于读取请求体的有界闸门（等待有期限，超时返回 busy）。
+    upload_gate = asyncio.Semaphore(max(1, service_config.max_upload_connections))
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        if os.getenv("TRANSLATION_WARMUP", "1").lower() not in {"0", "false", "no"}:
+        if strict_token and token_disabled:
+            raise RuntimeError(
+                "TRANSLATION_REQUIRE_TOKEN=1 但 TRANSLATION_SERVICE_TOKEN 为空；拒绝启动。"
+                "请配置令牌，或去掉 TRANSLATION_REQUIRE_TOKEN 以空令牌禁用翻译能力。"
+            )
+        # 空令牌 = 翻译能力整体禁用：跳过 OCR warmup。否则禁用状态下的一次
+        # warmup 失败会让 /readyz 返回 503，经 service_healthy 阻断整站启动，
+        # 与“空 token 禁用翻译、不阻断整站”的契约冲突。
+        if not token_disabled and os.getenv("TRANSLATION_WARMUP", "1").lower() not in {"0", "false", "no"}:
             try:
                 await asyncio.to_thread(service_manager.warmup)
             except Exception:
-                # Keep /healthz available even if an optional OCR model is
-                # unavailable; the first request will return a generic job
-                # error and operators can inspect the server log.
+                # Keep /healthz (liveness) available even if an optional OCR
+                # model is unavailable; /readyz reports the failure so
+                # orchestrators can hold traffic back.
                 LOG.exception("OCR warmup failed")
         yield
         service_manager.shutdown()
 
     app = FastAPI(title="JM Translation Service", version=PIPELINE_VERSION, lifespan=lifespan)
     app.state.translation_manager = service_manager
+    app.state.translation_upload_gate = upload_gate
 
     def guard(request: Request) -> None:
+        if token_disabled:
+            # 能力禁用与认证失败必须可区分：禁用是部署选择，不是凭据错误。
+            raise HTTPException(status_code=503, detail="翻译服务未配置访问令牌，能力已禁用")
         if not _authorised(request, service_config.service_token):
             raise HTTPException(status_code=401, detail="未授权")
 
+    def ensure_ready() -> None:
+        with service_manager._lock:  # noqa: SLF001 - small read of own manager state
+            warmup_error = service_manager._warmup_error
+        if warmup_error is not None:
+            raise HTTPException(status_code=503, detail="翻译服务未就绪（OCR 初始化失败）")
+
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
-        return service_manager.health()
+        info = service_manager.health()
+        info["auth"] = "disabled" if token_disabled else "token"
+        return info
+
+    @app.get("/readyz")
+    async def readyz() -> JSONResponse:
+        info = service_manager.health()
+        ready = bool(info["ready"])
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={"ready": ready, "reason": info["warmupError"] or ""},
+        )
 
     @app.post("/v1/translate/page")
     async def translate_page(request: Request) -> JSONResponse:
         guard(request)
+        ensure_ready()
         content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if not (content_type in RASTER_MIMES or content_type == "application/octet-stream"):
             raise HTTPException(status_code=415, detail="请以 image/* 二进制上传图片")
         metadata = _metadata(request)
-        source = await _read_limited(request, service_config.max_upload_bytes)
+        try:
+            if service_config.upload_wait_seconds > 0:
+                await asyncio.wait_for(upload_gate.acquire(), timeout=service_config.upload_wait_seconds)
+            else:
+                await upload_gate.acquire()
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                status_code=429,
+                content={"status": "busy", "error": "upload_queue_full", "retryAfterMs": 1000},
+                headers={"Retry-After": "1"},
+            )
+        try:
+            source = await _read_limited(request, service_config.max_upload_bytes, service_config.upload_timeout_seconds)
+        finally:
+            upload_gate.release()
         supplied_sha = metadata.get("sourceSha256")
         if supplied_sha and supplied_sha != hashlib.sha256(source).hexdigest():
             raise HTTPException(status_code=400, detail="sourceSha256 与请求体不一致")

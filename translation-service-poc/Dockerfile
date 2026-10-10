@@ -26,5 +26,6 @@ USER appuser
 EXPOSE 8091
 # Keep one uvicorn process: the in-process queue/cache is intentionally single
 # owner.  Scale by running another service instance with a shared object store
-# only after adding a distributed job backend.
-CMD ["uvicorn", "service:app", "--host", "0.0.0.0", "--port", "8091", "--workers", "1"]
+# only after adding a distributed job backend.  --limit-concurrency 为应用层
+# 闸门（上传准入 + max_inflight）之外的总连接护栏；keep-alive 超时回收空闲连接。
+CMD ["uvicorn", "service:app", "--host", "0.0.0.0", "--port", "8091", "--workers", "1", "--limit-concurrency", "64", "--timeout-keep-alive", "30"]

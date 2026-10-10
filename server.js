@@ -43,6 +43,7 @@ const sessions = require('./lib/sessions');
 const settings = require('./lib/settings');
 const features = require('./lib/features');
 const { ChapterAiScheduler, chapterSourceTitle, effectiveChapterTitle } = require('./lib/chapter-ai');
+const { createTranslationProxy } = require('./lib/translation-proxy');
 
 const configuredPort = Number(process.env.PORT || 3210);
 const portIsValid = Number.isInteger(configuredPort) && configuredPort >= 1 && configuredPort <= 65535;
@@ -66,7 +67,6 @@ const MIN_ACCESS_PASSWORD_BYTES = 16;
 // 逗号分隔的可信反代 IP/CIDR。环回对端默认作为本机反代信任；
 // 其他直连客户即使伪造 X-Forwarded-For 也不会被采信。
 const TRUST_PROXY = process.env.JMW_TRUST_PROXY || '';
-const trustedProxyBlockList = new net.BlockList();
 
 const SAFE_RASTER_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']);
 const MAX_IMAGE_BYTES = Math.min(100 * 1024 * 1024, Math.max(1024 * 1024, Number(process.env.JMW_MAX_IMAGE_BYTES) || 25 * 1024 * 1024));
@@ -113,6 +113,17 @@ const TRANSLATION_MAX_PAGE_BYTES = Math.min(
   Math.max(1024 * 1024, Number(process.env.TRANSLATION_MAX_PAGE_BYTES) || 25 * 1024 * 1024),
 );
 const TRANSLATION_IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']);
+// 翻译代理准入与期限（依据：翻译单页含 25MiB 上传 + OCR 处理，全局 4 并发 ×
+// 约 200MB 上传内存即可覆盖低端单机；客户端 2 并发防单用户占满；等待队列
+// 16 × 5 秒给正常排队留余量；120 秒整体截止覆盖上传→结果回传全程）。
+const TRANSLATION_PROXY = {
+  globalLimit: Math.max(1, Number(process.env.TRANSLATION_MAX_CONCURRENT) || 4),
+  perClientLimit: Math.max(1, Number(process.env.TRANSLATION_MAX_CONCURRENT_PER_CLIENT) || 2),
+  waitingLimit: Math.max(0, Number(process.env.TRANSLATION_WAIT_QUEUE_LIMIT) || 16),
+  waitTimeoutMs: Math.max(1000, Number(process.env.TRANSLATION_WAIT_TIMEOUT_MS) || 5000),
+  uploadTimeoutMs: Math.max(5000, Number(process.env.TRANSLATION_UPLOAD_TIMEOUT_MS) || 30000),
+  deadlineMs: Math.max(30000, Number(process.env.TRANSLATION_DEADLINE_MS) || 120000),
+};
 let activeImageRequests = 0;
 const imageRequestsByClient = new Map();
 // 只缓存成功的封面/缩略图，按字节和 TTL 双重限制；章节原图通常走流式转发，
@@ -142,6 +153,17 @@ const chapterAi = new ChapterAiScheduler({
   maxRetries: process.env.CHAPTER_AI_MAX_RETRIES || 3,
   maxConcurrency: process.env.CHAPTER_AI_CONCURRENCY || 1,
   modelTimeoutMs: process.env.AI_TIMEOUT || 120000,
+  // 状态与任务预算上限（依据见 lib/chapter-ai.js；调整须同步 .env.example、
+  // docker-compose.yml 与 test/chapter-ai.test.js）。
+  maxQueueEntries: process.env.CHAPTER_AI_MAX_QUEUE_ENTRIES || 1000,
+  maxRecordEntries: process.env.CHAPTER_AI_MAX_RECORDS || 5000,
+  maxStatEntries: process.env.CHAPTER_AI_MAX_STATS || 2000,
+  maxStateBytes: process.env.CHAPTER_AI_MAX_STATE_BYTES || 8 * 1024 * 1024,
+  maxTaskPages: process.env.CHAPTER_AI_MAX_TASK_PAGES || 60,
+  maxTaskImageBytes: process.env.CHAPTER_AI_MAX_TASK_IMAGE_BYTES || 24 * 1024 * 1024,
+  maxTaskImagePixels: process.env.CHAPTER_AI_MAX_TASK_IMAGE_PIXELS || 40_000_000,
+  maxTaskDurationMs: process.env.CHAPTER_AI_MAX_TASK_DURATION_MS || 10 * 60 * 1000,
+  maxModelResponseBytes: process.env.CHAPTER_AI_MAX_MODEL_RESPONSE_BYTES || 4 * 1024 * 1024,
   modelFetch: features.outboundFetch,
   discover: async (scheduler) => {
     const jar = { cookiesByOrigin: {}, user: null, apiHost: '' };
@@ -163,19 +185,19 @@ const chapterAi = new ChapterAiScheduler({
       } catch (_) {}
     }
   },
-  fetchChapter: async (aid, photoId) => {
+  fetchChapter: async (aid, photoId, signal) => {
     const jar = { cookiesByOrigin: {}, user: null, apiHost: '' };
     const html = await upstreamRequest({
       path: '/chapter_view_template',
       query: { id: photoId, app_img_shunt: '1', mode: 'vertical', page: '0', express: 'off', v: String(Math.floor(Date.now() / 1000)) },
       hosts: settings.apiHostsForSource('mixed', ''), cookieHosts: settings.allDataSourceHosts(), jar,
-      dnsLookup: features.dohLookup, fetchImpl: features.outboundFetch,
+      dnsLookup: features.dohLookup, fetchImpl: features.outboundFetch, signal,
     });
     const parsed = parsePhotoHtml(String(html));
     if (parsed.imghost) settings.addImageHost(parsed.imghost);
     let name = '';
     try {
-      const album = await upstreamRequest({ path: '/album', query: { id: aid }, hosts: settings.apiHostsForSource('mixed', ''), cookieHosts: settings.allDataSourceHosts(), jar, dnsLookup: features.dohLookup, fetchImpl: features.outboundFetch });
+      const album = await upstreamRequest({ path: '/album', query: { id: aid }, hosts: settings.apiHostsForSource('mixed', ''), cookieHosts: settings.allDataSourceHosts(), jar, dnsLookup: features.dohLookup, fetchImpl: features.outboundFetch, signal });
       const value = album?.data || album;
       const rows = Array.isArray(value?.series) ? value.series : (Array.isArray(value?.chapters) ? value.chapters : []);
       const row = rows.find((item) => String(item?.id || item?.photoId || '') === String(photoId));
@@ -183,8 +205,8 @@ const chapterAi = new ChapterAiScheduler({
     } catch (_) {}
     return { ...parsed, aid, name };
   },
-  fetchImage: async (url) => {
-    const fetched = await fetchImageResponse(url, 30000, features.dohLookup);
+  fetchImage: async (url, signal) => {
+    const fetched = await fetchImageResponse(url, 30000, features.dohLookup, signal);
     try {
       if (!fetched.response.ok || !fetched.response.body) throw new Error(`图片请求失败（HTTP ${fetched.response.status}）`);
       const buffer = await readResponseBuffer(fetched.response, MAX_IMAGE_BYTES, '章节图片', fetched.signal);
@@ -470,85 +492,21 @@ function rateLimit(key, limit, windowMs) {
   return b.count <= limit;
 }
 
-function normalizeIp(value) {
-  let ip = String(value || '').trim();
-  if (!ip) return '';
-  if (ip.startsWith('[') && ip.endsWith(']')) ip = ip.slice(1, -1);
-  // Node 在双栈 socket 上常以 ::ffff:192.0.2.1 表示 IPv4。
-  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(ip);
-  if (mapped && net.isIP(mapped[1]) === 4) ip = mapped[1];
-  return net.isIP(ip) ? ip.toLowerCase() : '';
-}
-
-function addTrustedProxyRule(rule) {
-  const slash = rule.lastIndexOf('/');
-  const rawIp = slash === -1 ? rule : rule.slice(0, slash);
-  const ip = normalizeIp(rawIp);
-  if (!ip) return false;
-  const family = net.isIP(ip);
-  const type = family === 6 ? 'ipv6' : 'ipv4';
-  try {
-    if (slash === -1) {
-      trustedProxyBlockList.addAddress(ip, type);
-      return true;
-    }
-    const prefixText = rule.slice(slash + 1);
-    if (!/^\d+$/.test(prefixText)) return false;
-    const prefix = Number(prefixText);
-    if (prefix < 0 || prefix > (family === 6 ? 128 : 32)) return false;
-    trustedProxyBlockList.addSubnet(ip, prefix, type);
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
-for (const rawRule of TRUST_PROXY.split(',')) {
-  const rule = rawRule.trim();
-  if (rule && !addTrustedProxyRule(rule)) {
-    console.warn(`[警告] 已忽略非法 JMW_TRUST_PROXY 规则: ${rule}`);
-  }
-}
-
-function isLoopbackIp(ip) {
-  if (net.isIP(ip) === 4) return ip.split('.')[0] === '127';
-  return ip === '::1';
-}
-
-function isTrustedProxyIp(ip) {
-  const family = net.isIP(ip);
-  if (!family) return false;
-  return isLoopbackIp(ip) || trustedProxyBlockList.check(ip, family === 6 ? 'ipv6' : 'ipv4');
-}
-
-function clientIp(req) {
-  let current = normalizeIp(req.socket.remoteAddress) || 'unknown';
-  if (!isTrustedProxyIp(current)) return current;
-
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded !== 'string' || !forwarded.trim()) return current;
-  const parts = forwarded.split(',');
-  // 限制链长，且任一 token 不是纯 IP 时整个头都不采信。
-  if (parts.length > 32) return current;
-  const chain = parts.map(normalizeIp);
-  if (chain.some((ip) => !ip)) return current;
-
-  // 从最靠近应用的一跳开始剥离可信代理，第一个非可信 IP 即客户。
-  for (let i = chain.length - 1; i >= 0 && isTrustedProxyIp(current); i--) {
-    current = chain[i];
-  }
-  return current;
-}
-
-function requestIsSecure(req) {
-  if (req.socket && req.socket.encrypted) return true;
-  const peer = normalizeIp(req.socket && req.socket.remoteAddress);
-  if (!peer || !isTrustedProxyIp(peer)) return false;
-  const forwarded = req.headers && req.headers['x-forwarded-proto'];
-  if (typeof forwarded !== 'string') return false;
-  // 反代必须覆盖而不是追加该头；拒绝含逗号的歧义链，避免客户端伪造首项。
-  return forwarded.trim().toLowerCase() === 'https';
-}
+// 可信代理解析与同源校验独立在 lib/origin-guard.js，便于用假请求矩阵
+// 直接测试“不可信转发头不得伪造 clientIp / Secure 判定”与 CSRF 拒绝分支。
+const {
+  normalizeIp,
+  isLoopbackIp,
+  createProxyTrust,
+  checkSameOrigin,
+} = require('./lib/origin-guard');
+const proxyTrust = createProxyTrust({
+  trustProxy: TRUST_PROXY,
+  onInvalidRule: (rule) => console.warn(`[警告] 已忽略非法 JMW_TRUST_PROXY 规则: ${rule}`),
+});
+const isTrustedProxyIp = proxyTrust.isTrustedProxyIp;
+const clientIp = proxyTrust.clientIp;
+const requestIsSecure = proxyTrust.requestIsSecure;
 
 function cookieSecurity(req) {
   return requestIsSecure(req) ? '; Secure' : '';
@@ -1726,110 +1684,19 @@ async function proxyEventStream(res, response, signal) {
   }
 }
 
-function translationServiceHeaders(contentType) {
-  const headers = { 'Content-Type': contentType };
-  if (TRANSLATION_SERVICE_TOKEN) headers.Authorization = `Bearer ${TRANSLATION_SERVICE_TOKEN}`;
-  return headers;
-}
-
-function translationQuery(u) {
-  const allowed = ['aid', 'photoId', 'pageIndex', 'targetLang', 'pipeline', 'waitMs'];
-  const query = new URLSearchParams();
-  for (const key of allowed) {
-    const value = String(u.searchParams.get(key) || '').trim();
-    if (value) query.set(key, value);
-  }
-  return query;
-}
-
-async function proxyTranslationPage(req, res, u, requestSignal) {
-  if (!TRANSLATION_SERVICE_URL) {
-    if (typeof req.resume === 'function') req.resume();
-    throw new ApiError('翻译服务未配置', 503, { expose: true, publicMessage: '翻译服务暂不可用' });
-  }
-  const contentType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
-  if (!TRANSLATION_IMAGE_MIMES.has(contentType)) {
-    if (typeof req.resume === 'function') req.resume();
-    throw new ApiError('请以 image/* 二进制上传图片', 415);
-  }
-  const source = await readBody(req, TRANSLATION_MAX_PAGE_BYTES);
-  if (!source.length) throw new ApiError('图片请求体为空', 400);
-
-  let endpoint;
-  try {
-    endpoint = new URL('/v1/translate/page', `${TRANSLATION_SERVICE_URL}/`);
-    endpoint.search = translationQuery(u).toString();
-  } catch (_) {
-    throw new ApiError('翻译服务地址配置无效', 503, { expose: true, publicMessage: '翻译服务暂不可用' });
-  }
-
-  let upstream;
-  try {
-    upstream = await fetch(endpoint, {
-      method: 'POST',
-      headers: translationServiceHeaders(contentType),
-      body: source,
-      signal: requestSignal,
-    });
-  } catch (error) {
-    if (requestSignal?.aborted || error?.name === 'AbortError') throw error;
-    throw new ApiError('翻译服务连接失败', 502, { cause: error });
-  }
-
-  const responseBody = await readResponseBuffer(upstream, 2 * 1024 * 1024, '翻译服务响应', requestSignal);
-  let payload = null;
-  try { payload = responseBody.length ? JSON.parse(responseBody.toString('utf8')) : null; } catch (_) {}
-  if (!upstream.ok) {
-    const status = upstream.status === 429 ? 429 : (upstream.status >= 400 && upstream.status < 500 ? upstream.status : 502);
-    return sendJson(res, status, {
-      status: payload?.status || 'error',
-      error: status === 429 ? 'translation_queue_full' : 'translation_unavailable',
-      retryAfterMs: payload?.retryAfterMs || 2000,
-    }, status === 429 ? { 'Retry-After': '2' } : {});
-  }
-  if (!payload || typeof payload !== 'object') {
-    throw new ApiError('翻译服务响应格式无效', 502);
-  }
-  if (payload.status !== 'ready' || !payload.imageUrl) {
-    return sendJson(res, 202, {
-      status: payload.status || 'queued',
-      jobId: payload.jobId || null,
-      pollAfterMs: payload.pollAfterMs || 1000,
-    }, { 'Retry-After': '1' });
-  }
-
-  let resultUrl;
-  try { resultUrl = new URL(String(payload.imageUrl), `${TRANSLATION_SERVICE_URL}/`); } catch (_) {
-    throw new ApiError('翻译结果地址无效', 502);
-  }
-  const serviceOrigin = new URL(`${TRANSLATION_SERVICE_URL}/`).origin;
-  if (resultUrl.origin !== serviceOrigin || !/^\/v1\/results\/[0-9a-f]{64}\.webp$/.test(resultUrl.pathname)) {
-    throw new ApiError('翻译结果地址不受信任', 502);
-  }
-  let translated;
-  try {
-    translated = await fetch(resultUrl, {
-      headers: translationServiceHeaders('application/json'),
-      signal: requestSignal,
-    });
-  } catch (error) {
-    if (requestSignal?.aborted || error?.name === 'AbortError') throw error;
-    throw new ApiError('翻译结果获取失败', 502, { cause: error });
-  }
-  if (!translated.ok) throw new ApiError('翻译结果获取失败', 502);
-  const resultType = String(translated.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
-  if (resultType !== 'image/webp') throw new ApiError('翻译结果不是 WebP 图片', 502);
-  const output = await readResponseBuffer(translated, TRANSLATION_MAX_PAGE_BYTES, '翻译结果', requestSignal);
-  if (!output.length) throw new ApiError('翻译结果为空', 502);
-  res.writeHead(200, baseHeaders({
-    'Content-Type': 'image/webp',
-    'Content-Length': output.length,
-    'Cache-Control': 'private, max-age=86400',
-    'X-Translation-Status': 'ready',
-    'X-Translation-Cache-Hit': payload.cacheHit === true ? '1' : '0',
-  }));
-  return res.end(output);
-}
+// 翻译代理独立在 lib/translation-proxy.js：有界准入先于上传、整体截止时间
+// 覆盖上传→服务 POST→响应体→结果 GET→结果响应体、空 token 禁用能力。
+const translationProxy = createTranslationProxy({
+  serviceUrl: TRANSLATION_SERVICE_URL,
+  token: TRANSLATION_SERVICE_TOKEN,
+  imageMimes: TRANSLATION_IMAGE_MIMES,
+  maxPageBytes: TRANSLATION_MAX_PAGE_BYTES,
+  fetchImpl: fetch,
+  ApiError,
+  baseHeaders,
+  sendJson,
+  ...TRANSLATION_PROXY,
+});
 
 async function api(req, res, u, requestSignal) {
   const route = u.pathname.replace(/^\/api/, '');
@@ -1920,7 +1787,8 @@ async function api(req, res, u, requestSignal) {
         },
         imageHosts: settings.imageHosts(),
         // 阅读器在翻译关闭时应完全跳过逐页翻译请求，避免用 503 探测能力。
-        translation: { available: !!TRANSLATION_SERVICE_URL },
+        // 空 token 与 Python 侧契约一致：缺少令牌即视为能力禁用。
+        translation: { available: !!TRANSLATION_SERVICE_URL && !!TRANSLATION_SERVICE_TOKEN },
         hasAccessPassword: !!ACCESS_PASSWORD,
         advanced: {
           ai: features.aiConfig(),
@@ -2387,7 +2255,7 @@ async function api(req, res, u, requestSignal) {
     }
 
     case '/translation/page':
-      return await proxyTranslationPage(req, res, u, requestSignal);
+      return await translationProxy.handle({ req, res, u, requestSignal, clientKey: clientIp(req) });
 
     /* ---- 高级功能 ---- */
     case '/ai/config':
@@ -2404,10 +2272,20 @@ async function api(req, res, u, requestSignal) {
     }
 
     case '/chapter-ai/enqueue': {
+      // 手工入队同时受客户端与全局准入限制，与 AI/chat 同族限流策略。
+      if (!rateLimit(`chapter-ai:${clientIp(req)}`, 20, 5 * 60 * 1000) ||
+          !rateLimit('chapter-ai:global', 120, 5 * 60 * 1000)) return sendJson(res, 429, { error: '章节分析请求过于频繁，请稍后重试' });
       const body = await readJsonBody(req);
       const aid = String(body.aid || ''); const photoId = String(body.photoId || '');
       if (!/^\d{1,16}$/.test(aid) || !/^\d{1,16}$/.test(photoId)) return sendJson(res, 400, { error: '漫画或章节 ID 不合法' });
-      return sendJson(res, 202, { data: chapterAi.enqueue(aid, photoId, Number(body.priority) || 0) });
+      try {
+        return sendJson(res, 202, { data: chapterAi.enqueue(aid, photoId, Number(body.priority) || 0, null, { manual: true }) });
+      } catch (error) {
+        const code = error?.code;
+        if (code === 'queue_full') return sendJson(res, 429, { error: String(error.message || '分析队列已满') });
+        if (code === 'ai_disabled') return sendJson(res, 503, { error: String(error.message || 'AI 服务未配置') });
+        throw error;
+      }
     }
 
     case '/ai/chat': {
@@ -2697,6 +2575,19 @@ const server = http.createServer(async (req, res) => {
       if (!allowed.includes(req.method)) {
         return sendJson(res, 405, { error: '不支持的请求方法' }, { Allow: allowed.join(', ') });
       }
+      // 集中同源校验（CSRF）：所有非安全方法的 /api 路由共用。跨源表单、
+      // same-site 不同 origin、Origin: null、Sec-Fetch-Site: cross-site 一律 403；
+      // 无来源证据的脚本/curl 请求放行但认证要求不变（SameSite=Lax 为主防线）。
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        const sameOrigin = checkSameOrigin({
+          headers: req.headers,
+          scheme: requestIsSecure(req) ? 'https' : 'http',
+          host: req.headers.host,
+        });
+        if (!sameOrigin.ok) {
+          return sendJson(res, 403, { error: '跨站请求已被拒绝' });
+        }
+      }
       if (ACCESS_PASSWORD && u.pathname !== '/api/auth' && !checkAccess(req)) {
         return sendJson(res, 401, { error: '需要访问口令', needAuth: true });
       }
@@ -2747,6 +2638,7 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`\n收到 ${signal}，正在保存状态…`);
+  try { chapterAi.stop(); chapterAi.flushSync(); } catch (_) {}
   try { sessions.flushAll(); } catch (_) {}
   try { settings.flushNow(); } catch (_) {}
   server.close(() => process.exit(0));

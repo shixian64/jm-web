@@ -25,6 +25,7 @@ function deferred() {
     filterReaderPrefetchWindow,
     scheduleReaderPrefetch,
     backfillReaderImageDimensions,
+    readerDecodedRecord,
     readerRawCacheBytes,
     blobByteSize,
     recommendedDecodeConcurrency,
@@ -115,8 +116,50 @@ function deferred() {
   const rawStart = source.indexOf('const url = URL.createObjectURL(blob);', decodeStart);
   const rawEnd = source.indexOf('return rec;', rawStart);
   assert.ok(rawStart >= 0 && rawEnd > rawStart);
-  // LRU 命中后不能清除早先由 onload 验证并回填的尺寸。
-  assert.ok(!source.slice(rawStart, rawEnd).includes('state.dims.'));
+  // 原图路径只允许“读取”已验证尺寸用于保留（行为由下方 readerDecodedRecord
+  // 用例锁定）；出现写入、删除或清空 dims 即回归。
+  const rawSource = source.slice(rawStart, rawEnd);
+  assert.ok(
+    rawSource.includes('state.dims.get(idx)'),
+    '原图路径必须读取已验证尺寸并传给 readerDecodedRecord（丢失该读取即回归）',
+  );
+  assert.ok(
+    !/state\.dims\.(?:set|delete|clear)\s*\(/.test(rawSource),
+    '原图路径不得写入或清除已验证尺寸',
+  );
+
+  // 行为验证：重建解码记录必须保留缓存的已验证尺寸（LRU 重用不丢宽高）。
+  assert.deepStrictEqual(
+    readerDecodedRecord({ url: 'blob:raw-1', generation: 7, sourceVersion: 2, dims: { width: 1440, height: 2160 } }),
+    { url: 'blob:raw-1', generation: 7, sourceVersion: 2, width: 1440, height: 2160 },
+    'raws LRU 重用时必须保留早先回填的尺寸',
+  );
+  // 没有已验证尺寸时不伪造——undefined 等待挂载后的 onload 回填。
+  assert.deepStrictEqual(
+    readerDecodedRecord({ url: 'blob:raw-2', generation: 7, sourceVersion: 2, dims: undefined }),
+    { url: 'blob:raw-2', generation: 7, sourceVersion: 2, width: undefined, height: undefined },
+    '缺少已验证尺寸时不得伪造宽高',
+  );
+  assert.deepStrictEqual(
+    readerDecodedRecord({ url: 'blob:raw-3', generation: 1, sourceVersion: 1, dims: null }),
+    { url: 'blob:raw-3', generation: 1, sourceVersion: 1, width: undefined, height: undefined },
+    'dims 缺失（null）与 undefined 同样不得伪造宽高',
+  );
+  // 端到端口径：onload 回填写入 state.dims 后，重建记录能读到同一尺寸。
+  {
+    const dims = new Map();
+    const record = { url: 'blob:page-9', generation: 3, sourceVersion: 1 };
+    const state = { destroyed: false, decoded: new Map([[9, record]]), dims };
+    const slot = { isConnected: true, dataset: { idx: '9', objectUrl: record.url } };
+    const image = { naturalWidth: 800, naturalHeight: 600 };
+    assert.strictEqual(backfillReaderImageDimensions({
+      image, slot, index: 9, record, state, generation: 3, sourceVersion: 1,
+    }), true);
+    const rebuilt = readerDecodedRecord({
+      url: 'blob:page-9', generation: 3, sourceVersion: 1, dims: dims.get(9),
+    });
+    assert.deepStrictEqual(rebuilt, { url: 'blob:page-9', generation: 3, sourceVersion: 1, width: 800, height: 600 });
+  }
 
   const prefetchStart = source.indexOf('function prefetchAround(idx)');
   const prefetchEnd = source.indexOf('\n  function placeholderFor', prefetchStart);
