@@ -84,7 +84,9 @@ class Element {
   Date.now = () => now;
   const observers = [];
   global.Element = Element;
-  global.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
+  const storage = new Map();
+  global.localStorage = { getItem: (key) => storage.get(key) ?? null,
+    setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) };
   global.location = { hash: '#/favorites' };
   global.window = new EventTarget(); window.scrollY = 0;
   global.document = {
@@ -101,6 +103,7 @@ class Element {
     disconnect() { this.targets.clear(); }
   };
   const { favoritesView } = await import(pathToFileURL(path.resolve(__dirname, '../public/js/user.js')));
+  const { setting, updateSetting } = await import(pathToFileURL(path.resolve(__dirname, '../public/js/store.js')));
   const { api, navigationState } = await import(pathToFileURL(path.resolve(__dirname, '../public/js/api.js')));
   let requests = 0; let offset = 0; let folderName = '原收藏夹'; let failPage = 0; let unauthorized = false;
   global.fetch = async (url) => {
@@ -120,13 +123,13 @@ class Element {
       folder_list: { 0: '全部', 1: folderName }, session_folder_ids: [],
     } }));
   };
-  function mount(restoreScroll = false) {
+  function mount(restoreScroll = false, query = 'o=mp', entryId = 42) {
     const root = new Element('main'); document.body.append(root);
     const controller = new AbortController();
     let refreshes = 0;
-    const ctx = { entryId: 42, restoreScroll, signal: controller.signal,
+    const ctx = { entryId, restoreScroll, signal: controller.signal,
       isActive: () => !controller.signal.aborted, refresh: () => { refreshes++; } };
-    const cleanup = favoritesView(root, new URLSearchParams('o=mp'), ctx);
+    const cleanup = favoritesView(root, new URLSearchParams(query), ctx);
     return { root, ctx, refreshes: () => refreshes, cleanup() { controller.abort(); cleanup(); root.remove(); } };
   }
   const cards = (view) => view.root.querySelectorAll('.comic-card').filter((x) => !x.classList.contains('skeleton-card'));
@@ -216,6 +219,29 @@ class Element {
   await nextPage(view);
   assert.equal(cards(view).length, 20, '无关详情失效后，收藏冷加载必须能用新世代重试');
   view.cleanup();
+  const replaced = [];
+  global.history = { state: { __jmw_route_entry: { id: 500, key: '#/favorites' } },
+    replaceState(next, _title, url) { this.state = next; replaced.push(url); location.hash = url; } };
+  updateSetting({ favoriteOrder: 'mp', favoriteFolder: '1' });
+  view = mount(false, '', 500); await turn();
+  assert.equal(view.root.querySelector('.favorite-order').querySelector('a[aria-current="page"]').textContent, '更新时间');
+  assert.equal(view.root.querySelector('.favorite-folders').querySelector('a[aria-current="page"]').textContent, folderName);
+  assert.equal(location.hash, '#/favorites?o=mp&folder=1');
+  assert.equal(history.state.__jmw_route_entry.id, 500, '补全默认 URL 不得新增历史项');
+  assert.equal(JSON.parse(storage.get('jmw_setting')).favoriteFolder, '1', '只持久化分组/排序 UI 偏好');
+  view.cleanup();
+  view = mount(false, 'o=mp&folder=0', 501); await turn();
+  assert.equal(setting.favoriteFolder, '0', '快捷更新入口必须覆盖上次分组，显示全部更新');
+  assert.equal(setting.favoriteOrder, 'mp');
+  view.cleanup();
+  view = mount(false, 'o=invalid&folder=../../outside', 502); await turn();
+  assert.equal(location.hash, '#/favorites?o=mr&folder=0', '损坏或外部传入的偏好应规范化');
+  view.cleanup();
+  updateSetting({ favoriteOrder: 'mp', favoriteFolder: '1' });
+  await api.logout();
+  assert.equal(setting.favoriteFolder, '0', '退出时清除旧账号分组偏好');
+  assert.equal(setting.favoriteOrder, 'mp', '排序是普通 UI 偏好，退出后可保留');
+  delete global.history;
   Date.now = originalNow;
   console.log('favorites back-navigation/snapshot/filter/pull-refresh/auth all pass');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

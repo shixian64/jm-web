@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import sys
+import warnings
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -35,7 +36,9 @@ def test_safe_glyph_is_redrawn():
     source = png_with_text()
     detection = Detection(((30.0, 20.0), (120.0, 20.0), (120.0, 52.0), (30.0, 52.0)), "什麼", 0.99)
     pipeline = StubOCRPipeline(detection)
-    output, stats = pipeline.process(source)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        output, stats = pipeline.process(source)
     assert stats.candidate_chars == 1
     assert stats.edits == 1
     assert output != source

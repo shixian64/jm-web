@@ -120,7 +120,7 @@ const req = (remoteAddress, headers = {}, extra = {}) => ({
     };
   };
 
-  const { api } = await import(pathToFileURL(path.resolve(__dirname, '../public/js/api.js')));
+  const { api, apiRequest } = await import(pathToFileURL(path.resolve(__dirname, '../public/js/api.js')));
   const turn = () => new Promise((resolve) => setImmediate(resolve));
 
   // 1) 站点门禁失效：401 + needAuth 派发 jmw-access-required，且不派发账号变更。
@@ -211,6 +211,32 @@ const req = (remoteAddress, headers = {}, extra = {}) => ({
     const next = responses.shift();
     return { ok: next.ok, status: next.status, json: async () => next.body };
   };
+
+  // 执行 reader/download 的真实 JSON 包装函数，而非只断言导入共享帮助函数。
+  // 它们过去独立 fetch，丢失 needAuth 且完全绕过全局门禁事件。
+  const readerSource = fs.readFileSync(path.resolve(__dirname, '../public/js/reader.js'), 'utf8');
+  const downloadSource = fs.readFileSync(path.resolve(__dirname, '../public/js/downloads.js'), 'utf8');
+  const readerRequestSource = readerSource.slice(readerSource.indexOf('  async function readerRequest('),
+    readerSource.indexOf('  /* ---------- DOM 骨架'));
+  const downloadRequestSource = downloadSource.slice(downloadSource.indexOf('async function fetchJson('),
+    downloadSource.indexOf('async function fetchBlob('));
+  for (const [name, source, functionName] of [
+    ['reader', readerRequestSource, 'readerRequest'], ['download', downloadRequestSource, 'fetchJson'],
+  ]) {
+    const signal = new AbortController().signal;
+    const call = new Function('apiRequest', 'selectedDataSource', 'signal',
+      `${source}; return ${functionName};`)(apiRequest, () => 'builtin', signal);
+    events.length = 0;
+    responses = [{ ok: false, status: 401, body: { error: '需要访问口令', needAuth: true } }];
+    await assert.rejects(() => call('/chapter?id=1', signal), (error) => error.status === 401 && error.needAuth === true,
+      `${name} 必须保留 401 门禁错误信息`);
+    assert.deepEqual(events, ['access-required'], `${name} 也必须触发共享门禁重验证`);
+    const body = { data: { images: [] } };
+    responses = [{ ok: true, status: 200, body }];
+    assert.deepEqual(await call('/chapter?id=1', signal), body, `${name} 不得改变响应包装`);
+    responses = [{ ok: true, status: 200, body: null }];
+    await assert.rejects(() => call('/chapter?id=1', signal), /无法识别/, `${name} 保留无效 JSON 的明确错误`);
+  }
 
   /* ---------------- 路由错误文案区分（ui.js） ---------------- */
 

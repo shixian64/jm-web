@@ -8,6 +8,7 @@ import {
 } from './store.js';
 import { fmt, fmtTime } from './views.js';
 import { icon } from './icons.js';
+import { replaceCurrentRouteHash } from './navigation.js';
 import { filterComics } from './content-filter.js';
 import { chooseFolder, folderEntries } from './content-actions.js';
 
@@ -456,6 +457,7 @@ function renderProfile(page, me, ctx, reload, beforeReplace) {
     h('div', { class: 'menu-list' },
       menuItem('calendar-days', '每日签到', '#/signin'),
       menuItem('star', '我的收藏', '#/favorites'),
+      menuItem('history', '收藏更新', '#/favorites?o=mp&folder=0'),
       menuItem('history', '阅读历史（云端）', '#/watch-history'),
       menuItem('smartphone', '本地阅读记录', '#/local-history'),
       menuItem('message-square', '我的评论', '#/my-comments'),
@@ -717,8 +719,19 @@ function signinSkeleton() {
 const FAV_ORDERS = [['mr', '收藏时间'], ['mp', '更新时间']];
 
 export function favoritesView(root, params, ctx) {
-  const o = params.get('o') || 'mr';
-  const folderId = params.get('folder') || params.get('folder_id') || '0';
+  const requestedOrder = params.get('o') ?? setting.favoriteOrder;
+  const o = FAV_ORDERS.some(([value]) => value === requestedOrder) ? requestedOrder : 'mr';
+  const requestedFolder = String(params.get('folder') ?? params.get('folder_id') ?? setting.favoriteFolder ?? '0');
+  const folderId = /^\d{1,20}$/.test(requestedFolder) ? requestedFolder : '0';
+  if (setting.favoriteOrder !== o || setting.favoriteFolder !== folderId) {
+    try { updateSetting({ favoriteOrder: o, favoriteFolder: folderId }); } catch (_) { /* 偏好存储失败不阻断列表 */ }
+  }
+  // 默认入口只补全当前 URL；让返回键带回确切排序/分组，不额外堆积历史。
+  const canonicalParams = new URLSearchParams(params);
+  canonicalParams.set('o', o);
+  canonicalParams.set('folder', folderId);
+  canonicalParams.delete('folder_id');
+  if (typeof history !== 'undefined') replaceCurrentRouteHash('#/favorites?' + canonicalParams);
   const cacheKey = navigationState.key(o, folderId);
   const stateKey = `favorite-state:${cacheKey}:${ctx?.entryId ?? 'default'}`;
   const cached = navigationState.get(cacheKey);

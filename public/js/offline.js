@@ -692,6 +692,7 @@ export async function registerOfflineWorker() {
 
 export async function precacheOfflineShell() {
   const registration = await registerOfflineWorker();
+  if (!registration) return false;
   const worker = registration.active || registration.waiting || registration.installing;
   if (!worker) return false;
   worker.postMessage({ type: 'PRECACHE_SHELL' });

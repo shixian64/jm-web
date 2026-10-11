@@ -335,7 +335,7 @@ def _draw_glyph(
     ink = cv2.dilate(ink, np.ones((2, 2), np.uint8), iterations=1)
     clean = crop.copy()
     clean[ink > 0] = background
-    image.paste(Image.fromarray(clean, "RGB"), (x0, y0))
+    image.paste(Image.fromarray(clean), (x0, y0))
     arr[y0:y1, x0:x1] = clean
 
     draw = ImageDraw.Draw(image)

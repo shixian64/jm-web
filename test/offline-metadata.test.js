@@ -7,7 +7,10 @@ const path = require('path');
 (async () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'offline.js'), 'utf8');
   const moduleUrl = `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`;
-  const { buildRestoreRequests } = await import(moduleUrl);
+  const { buildRestoreRequests, precacheOfflineShell } = await import(moduleUrl);
+
+  assert.equal(await precacheOfflineShell(), false,
+    '无 Service Worker 支持时应正常返回不可预缓存，而非解引用 null');
 
   const requests = buildRestoreRequests([
     { aid: '10', request: { chapterIds: ['101'] } },

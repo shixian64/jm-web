@@ -9,7 +9,7 @@ import {
 } from './ui.js';
 import { setting, getLocalHistory, getSearchHistory, addSearchHistory, clearSearchHistory } from './store.js';
 import { icon } from './icons.js';
-import { replaceCurrentRouteHash } from './navigation.js';
+import { replaceCurrentRouteHash, favoritesReturnTarget, returnToFavorites } from './navigation.js';
 import {
   buildSearchQuery, deserializeExcludedTags, filterComics, isComicBlocked,
   normalizeTags, parseSearchSyntax, searchContentWithoutExcludedTags, serializeExcludedTags,
@@ -958,7 +958,10 @@ export async function albumView(root, id, ctx) {
       finally { if (!isInactive(ctx)) refreshBtn.disabled = false; }
     },
   }, '刷新章节');
-  body.append(h('div', { class: 'action-bar' }, readBtn, downloadBtn, favBtn, likeBtn, refreshBtn));
+  const favoritesBack = favoritesReturnTarget()
+    ? h('button', { class: 'btn', type: 'button', onclick: returnToFavorites }, icon('arrow-left', 16), '返回收藏')
+    : null;
+  body.append(h('div', { class: 'action-bar' }, readBtn, favoritesBack, downloadBtn, favBtn, likeBtn, refreshBtn));
 
   // 简介
   if (description) {

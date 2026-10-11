@@ -31,7 +31,14 @@ if [[ -n "${JMW_RELEASE_EXTRA_BLOCKED_PATHS:-}" ]]; then
   done <<< "$JMW_RELEASE_EXTRA_BLOCKED_PATHS"
 fi
 for prefix in "${blocked_prefixes[@]}"; do
-  if [[ "$artifact" == "$prefix" || "$artifact" == "$prefix"/* ]]; then
+  # current 本身是软链接。制品已经 pwd -P，受保护前缀也必须解析到同一
+  # 物理命名空间，否则 current/子目录或其 releases 真实路径会绕过保护。
+  resolved_prefix="$prefix"
+  if [[ -d "$prefix" ]]; then
+    resolved_prefix="$(cd -- "$prefix" && pwd -P)"
+  fi
+  if [[ "$artifact" == "$prefix" || "$artifact" == "$prefix"/* \
+     || "$artifact" == "$resolved_prefix" || "$artifact" == "$resolved_prefix"/* ]]; then
     echo "拒绝已停用或受保护的生产路径: $artifact" >&2
     exit 65
   fi

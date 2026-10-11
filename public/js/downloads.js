@@ -1,7 +1,7 @@
 // 漫画下载队列：任务状态、暂停/恢复、断点续传和解扰后持久化。
 // 数据最终写入 offline.js 的 IndexedDB，刷新页面后仍可继续。
 
-import { imgSrc, selectedDataSource } from './api.js';
+import { apiRequest, imgSrc, selectedDataSource } from './api.js';
 import { needsScramble, decodeFromBlob } from './descramble.js';
 import {
   putOfflineAlbum,
@@ -84,18 +84,7 @@ function sleep(ms, signal) {
 }
 
 async function fetchJson(path, signal) {
-  const response = await fetch(path, {
-    headers: { Accept: 'application/json', 'X-JMW-Data-Source': selectedDataSource() },
-    credentials: 'same-origin',
-    signal,
-  });
-  let json = null;
-  try { json = await response.json(); } catch (_) {}
-  if (!response.ok) {
-    const error = new Error((json && json.error) || `请求失败（${response.status}）`);
-    error.status = response.status;
-    throw error;
-  }
+  const json = await apiRequest(path, { signal });
   if (!json) throw new Error('服务器返回了无法识别的数据');
   return json;
 }
@@ -212,7 +201,12 @@ export class DownloadManager extends EventTarget {
     this.messageQueue = Promise.resolve();
     this.clearing = false;
     this.#installCoordination();
-    this.ready = this.#restore();
+    this.ready = this.#restore().then((tasks) => {
+      // queued 尚未开始下载，不应像运行中断的任务一样要求手动恢复。
+      // 必须等 restore 完整结束再调度；真正执行前仍要在 aid 锁内核对最新记录。
+      this.#pump();
+      return tasks;
+    });
     queueMicrotask(() => this.#broadcast({ type: 'HELLO' }));
   }
 
@@ -798,6 +792,21 @@ export class DownloadManager extends EventTarget {
     const execute = async () => {
       if (controller.signal.aborted || task.status !== 'queued' || this.clearing
           || this.suspendedAids.has(String(task.aid)) || this.#isRemotelySuspended(task)) return;
+      // 排队等待 aid 锁期间，其他标签可能已经完成、暂停或删除同一任务。
+      // 内存镜像不是执行授权；否则新标签恢复 queued 会重跑旧任务甚至复活删除。
+      const current = await getDownloadTask(task.id);
+      if (controller.signal.aborted || task.status !== 'queued') return;
+      if (!current) {
+        this.tasks.delete(task.id);
+        this.#emit(task, 'remove', false);
+        return;
+      }
+      task = current;
+      this.tasks.set(task.id, task);
+      if (task.status !== 'queued') {
+        this.#emit(task, 'remote-update', false);
+        return;
+      }
       this.ownedAids.add(String(task.aid));
       task.ownerId = this.instanceId;
       this.#broadcast({ type: 'RUN_STARTED', aid: task.aid, taskId: task.id });
@@ -856,7 +865,7 @@ export class DownloadManager extends EventTarget {
 
       const albumJson = task.request.album
         ? { data: task.request.album }
-        : await fetchJson(`/api/album?id=${encodeURIComponent(task.aid)}`, signal);
+        : await fetchJson(`/album?id=${encodeURIComponent(task.aid)}`, signal);
       const album = albumJson.data || albumJson;
       if (!album || typeof album !== 'object') throw new Error('漫画详情为空');
       const allChapters = normalizeSeries(album, null, task.aid);
@@ -907,7 +916,7 @@ export class DownloadManager extends EventTarget {
           continue;
         }
 
-        const chapterJson = await fetchJson(`/api/chapter?id=${encodeURIComponent(chapter.id)}&shunt=${encodeURIComponent(task.request.shunt)}`, signal);
+        const chapterJson = await fetchJson(`/chapter?id=${encodeURIComponent(chapter.id)}&shunt=${encodeURIComponent(task.request.shunt)}`, signal);
         const payload = chapterJson.data || chapterJson;
         const images = Array.isArray(payload.images) ? payload.images : [];
         if (!images.length) throw new Error(`章节“${chapter.name}”没有图片`);
@@ -968,8 +977,10 @@ export class DownloadManager extends EventTarget {
         await this.#persistProgress(task);
 
         let cursor = 0;
+        let workerFailure = null;
         const worker = async () => {
           while (cursor < jobs.length) {
+            if (workerFailure) return;
             if (signal.aborted || task.status === 'paused') throw abortError();
             const job = jobs[cursor++];
             try {
@@ -1023,7 +1034,13 @@ export class DownloadManager extends EventTarget {
             }
           }
         };
-        await Promise.all(Array.from({ length: Math.min(task.request.concurrency, jobs.length || 1) }, worker));
+        // Promise.all 会在配额错误/取消时提前结束，但其他 worker 可能仍在解码或
+        // 写 IDB。必须等全部 worker 停止后再释放 aid 锁，否则删除后会被迟到写入复活。
+        await Promise.allSettled(Array.from({ length: Math.min(task.request.concurrency, jobs.length || 1) }, async () => {
+          try { await worker(); }
+          catch (error) { workerFailure ||= error; }
+        }));
+        if (workerFailure) throw workerFailure;
 
         const finalRows = await listOfflineImages(task.aid, chapter.id);
         const chapterComplete = offlineRowsAreComplete(finalRows, images.length);

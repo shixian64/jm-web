@@ -48,6 +48,35 @@ class QueueFullError(RuntimeError):
     """Raised when the bounded service queue cannot accept another page."""
 
 
+class UploadAdmissionGate:
+    """Bound both active uploads and requests waiting to start an upload."""
+
+    def __init__(self, capacity: int, max_waiters: int, wait_seconds: float) -> None:
+        self._semaphore = asyncio.Semaphore(max(1, capacity))
+        self.max_waiters = max(0, max_waiters)
+        self.wait_seconds = wait_seconds
+        self.waiting = 0
+
+    async def acquire(self) -> None:
+        if not self._semaphore.locked():
+            # Semaphore.acquire() has no suspension on this fast path, so the
+            # availability test and acquisition are atomic in this event loop.
+            await self._semaphore.acquire()
+            return
+        if self.wait_seconds <= 0 or self.waiting >= self.max_waiters:
+            raise QueueFullError("upload queue is full")
+        self.waiting += 1
+        try:
+            await asyncio.wait_for(self._semaphore.acquire(), timeout=self.wait_seconds)
+        except asyncio.TimeoutError as exc:
+            raise QueueFullError("upload queue wait timed out") from exc
+        finally:
+            self.waiting -= 1
+
+    def release(self) -> None:
+        self._semaphore.release()
+
+
 @dataclass(frozen=True)
 class ServiceConfig:
     cache_dir: Path
@@ -62,6 +91,7 @@ class ServiceConfig:
     # 连接级准入在上传之前：max_inflight 只统计已提交任务，无法阻止大量
     # 并发慢速上传占满内存；上传闸门先于读取请求体获取。
     max_upload_connections: int = 8
+    max_upload_waiters: int = 16
     upload_wait_seconds: float = 5.0
     upload_timeout_seconds: float = 60.0
 
@@ -98,6 +128,7 @@ class ServiceConfig:
             result_max_age_seconds=integer("TRANSLATION_RESULT_MAX_AGE_SECONDS", 86400, 60, 30 * 24 * 3600),
             service_token=os.getenv("TRANSLATION_SERVICE_TOKEN", ""),
             max_upload_connections=integer("TRANSLATION_MAX_UPLOAD_CONNECTIONS", 8, 1, 64),
+            max_upload_waiters=integer("TRANSLATION_MAX_UPLOAD_WAITERS", 16, 0, 128),
             upload_wait_seconds=number("TRANSLATION_UPLOAD_WAIT_SECONDS", 5.0, 0.0, 60.0),
             upload_timeout_seconds=number("TRANSLATION_UPLOAD_TIMEOUT_SECONDS", 60.0, 1.0, 300.0),
         )
@@ -392,7 +423,9 @@ def _authorised(request: Request, token: str) -> bool:
         supplied = supplied[7:].strip()
     else:
         supplied = request.headers.get("x-translation-token", "")
-    return bool(supplied) and hmac.compare_digest(supplied, token)
+    # HTTP header bytes may decode to non-ASCII; compare_digest(str, str)
+    # raises TypeError for those inputs instead of denying authentication.
+    return bool(supplied) and hmac.compare_digest(supplied.encode("utf-8"), token.encode("utf-8"))
 
 
 async def _read_limited(request: Request, limit: int, timeout_seconds: float | None = None) -> bytes:
@@ -415,7 +448,7 @@ async def _read_limited(request: Request, limit: int, timeout_seconds: float | N
             if total > limit:
                 raise HTTPException(status_code=413, detail="图片文件超过大小限制")
             chunks.append(chunk)
-        if not chunks:
+        if total == 0:
             raise HTTPException(status_code=400, detail="请求体为空")
         return b"".join(chunks)
 
@@ -473,7 +506,9 @@ def create_app(
     token_disabled = not service_config.service_token
     strict_token = os.getenv("TRANSLATION_REQUIRE_TOKEN", "0").lower() in {"1", "true", "yes"}
     # 上传阶段准入：先于读取请求体的有界闸门（等待有期限，超时返回 busy）。
-    upload_gate = asyncio.Semaphore(max(1, service_config.max_upload_connections))
+    upload_gate = UploadAdmissionGate(
+        service_config.max_upload_connections, service_config.max_upload_waiters, service_config.upload_wait_seconds
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -537,11 +572,8 @@ def create_app(
             raise HTTPException(status_code=415, detail="请以 image/* 二进制上传图片")
         metadata = _metadata(request)
         try:
-            if service_config.upload_wait_seconds > 0:
-                await asyncio.wait_for(upload_gate.acquire(), timeout=service_config.upload_wait_seconds)
-            else:
-                await upload_gate.acquire()
-        except asyncio.TimeoutError:
+            await upload_gate.acquire()
+        except QueueFullError:
             return JSONResponse(
                 status_code=429,
                 content={"status": "busy", "error": "upload_queue_full", "retryAfterMs": 1000},
@@ -567,6 +599,9 @@ def create_app(
                 content={"status": "busy", "error": "translation_queue_full", "retryAfterMs": 2000},
                 headers={"Retry-After": "2"},
             )
+        # The job manager owns the accepted source now (or reused an existing
+        # job).  Duplicate inline waiters must not each retain a full upload.
+        source = b""
         job_id = submission.get("jobId")
         if job_id and submission.get("status") in {"queued", "processing"} and wait_ms:
             deadline = time.monotonic() + wait_ms / 1000

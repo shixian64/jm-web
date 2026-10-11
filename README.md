@@ -24,6 +24,7 @@
 - **章节 AI 分析（可选）**：复用上述 AI 配置，按热门/访问候选在后台自动排队分析章节，生成标题、详细剧情和简洁总结。上游已有章节名优先保留，缺失章节名时才使用 AI 标题；完整结果持久化并可通过 `/api/chapter-ai` 查询，详细剧情和简洁总结当前不直接显示。
 - **运维**：API/图片多线路故障切换、可选 DoH 预解析与测速、运行日志、缓存维护、健康检查和 GitHub Release 更新检查。
 - **响应式体验**：手机列表支持下拉刷新与首屏骨架；桌面搜索新页面自动聚焦，触屏端等待用户主动点按以避免系统编辑浮层；桌面和手机返回/前进时均按独立路由记录恢复滚动位置。
+- **收藏更新快捷入口**：手机底栏与「我的」提供「收藏更新」，直接查看全部收藏的更新时间排序；普通「我的收藏」记住上次排序和收藏夹。从收藏进入详情或阅读器后，可一键「返回收藏」，恢复原列表分页、筛选和位置；连续切章不会增加返回层级。此入口是更新时间排序，不代表未读更新检测。
 - **返回导航加速**：收藏页在当前标签页内恢复已加载分页、搜索和筛选状态，详情页使用短期内存缓存；后台发现变化时提示点击刷新，不擅自重排列表。收藏下拉刷新和详情「刷新章节」可主动取最新数据；登录、退出、账号失效及收藏变更会清除相关缓存。业务缓存不写入 localStorage 或 Service Worker，关闭标签页即释放。
 
 > Web 与 Android 平台能力不同：Android WorkManager 对应为浏览器内持久下载队列（关闭页面后暂停、下次进入续传）；Android 系统 PDF 写入对应为浏览器打印“另存为 PDF”；桌面图标伪装对应为失焦隐私遮罩。浏览器本地收藏夹与历史删除是当前浏览器会话视图，不会改动不支持这些操作的上游账号数据。
@@ -38,7 +39,7 @@
 
 ### 方式一：直接运行（推荐）
 
-服务器需有 Node.js **20.0.0 或更高**版本。后端仅一个运行依赖 `sharp`（服务端章节视觉分析用的图片编解码库，随 `package-lock.json` 锁定版本），需先安装再启动；生产环境建议使用仍在安全维护期内的 LTS 版本；项目 Docker 构建基线固定为 `node:22.23.2-alpine3.24`，升级需经过显式评审与回归：
+服务器需有 Node.js **20.9.0 或更高**版本。后端仅一个运行依赖 `sharp`（服务端章节视觉分析用的图片编解码库，随 `package-lock.json` 锁定版本），需先安装再启动；生产环境建议使用仍在安全维护期内的 LTS 版本；项目 Docker 构建基线固定为 `node:22.23.2-alpine3.24`，升级需经过显式评审与回归：
 
 ```bash
 git clone <本项目目录> jm-web   # 或直接上传 jm-web 文件夹
@@ -130,7 +131,7 @@ docker compose restart
 docker compose down
 ```
 
-翻译容器只加入 Compose 内部网络，不对宿主机发布 8091 端口；`jm-web` 通过 `http://translation-service:8091` 访问。设置 `TRANSLATION_SERVICE_URL=` 可关闭主站翻译调用，但翻译容器仍会随 Compose 启动。**安全契约：`TRANSLATION_SERVICE_TOKEN` 为空时，主站与翻译容器都会禁用翻译能力并明确提示（不再默认放行）**；需要翻译时请在 `.env` 为两侧配置同一个强随机令牌。主站代理在读取上传体之前获取有界并发槽位，且单请求受整体截止时间约束（`TRANSLATION_MAX_CONCURRENT` 等可调）；翻译容器 `/healthz` 为存活探针、`/readyz` 为就绪探针（OCR 初始化失败时返回 503），Compose 健康检查使用 `/readyz`。当前后端仅覆盖繁体中文到简体中文的 `fast` 路径；复杂背景会安全回退原图。翻译结果保存在 Docker 命名卷 `translation-cache` 中。
+翻译容器只加入 Compose 内部网络，不对宿主机发布 8091 端口；`jm-web` 通过 `http://translation-service:8091` 访问。设置 `TRANSLATION_SERVICE_URL=` 可关闭主站翻译调用，但翻译容器仍会随 Compose 启动。**安全契约：`TRANSLATION_SERVICE_TOKEN` 为空时，主站与翻译容器都会禁用翻译能力并明确提示（不再默认放行）**；需要翻译时请在 `.env` 为两侧配置同一个强随机令牌。主站代理禁止自动跟随翻译接口及结果下载的重定向，在读取上传体之前获取有界并发槽位，且单请求受整体截止时间约束（`TRANSLATION_MAX_CONCURRENT` 等可调）；翻译容器 `/healthz` 为存活探针、`/readyz` 为就绪探针（OCR 初始化失败时返回 503），Compose 健康检查使用 `/readyz`。当前后端仅覆盖繁体中文到简体中文的 `fast` 路径；复杂背景会安全回退原图。翻译结果保存在 Docker 命名卷 `translation-cache` 中。
 
 已有部署请保留原 `.env`，将其中的 `TRANSLATION_SERVICE_URL` 改为 `http://translation-service:8091`，再执行 `docker compose up -d --build`；不要用示例覆盖生产配置。第一次构建需要下载 Python/OCR 依赖。翻译容器默认上限为 2 CPU、2 GiB 内存，2 个工作线程、8 个在途任务，可通过 `.env` 的 `TRANSLATION_*` 调整。
 
@@ -225,6 +226,7 @@ docker compose --env-file .env \
 | `TRANSLATION_WAIT_QUEUE_LIMIT` / `TRANSLATION_WAIT_TIMEOUT_MS` | `16` / `5000` | 等待队列上限与等待超时（超时返回 429） |
 | `TRANSLATION_UPLOAD_TIMEOUT_MS` / `TRANSLATION_DEADLINE_MS` | `30000` / `120000` | 上传读取期限 / 覆盖上传到结果回传的整体截止时间 |
 | `TRANSLATION_MAX_UPLOAD_CONNECTIONS` / `TRANSLATION_UPLOAD_TIMEOUT_SECONDS` | `8` / `60` | 翻译容器上传阶段准入与慢速上传总期限 |
+| `TRANSLATION_MAX_UPLOAD_WAITERS` / `TRANSLATION_UPLOAD_WAIT_SECONDS` | `16` / `5` | 翻译容器等待上传槽位的队列长度与秒数；任一为 `0` 时不排队，满队列返回 429 |
 | `TRANSLATION_REQUIRE_TOKEN` | `0` | 严格模式：置 `1` 时翻译容器在空令牌下拒绝启动 |
 | `JMW_MAX_API_RESPONSE_BYTES` | `16777216` | 上游 API 单响应大小上限（字节，范围 1–32 MiB） |
 | `JMW_MAX_AI_STREAM_BYTES` | `16777216` | 单次 AI 流式响应大小上限（字节，范围 1–64 MiB） |
@@ -237,7 +239,7 @@ docker compose --env-file .env \
 | `AI_TIMEOUT` | `120000` | 单次 AI 流式请求超时（正整数毫秒，最大 10 分钟） |
 | `CHAPTER_AI_INTERVAL_MS` | `30000` | 后台章节视觉分析轮询间隔；与用户无关 |
 | `CHAPTER_AI_CONCURRENCY` | `1` | 后台章节视觉分析全局模型并发（部署时可调，默认 1） |
-| `CHAPTER_AI_MAX_RETRIES` | `3` | 章节视觉分析失败后的最大重试次数（指数退避） |
+| `CHAPTER_AI_MAX_RETRIES` | `3` | 章节视觉分析失败后的最大重试次数（指数退避）；`0` 表示失败后不重试 |
 | `CHAPTER_AI_MAX_QUEUE_ENTRIES` | `1000` | 队列配置上限；实际准入还受记录/字节预留限制，满后手工入队返回 429、自动入队跳过 |
 | `CHAPTER_AI_MAX_RECORDS` | `5000` | 分析记录硬上限：排队/运行记录不可淘汰，其余按失败 → 孤儿 → 旧版本 → 最旧完成顺序淘汰 |
 | `CHAPTER_AI_MAX_STATS` | `2000` | 热度统计条数上限（淘汰调度价值最小的条目） |
@@ -297,7 +299,7 @@ JMW_TRUST_PROXY=172.18.0.5,172.19.0.0/24
 
 | 层 | 说明 |
 | --- | --- |
-| 后端 | Node.js（≥20）内建模块实现 HTTP 服务；唯一运行依赖 `sharp`（章节视觉分析） |
+| 后端 | Node.js（≥20.9）内建模块实现 HTTP 服务；唯一运行依赖 `sharp`（章节视觉分析） |
 | API 协议 | 与 jm-mobile 一致：`token` / `tokenparam` 请求头签名，响应 `data` 字段 AES-256-ECB 解密 |
 | 会话 | 每个浏览器一个 Cookie Jar（AVS 等），持久化到 `data/sessions/`，重启不丢登录态；空会话 7 天、登录会话默认 365 天自动清理，可由 `JMW_SESSION_TTL_SECONDS` 调整（7 天至 2 年） |
 | 图片 | 服务端按 HTTPS 域名白名单逐跳流式代理并限制大小/并发；解扰由浏览器 Worker/Canvas 完成 |

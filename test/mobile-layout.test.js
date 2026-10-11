@@ -60,6 +60,14 @@ assertRule(
   '默认首页横条卡片必须有不依赖 --home-grid-columns 的确定尺寸',
 );
 
+assertRule(
+  /#reader\s+\.icon-btn\.r-favorites-back\s*\{[^}]*width\s*:\s*auto[^}]*flex-shrink\s*:\s*0[^}]*white-space\s*:\s*nowrap/,
+  '返回收藏按钮应自适应文本宽度并保持触控目标不被压缩',
+);
+
+assert(css.indexOf('#reader .icon-btn.r-favorites-back') < css.indexOf('@media (hover: hover)'),
+  '返回收藏基础样式不得仅存在于鼠标 hover 规则内，触屏也必须生效');
+
 // 页面根级禁止产生横向滚动；真正需要横滑的组件必须保留自己的滚动容器。
 assertRule(
   /html\s*,\s*body\s*,\s*#app\s*,\s*#main\s*\{[^}]*max-width\s*:\s*100%[^}]*overflow-x\s*:\s*clip/,

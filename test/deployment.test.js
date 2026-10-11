@@ -97,6 +97,17 @@ mustMatch(workflow, /packages:\s*write/, '镜像 workflow 必须允许写入 GHC
 mustMatch(workflow, /docker\/build-push-action@v6/, '镜像 workflow 必须使用 Buildx 发布');
 mustMatch(workflow, /if: github\.event_name != 'pull_request'/, 'Pull Request 不得发布镜像');
 mustMatch(workflow, /run: npm ci/, 'CI 必须在测试前按锁文件安装依赖，否则干净 runner 必然失败');
+// 安全修复必须锁定精确版本，且跨平台锁文件保留生产 Alpine 预编译包。
+const packageManifest = JSON.parse(read('package.json'));
+const packageLock = JSON.parse(read('package-lock.json'));
+assert.strictEqual(packageManifest.dependencies.sharp, '0.35.5');
+assert.strictEqual(packageLock.packages['node_modules/sharp'].version, packageManifest.dependencies.sharp);
+assert.strictEqual(packageManifest.engines.node, '>=20.9.0');
+assert.strictEqual(packageLock.packages[''].engines.node, packageManifest.engines.node);
+for (const name of ['sharp-linuxmusl-x64', 'sharp-linuxmusl-arm64',
+  'sharp-libvips-linuxmusl-x64', 'sharp-libvips-linuxmusl-arm64', 'sharp-win32-x64']) {
+  assert.ok(packageLock.packages[`node_modules/@img/${name}`], `锁文件缺少预编译包 ${name}`);
+}
 mustMatch(read('package.json'), /"validate:artifact"\s*:/, 'package.json 必须提供制品校验入口');
 
 // 平台契约：Windows 文件系统不承载 POSIX 可执行位，不能把位缺失当作脚本业务错误。
@@ -117,11 +128,27 @@ if (process.platform !== 'win32') {
 
 // 校验脚本是 bash 脚本：win32 无 .sh 执行关联，统一经 bash 运行全部业务规则；
 // 缺少 bash 时此处会显式失败（明确环境阻碍），而不是静默跳过制品安全测试。
+// Windows 的 PATH 中 bash 可能是 WSL launcher，不能识别 D:/... 路径。
+// 跟随本测试已依赖的 Git 安装定位 Git Bash，避免误选另一套文件系统/Node。
+const bashCommand = (() => {
+  if (process.platform !== 'win32') return 'bash';
+  const gitExecPath = execFileSync('git', ['--exec-path'], { encoding: 'utf8' }).trim();
+  for (let dir = path.resolve(gitExecPath);;) {
+    for (const relative of ['bin/bash.exe', 'usr/bin/bash.exe']) {
+      const candidate = path.join(dir, relative);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  throw new Error('Windows 制品回归需要 Git for Windows 的 Git Bash，不能使用 WSL bash');
+})();
 const toPosixPath = (dir) => (process.platform === 'win32' ? String(dir).replace(/\\/g, '/') : String(dir));
 const runValidator = (dir, extraEnv = {}) => {
   const env = { ...process.env, RELEASE_BUILD_STATUS: 'PASS', ...extraEnv };
   if (process.platform === 'win32') {
-    return execFileSync('bash', [toPosixPath(artifactValidator), toPosixPath(dir)], {
+    return execFileSync(bashCommand, [toPosixPath(artifactValidator), toPosixPath(dir)], {
       env, encoding: 'utf8',
     });
   }
@@ -149,7 +176,7 @@ const expectValidatorFailure = (dir, { env: extraEnv, code, message } = {}) => {
 };
 // 与校验脚本相同的路径规范化（bash pwd -P），用于构造能命中阻断分支的受保护前缀。
 const normalizeViaBash = (dir) => execFileSync(
-  'bash', ['-c', `cd -- "${toPosixPath(dir).replace(/"/g, '\\"')}" && pwd -P`], { encoding: 'utf8' },
+  bashCommand, ['-c', `cd -- "${toPosixPath(dir).replace(/"/g, '\\"')}" && pwd -P`], { encoding: 'utf8' },
 ).trim();
 
 // 制品校验必须只在构建成功标志明确存在时生成 PASS，并拒绝缺失运行文件（含锁文件）。
@@ -249,6 +276,25 @@ try {
     });
   } finally {
     fs.rmSync(blockedRoot, { recursive: true, force: true });
+  }
+
+  // current 是目录软链接：不能先 realpath 制品，再仅拿未解析的 current 前缀比较。
+  const aliasRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'jmw-blocked-alias-'));
+  try {
+    const release = path.join(aliasRoot, 'releases', 'candidate');
+    const current = path.join(aliasRoot, 'current');
+    fs.mkdirSync(path.join(release, 'inner'), { recursive: true });
+    fs.symlinkSync(release, current, process.platform === 'win32' ? 'junction' : 'dir');
+    const protectedAlias = `${normalizeViaBash(aliasRoot)}/current`;
+    for (const input of [path.join(current, 'inner'), path.join(release, 'inner')]) {
+      expectValidatorFailure(input, {
+        env: { JMW_RELEASE_EXTRA_BLOCKED_PATHS: protectedAlias },
+        code: 65,
+        message: /生产路径/,
+      });
+    }
+  } finally {
+    fs.rmSync(aliasRoot, { recursive: true, force: true });
   }
 
   // 负向用例全部还原后，最小合法制品必须重新通过校验。

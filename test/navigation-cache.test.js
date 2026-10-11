@@ -99,6 +99,14 @@ const deferred = () => {
   };
   const { api, navigationState } = await import(pathToFileURL(path.resolve(__dirname, '../public/js/api.js')));
   const { setting, updateSetting } = await import(pathToFileURL(path.resolve(__dirname, '../public/js/store.js')));
+  const { rememberRouteEntry, clearRouteTrail, favoritesReturnTarget } = await import(pathToFileURL(path.resolve(__dirname, '../public/js/navigation.js')));
+  function favoriteOrigin() {
+    clearRouteTrail();
+    rememberRouteEntry({ id: 1, key: '#/favorites?o=mp&folder=1' });
+    rememberRouteEntry({ id: 2, key: '#/album/7' });
+    global.location = { hash: '#/album/7' };
+    global.history = { state: { __jmw_route_entry: { id: 2, key: '#/album/7' } } };
+  }
   let albumFetches = 0;
   let albumFavorite = true;
   let identity = 'A';
@@ -126,7 +134,9 @@ const deferred = () => {
   const key = navigationState.key('mr', 0);
   navigationState.save(key, { pages: [{ data: { list: [{ id: 7 }] } }] });
   albumFavorite = false;
+  favoriteOrigin();
   await api.favorite(7);
+  assert.equal(favoritesReturnTarget().delta, -1, '收藏操作使业务快照失效，但仍应能返回原列表');
   assert.equal(navigationState.get(key), null);
   assert.equal((await api.cachedAlbum(7)).data.is_favorite, false, '批量取消收藏也必须失效详情');
   const folderToken = navigationState.token();
@@ -136,9 +146,15 @@ const deferred = () => {
   assert.equal(albumFetches, 3);
   await api.setApiHost('https://trusted.example'); await api.cachedAlbum(7);
   assert.equal(albumFetches, 4);
+  assert.equal(favoritesReturnTarget(), null, '线路改变后不得使用旧来源');
+  updateSetting({ favoriteOrder: 'mp', favoriteFolder: '1' });
+  favoriteOrigin();
   updateSetting({ dataSource: 'network' }); await api.cachedAlbum(7);
   assert.equal(albumFetches, 5);
   assert.equal(setting.dataSource, 'network');
+  assert.equal(setting.favoriteFolder, '0', '切换数据源清除旧分组偏好');
+  assert.equal(setting.favoriteOrder, 'mp');
+  assert.equal(favoritesReturnTarget(), null);
 
   pendingLogin = deferred();
   const login = api.login('B', 'test-password');
@@ -164,7 +180,11 @@ const deferred = () => {
   const storage = new Event('storage');
   storage.key = 'jmw_navigation_cache_invalidation';
   storage.newValue = JSON.stringify({ kind: 'auth' });
+  favoriteOrigin();
+  updateSetting({ favoriteFolder: '1' });
   window.dispatchEvent(storage);
+  assert.equal(setting.favoriteFolder, '0', '跨标签切换账号清除旧分组偏好');
+  assert.equal(favoritesReturnTarget(), null, '跨标签切换账号清除旧收藏来源');
   await api.cachedAlbum(7);
   assert.equal(albumFetches, 8, '其它标签账号切换后必须丢弃本标签详情');
   pendingMe = deferred();
@@ -181,5 +201,7 @@ const deferred = () => {
   assert(writes.filter(([name]) => name === 'jmw_navigation_cache_invalidation')
     .every(([, text]) => !text.includes('test-password') && !text.includes('pages')),
   '跨标签通知不可持久化凭据或业务数据');
+  delete global.history;
+  delete global.location;
   console.log('navigation cache TTL/abort/identity/invalidation all pass');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

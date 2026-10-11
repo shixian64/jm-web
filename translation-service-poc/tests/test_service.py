@@ -132,6 +132,22 @@ def test_limits_and_sha_validation(tmp_path):
         assert client.post("/v1/translate/page", content=image_bytes(), headers=headers).status_code == 400
 
 
+def test_empty_upload_is_rejected_before_submission(tmp_path):
+    with make_client(tmp_path) as client:
+        response = client.post(
+            "/v1/translate/page?waitMs=0", content=b"",
+            headers={"Authorization": "Bearer secret", "Content-Type": "image/png"},
+        )
+        assert response.status_code == 400
+        assert not client.app.state.translation_manager._jobs
+
+
+def test_non_ascii_bearer_is_unauthorised_not_server_error(tmp_path):
+    with make_client(tmp_path) as client:
+        denied = client.get("/v1/jobs/" + "a" * 32, headers={b"Authorization": b"Bearer \xc3\xa9"})
+        assert denied.status_code == 401
+
+
 class _SlowStreamRequest:
     """最小 Request 替身：headers + 逐块慢速异步流，用于直接测上传期限。"""
 
@@ -245,6 +261,128 @@ def test_upload_gate_returns_busy_when_exhausted(tmp_path):
             assert ok.status_code in {200, 202}
 
     asyncio.run(scenario())
+
+
+def test_zero_upload_wait_rejects_immediately_instead_of_waiting_forever(tmp_path):
+    import httpx
+
+    config = ServiceConfig(
+        cache_dir=tmp_path, workers=1, service_token="secret",
+        max_upload_connections=1, upload_wait_seconds=0,
+    )
+    manager = TranslationJobManager(config, pipeline=FakePipeline())
+    app = create_app(config=config, manager=manager)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            gate = app.state.translation_upload_gate
+            await gate.acquire()
+            try:
+                response = await asyncio.wait_for(client.post(
+                    "/v1/translate/page?waitMs=0", content=image_bytes(),
+                    headers={"Authorization": "Bearer secret", "Content-Type": "image/png"},
+                ), timeout=0.2)
+                assert response.status_code == 429
+            finally:
+                gate.release()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        manager.shutdown()
+
+
+def test_upload_waiter_count_is_bounded_and_cancelled_waiters_are_removed(tmp_path):
+    import httpx
+
+    config = ServiceConfig(
+        cache_dir=tmp_path, workers=1, service_token="secret",
+        max_upload_connections=1, max_upload_waiters=1, upload_wait_seconds=5,
+    )
+    manager = TranslationJobManager(config, pipeline=FakePipeline())
+    app = create_app(config=config, manager=manager)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            gate = app.state.translation_upload_gate
+            headers = {"Authorization": "Bearer secret", "Content-Type": "image/png"}
+            await gate.acquire()
+            waiting = asyncio.create_task(client.post(
+                "/v1/translate/page?waitMs=0", content=image_bytes(), headers=headers,
+            ))
+            try:
+                for _ in range(100):
+                    if gate.waiting:
+                        break
+                    await asyncio.sleep(0.001)
+                assert gate.waiting == 1
+                busy = await asyncio.wait_for(client.post(
+                    "/v1/translate/page?waitMs=0", content=image_bytes(), headers=headers,
+                ), timeout=0.2)
+                assert busy.status_code == 429
+                assert busy.json()["error"] == "upload_queue_full"
+                assert gate.waiting == 1
+            finally:
+                waiting.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await waiting
+                gate.release()
+            assert gate.waiting == 0
+            ok = await client.post("/v1/translate/page?waitMs=0", content=image_bytes(), headers=headers)
+            assert ok.status_code in {200, 202}
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        manager.shutdown()
+
+
+def test_inline_waiter_releases_its_duplicate_upload(tmp_path, monkeypatch):
+    import httpx
+    import weakref
+    import service
+
+    config = ServiceConfig(cache_dir=tmp_path, workers=1, service_token="secret")
+    manager = TranslationJobManager(config, pipeline=FakePipeline())
+    app = create_app(config=config, manager=manager)
+    references = []
+
+    class UploadBytes(bytearray):
+        pass
+
+    async def read_upload(*_args):
+        source = UploadBytes(b"duplicate image upload")
+        references.append(weakref.ref(source))
+        return source
+
+    monkeypatch.setattr(service, "_read_limited", read_upload)
+    monkeypatch.setattr(manager, "submit", lambda *_args: {"status": "processing", "jobId": "a" * 32})
+    monkeypatch.setattr(manager, "get", lambda _job_id: {"status": "ready"})
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            request = asyncio.create_task(client.post(
+                "/v1/translate/page?waitMs=1000", content=b"image",
+                headers={"Authorization": "Bearer secret", "Content-Type": "image/png"},
+            ))
+            try:
+                for _ in range(100):
+                    if references:
+                        break
+                    await asyncio.sleep(0.001)
+                assert references and not request.done(), "check while inline waiter is still sleeping"
+                assert references[0]() is None, "duplicate request must release uploaded bytes before waiting"
+                assert (await request).status_code == 200
+            finally:
+                if not request.done():
+                    request.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await request
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        manager.shutdown()
 
 
 def test_stalled_upload_is_interrupted_and_gate_released(tmp_path):

@@ -32,7 +32,7 @@ const sessions = require('../lib/sessions');
 const features = require('../lib/features');
 const {
   ApiError, upstreamRequest, assertPublicUrl, positiveTimeout,
-  MAX_API_RESPONSE_BYTES, BUILTIN_API_HOSTS,
+  MAX_API_RESPONSE_BYTES, BUILTIN_API_HOSTS, parseSetCookies,
 } = require('../lib/jm-api');
 const {
   server,
@@ -270,6 +270,15 @@ class MockServerResponse extends EventEmitter {
       (error) => error.code === 403,
       'RFC 2544 内部/基准测试网段不得作为公网出站目标'
     );
+    for (const address of ['fec0::1', 'fedc:ba98::1', 'feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff']) {
+      assert.strictEqual(settings.normalizeHost(`https://[${address}]`), '', '站点本地 IPv6 字面量不得进入服务端白名单');
+      await assert.rejects(() => assertPublicUrl(`https://[${address}]/`), (error) => error.code === 403);
+      await assert.rejects(
+        () => assertPublicUrl('https://upstream.example/', async () => [{ address, family: 6 }]),
+        (error) => error.code === 403,
+        'DNS 返回废弃但仍可能路由到内网的 fec0::/10 地址时必须拒绝',
+      );
+    }
 
     // JM_API_BASE 锁定是强制出站边界，任何 dataSource 都不得回退内置域名。
     settings.setEnvApiHosts(['https://locked.example']);
@@ -1488,6 +1497,15 @@ class MockServerResponse extends EventEmitter {
       jar: { cookies: { AVS: 'secret' } }, cookieHosts: ['https://trusted.example'], dnsLookup: publicDns,
     }));
     assert.strictEqual(leakedCookie, '');
+
+    // Max-Age 是 Cookie 有效期的权威值：不能因同时附带过期 Expires
+    // 而撤销一个仍有效的 AVS；非法 Max-Age 才回退 Expires。
+    const expiredCookieDate = 'Thu, 01 Jan 1970 00:00:00 GMT';
+    const futureCookieDate = 'Fri, 01 Jan 2100 00:00:00 GMT';
+    assert.deepStrictEqual(parseSetCookies(`AVS=renewed; Max-Age=3600; Expires=${expiredCookieDate}`), { AVS: 'renewed' });
+    assert.deepStrictEqual(parseSetCookies(`AVS=revoked; Max-Age=0; Expires=${futureCookieDate}`), { AVS: null });
+    assert.deepStrictEqual(parseSetCookies(`AVS=revoked; Max-Age=invalid; Expires=${expiredCookieDate}`), { AVS: null });
+    assert.deepStrictEqual(parseSetCookies(`AVS=valid; Max-Age=invalid; Expires=${futureCookieDate}`), { AVS: 'valid' });
 
     // 接收与发送 Cookie 都必须按精确 origin 隔离，受信候选之间也不得串线。
     const isolatedJar = { cookiesByOrigin: {} };

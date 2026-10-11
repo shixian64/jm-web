@@ -1,5 +1,6 @@
 // 后端 API 封装：所有业务请求都走自部署的 /api/*（签名/解密/会话由服务端处理）
-import { setting, onSettingChange } from './store.js';
+import { setting, onSettingChange, updateSetting } from './store.js';
+import { clearRouteTrail } from './navigation.js';
 import { createNavigationCache, navigationAbortError } from './navigation-cache.js';
 
 export function selectedDataSource() {
@@ -13,7 +14,13 @@ let identityEpoch = 0;
 let lastSource = selectedDataSource();
 
 function invalidateNavigation(kind = 'all', id = '', { remote = false, abortFlights = true } = {}) {
-  if (['all', 'auth', 'unauthorized', 'source', 'host'].includes(kind)) identityEpoch++;
+  if (['all', 'auth', 'unauthorized', 'source', 'host'].includes(kind)) {
+    identityEpoch++;
+    clearRouteTrail();
+  }
+  if (['auth', 'unauthorized', 'source'].includes(kind) && setting.favoriteFolder !== '0') {
+    try { updateSetting({ favoriteFolder: '0' }); } catch (_) { /* 存储不可写时仍可浏览 */ }
+  }
   const matches = (key) => kind === 'all' || kind === 'auth' || kind === 'unauthorized'
     || kind === 'source' || kind === 'host'
     || (kind === 'favorites' && (key.startsWith('favorites:') || key.startsWith('favorite-state:')
@@ -120,6 +127,9 @@ async function request(path, opts = {}) {
   }
   return json;
 }
+
+// 阅读器/下载同样必须经过统一的超时、认证世代与 401 分流，不再各自直连 JSON API。
+export { request as apiRequest };
 
 export const api = {
   config: (signal) => request('/config', { signal }),

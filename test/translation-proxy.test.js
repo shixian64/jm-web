@@ -5,8 +5,9 @@
 
 const assert = require('assert');
 const http = require('http');
+const { EventEmitter, getEventListeners } = require('events');
 const { PassThrough } = require('stream');
-const { createTranslationProxy } = require('../lib/translation-proxy');
+const { createTranslationProxy, readBounded } = require('../lib/translation-proxy');
 
 const TOKEN = 'test-service-token';
 const WEBP = Buffer.from([0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50]);
@@ -58,16 +59,25 @@ function slowReq(chunk, intervalMs, headers = {}) {
   return stream;
 }
 
-function mockRes() {
-  return {
+function mockRes({ autoFinish = true } = {}) {
+  return Object.assign(new EventEmitter(), {
     status: 0,
     headers: null,
     body: null,
     headersSent: false,
     ended: false,
+    writableEnded: false,
+    writableFinished: false,
+    destroyed: false,
     writeHead(status, headers) { this.status = status; this.headers = headers; this.headersSent = true; },
-    end(data) { this.ended = true; this.body = data ? Buffer.from(data) : Buffer.alloc(0); },
-  };
+    end(data) {
+      this.ended = this.writableEnded = true;
+      this.body = data ? Buffer.from(data) : Buffer.alloc(0);
+      if (autoFinish) this.finish();
+    },
+    finish() { this.writableFinished = true; this.emit('finish'); },
+    destroy() { this.destroyed = true; this.emit('close'); },
+  });
 }
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -382,6 +392,191 @@ async function main() {
       assert.strictEqual(JSON.parse(busy.body).error, 'translation_queue_full');
       assert.strictEqual(proxy.gate.stats().active, 0);
       service.capture.onPost = null;
+    }
+
+    // 重定向不能绕过固定的 API/结果路径；同源 307 也会携带令牌和原始图片。
+    {
+      const proxy = makeProxy(port);
+      const getsBefore = service.capture.gets.length;
+      service.capture.onPost = (_record, res) => {
+        res.writeHead(307, { Location: '/unexpected-upload-target' });
+        res.end();
+      };
+      await assert.rejects(() => run(proxy, mockReq(WEBP, { 'content-type': 'image/webp' })),
+        (error) => error instanceof ApiError && error.status === 502);
+      assert.strictEqual(service.capture.gets.length, getsBefore, 'POST 重定向不得被自动请求');
+
+      service.capture.onPost = (_record, res) => {
+        res.writeHead(200, JSON_HEADERS);
+        res.end(JSON.stringify({ status: 'ready', imageUrl: '/v1/results/' + 'a'.repeat(64) + '.webp' }));
+      };
+      service.capture.onGet = (url, res) => {
+        if (url.startsWith('/v1/results/')) {
+          res.writeHead(302, { Location: '/unexpected-result-target' });
+          res.end();
+        } else {
+          res.writeHead(200, { 'Content-Type': 'image/webp' });
+          res.end(WEBP);
+        }
+      };
+      await assert.rejects(() => run(proxy, mockReq(WEBP, { 'content-type': 'image/webp' })),
+        (error) => error instanceof ApiError && error.status === 502);
+      assert.strictEqual(service.capture.gets.length, getsBefore + 1, 'GET 重定向不得被自动请求');
+      service.capture.onPost = null;
+      service.capture.onGet = null;
+      assert.strictEqual(proxy.gate.stats().active, 0);
+    }
+
+    // 合法 pathname 不等于可信 URL：用户信息、查询及片段均不得夹带。
+    for (const imageUrl of [
+      '/v1/results/' + 'a'.repeat(64) + '.webp?redirect=outside',
+      '/v1/results/' + 'a'.repeat(64) + '.webp#fragment',
+      `http://user:password@127.0.0.1:${port}/v1/results/` + 'a'.repeat(64) + '.webp',
+    ]) {
+      const getsBefore = service.capture.gets.length;
+      service.capture.onPost = (_record, res) => {
+        res.writeHead(200, JSON_HEADERS);
+        res.end(JSON.stringify({ status: 'ready', imageUrl }));
+      };
+      await assert.rejects(() => run(makeProxy(port), mockReq(WEBP, { 'content-type': 'image/webp' })),
+        (error) => error instanceof ApiError && error.status === 502);
+      assert.strictEqual(service.capture.gets.length, getsBefore);
+    }
+    service.capture.onPost = null;
+
+    // res.end() 只是提交缓冲；finish 前不能归还槽位，否则慢客户端可无界积压图片。
+    {
+      const proxy = makeProxy(port, { waitingLimit: 0 });
+      service.capture.onPost = (_record, res) => {
+        res.writeHead(200, JSON_HEADERS);
+        res.end(JSON.stringify({ status: 'ready', imageUrl: '/v1/results/' + 'a'.repeat(64) + '.webp' }));
+      };
+      const res = mockRes({ autoFinish: false });
+      let settled = false;
+      const sending = run(proxy, mockReq(WEBP, { 'content-type': 'image/webp' }), { res })
+        .finally(() => { settled = true; });
+      for (let i = 0; i < 100 && !res.ended; i++) await wait(5);
+      assert.strictEqual(res.ended, true);
+      assert.strictEqual(settled, false, '写入已结束不代表客户端发送完成');
+      assert.strictEqual(proxy.gate.stats().active, 1, 'finish 前必须持有槽位');
+      const blocked = mockRes();
+      await run(proxy, mockReq(WEBP, { 'content-type': 'image/webp' }), { res: blocked, clientKey: 'other' });
+      assert.strictEqual(blocked.status, 429);
+      res.finish();
+      await sending;
+      assert.strictEqual(proxy.gate.stats().active, 0);
+      for (const event of ['finish', 'close', 'error']) assert.strictEqual(res.listenerCount(event), 0);
+      service.capture.onPost = null;
+    }
+
+    // 总期限继续覆盖慢速回传；超时/断开/响应流错误都应销毁连接和清理监听。
+    for (const failure of ['deadline', 'close', 'abort', 'error']) {
+      const controller = new AbortController();
+      const proxy = makeProxy(port, { deadlineMs: failure === 'deadline' ? 150 : 5000 });
+      service.capture.onPost = (_record, res) => {
+        res.writeHead(200, JSON_HEADERS);
+        res.end(JSON.stringify({ status: 'ready', imageUrl: '/v1/results/' + 'a'.repeat(64) + '.webp' }));
+      };
+      const res = mockRes({ autoFinish: false });
+      const sending = run(proxy, mockReq(WEBP, { 'content-type': 'image/webp' }), {
+        res, requestSignal: controller.signal,
+      });
+      const rejected = assert.rejects(() => sending, (error) => failure === 'deadline'
+        ? error instanceof ApiError && error.status === 504
+        : failure === 'error' ? error.message === 'response failed' : error.name === 'AbortError');
+      for (let i = 0; i < 100 && !res.ended; i++) await wait(5);
+      assert.strictEqual(res.ended, true);
+      assert.strictEqual(proxy.gate.stats().active, 1);
+      if (failure === 'close') res.emit('close');
+      if (failure === 'abort') controller.abort();
+      if (failure === 'error') res.emit('error', new Error('response failed'));
+      await rejected;
+      assert.strictEqual(res.destroyed, true, `${failure} 必须关闭未完成的响应`);
+      assert.strictEqual(proxy.gate.stats().active, 0);
+      for (const event of ['finish', 'close', 'error']) assert.strictEqual(res.listenerCount(event), 0);
+      assert.strictEqual(getEventListeners(controller.signal, 'abort').length, 0);
+      service.capture.onPost = null;
+    }
+
+    // 使用真实 Node Writable 背压，而非手动模拟 finish：无消费者的
+    // PassThrough 会停在 writableEnded=true / writableFinished=false。
+    {
+      const proxy = makeProxy(port, {
+        deadlineMs: 150,
+        fetchImpl: async (_url, options) => options.method === 'POST'
+          ? Response.json({ status: 'ready', imageUrl: '/v1/results/' + 'a'.repeat(64) + '.webp' })
+          : new Response(WEBP, { headers: { 'Content-Type': 'image/webp' } }),
+      });
+      const response = new PassThrough({ highWaterMark: 1 });
+      response.writeHead = () => { response.headersSent = true; };
+      try {
+        const sending = run(proxy, mockReq(WEBP, { 'content-type': 'image/webp' }), { res: response });
+        const rejected = assert.rejects(() => sending, (error) => error instanceof ApiError && error.status === 504);
+        for (let i = 0; i < 100 && !response.writableEnded; i++) await wait(5);
+        assert.strictEqual(response.writableEnded, true);
+        assert.strictEqual(response.writableFinished, false, '暂停读取必须产生真实响应背压');
+        assert.strictEqual(proxy.gate.stats().active, 1);
+        await rejected;
+        assert.strictEqual(response.destroyed, true);
+        assert.strictEqual(proxy.gate.stats().active, 0);
+        for (const event of ['finish', 'close', 'error']) assert.strictEqual(response.listenerCount(event), 0);
+      } finally {
+        response.destroy();
+      }
+    }
+
+    // MIME 拒绝发生在读取之前时也必须取消响应，而非依赖 GC 归还连接。
+    {
+      let cancelled = false;
+      let calls = 0;
+      const proxy = makeProxy(port, { fetchImpl: async () => {
+        if (++calls === 1) return Response.json({
+          status: 'ready', imageUrl: '/v1/results/' + 'a'.repeat(64) + '.webp',
+        });
+        return new Response(new ReadableStream({ cancel() { cancelled = true; } }), {
+          headers: { 'Content-Type': 'text/html' },
+        });
+      } });
+      await assert.rejects(() => run(proxy, mockReq(WEBP, { 'content-type': 'image/webp' })),
+        (error) => error instanceof ApiError && error.status === 502);
+      assert.strictEqual(cancelled, true);
+      assert.strictEqual(proxy.gate.stats().active, 0);
+    }
+
+    // 每次读取结束都移除 abort 监听，并释放 reader；取消时主动关闭停传的响应体。
+    {
+      const controller = new AbortController();
+      const response = new Response(WEBP);
+      assert.deepStrictEqual(await readBounded(response, 1024, 'test', controller.signal), WEBP);
+      assert.strictEqual(getEventListeners(controller.signal, 'abort').length, 0);
+      assert.strictEqual(response.body.locked, false);
+
+      let cancelled = false;
+      const stalled = new Response(new ReadableStream({ cancel() { cancelled = true; } }));
+      const aborted = new AbortController();
+      const reading = readBounded(stalled, 1024, 'test', aborted.signal);
+      aborted.abort();
+      await assert.rejects(() => reading, (error) => error.name === 'AbortError');
+      assert.strictEqual(cancelled, true);
+      assert.strictEqual(stalled.body.locked, false);
+      assert.strictEqual(getEventListeners(aborted.signal, 'abort').length, 0);
+
+      const preAborted = new AbortController();
+      preAborted.abort();
+      await assert.rejects(() => readBounded(new Response(WEBP), 1024, 'test', preAborted.signal),
+        (error) => error.name === 'AbortError');
+
+      const oversized = new Response(new ReadableStream({
+        start(stream) { stream.enqueue(new Uint8Array(32)); },
+        cancel() { return new Promise(() => {}); },
+      }));
+      // 不等待不可控的 cancel Promise，否则字节上限分支本身会无限挂起。
+      await assert.rejects(() => Promise.race([
+        readBounded(oversized, 16, 'test', controller.signal),
+        wait(250).then(() => { throw new Error('cancel stalled'); }),
+      ]), /超过字节上限/);
+      assert.strictEqual(oversized.body.locked, false);
+      assert.strictEqual(getEventListeners(controller.signal, 'abort').length, 0);
     }
 
     console.log('translation proxy admission/deadline/safety all pass');

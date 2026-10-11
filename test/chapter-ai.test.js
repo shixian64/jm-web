@@ -107,6 +107,49 @@ try {
   assert.match(prompt, /格式固定为/);
   assert.doesNotMatch(prompt, /仅在原章节名为空或无意义时生成/);
 
+  // 模型响应生命周期：非 2xx、读取超时和迟到响应都必须释放流；
+  // 完整读取成功也要释放 reader 锁，不能仅依赖 fetch 实现响应 AbortSignal。
+  {
+    const makeModelScheduler = (modelFetch) => new ChapterAiScheduler({
+      dataDir: dir, apiKey: 'test', model: 'test',
+      fetchChapter: async () => ({ scrambleId: 999999, images: [{ url: 'https://image.example/1.jpg', name: '1.jpg', page: '1' }] }),
+      fetchImage: async () => image,
+      modelFetch,
+    });
+    let rejectedBodyCancelled = false;
+    const rejectedResponse = new Response(new ReadableStream({
+      cancel() { rejectedBodyCancelled = true; },
+    }), { status: 503 });
+    await assert.rejects(() => makeModelScheduler(async () => rejectedResponse).analyze('100', '210'), /HTTP 503/);
+    assert.strictEqual(rejectedBodyCancelled, true, '非 2xx 模型响应必须主动取消，不能遗留无截止期限的连接');
+
+    let timedBodyCancelled = false;
+    const timedResponse = new Response(new ReadableStream({
+      cancel() { timedBodyCancelled = true; },
+    }));
+    const timed = makeModelScheduler(async () => timedResponse);
+    timed.modelTimeoutMs = 30;
+    await assert.rejects(() => timed.analyze('100', '211'), /超时/);
+    await wait(0);
+    assert.strictEqual(timedBodyCancelled, true, '读取超时必须取消已经取得的 reader');
+    assert.strictEqual(timedResponse.body.locked, false, '读取超时必须释放 reader 锁');
+
+    let resolveLate;
+    const late = makeModelScheduler(() => new Promise((resolve) => { resolveLate = resolve; }));
+    late.modelTimeoutMs = 30;
+    await assert.rejects(() => late.analyze('100', '212'), /超时/);
+    let lateBodyCancelled = false;
+    resolveLate(new Response(new ReadableStream({ cancel() { lateBodyCancelled = true; } })));
+    await wait(0);
+    assert.strictEqual(lateBodyCancelled, true, '超时后迟到的 fetch 响应必须取消');
+
+    const completeResponse = new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+      chapterTitle: '标题', detailedDescription: '描述', briefSummary: '总结',
+    }) } }] }));
+    await makeModelScheduler(async () => completeResponse).analyze('100', '213');
+    assert.strictEqual(completeResponse.body.locked, false, '成功读取模型响应后也必须释放 reader 锁');
+  }
+
   // runJob 必须把标题、详细剧情和简洁总结作为同一条完成记录原子保存。
   analysis.enqueue('100', '203');
   await analysis.runJob(analysis.state.queue.find((job) => job.key === '100:203'));
@@ -191,6 +234,22 @@ try {
   await run(); await run(); await run(); await run();
     assert.strictEqual(scheduler.state.queue.length, 0, '超过最大重试次数后任务必须终止');
     assert.strictEqual(scheduler.get('100', '200').status, 'failed');
+
+  // 部署者用 CHAPTER_AI_MAX_RETRIES=0 关闭自动重试时，数字 0 与环境
+  // 字符串 "0" 都必须保留，不能经 || 3 恢复默认而重复付费调用模型。
+  for (const maxRetries of [0, '0']) {
+    const noRetryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'jmw-chapter-ai-no-retry-'));
+    extraDirs.push(noRetryDir);
+    const noRetry = new ChapterAiScheduler({ dataDir: noRetryDir, apiKey: 'test', maxRetries });
+    assert.strictEqual(noRetry.maxRetries, 0);
+    noRetry.analyze = async () => { throw new Error('expected no-retry failure'); };
+    noRetry.enqueue('100', '204');
+    await noRetry.runJob(noRetry.state.queue[0]);
+    assert.strictEqual(noRetry.get('100', '204').status, 'failed');
+    assert.strictEqual(noRetry.get('100', '204').attempts, 1);
+    assert.strictEqual(noRetry.state.queue.length, 0, '关闭重试后首次失败即终止任务');
+    noRetry.flushSync();
+  }
 
   /* ---------------- 第 2 批新增：资源控制行为验证 ---------------- */
 

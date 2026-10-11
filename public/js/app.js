@@ -7,7 +7,7 @@ import { homeView, searchView, categoryView, categoryListView, promoteListView, 
 import { mountReader } from './reader.js';
 import { downloadsView } from './download-view.js';
 import { registerOfflineWorker } from './offline.js';
-import { NAV_STATE_KEY, hashRouteKey } from './navigation.js';
+import { NAV_STATE_KEY, hashRouteKey, rememberRouteEntry } from './navigation.js';
 import {
   advancedHubView, blockedTagsView, paletteView, securityView, backupView, personasView,
   aiView, networkView, logsView, extractCodeView, cacheView, aboutView,
@@ -62,6 +62,7 @@ const tabbar = h('nav', { id: 'tabbar', 'aria-label': '移动导航' },
   tab('#/', 'house', '首页'),
   tab('#/category', 'layout-grid', '分类'),
   tab('#/week', 'calendar-days', '每周'),
+  tab('#/favorites?o=mp&folder=0', 'star', '收藏更新', '#/favorites'),
   tab('#/user', 'user', '我的'),
 );
 
@@ -254,8 +255,8 @@ function navLink(href, label) {
   return h('a', { href, dataset: { nav: href } }, label);
 }
 
-function tab(href, ic, label) {
-  return h('a', { href, dataset: { nav: href } },
+function tab(href, ic, label, nav = href) {
+  return h('a', { href, dataset: { nav } },
     h('span', { class: 'ti' }, icon(ic, 22)), label);
 }
 
@@ -273,6 +274,7 @@ function render(navigation = {}) {
 
   const hash = location.hash || '#/';
   const routeKey = hashRouteKey(hash);
+  rememberRouteEntry({ id: targetEntryId, key: routeKey });
   const sameEntryRefresh = currentRouteKey === routeKey
     && previousEntryId != null && previousEntryId === targetEntryId;
   const path = hash.replace(/^#/, '').split('?')[0] || '/';
@@ -380,8 +382,7 @@ function highlightNav(path) {
       || path.startsWith('/extract') || path.startsWith('/cache') || path.startsWith('/about')) ? '#/user'
     : null;
   document.querySelectorAll('#topbar .nav-links a, #tabbar a').forEach((a) => {
-    // 桌面端有独立“收藏”入口；移动端仍将收藏归入“我的”主 Tab。
-    const active = a.closest('#tabbar') && desktopActive === '#/favorites' ? '#/user' : desktopActive;
+    const active = desktopActive;
     const isActive = a.dataset.nav === active;
     a.classList.toggle('active', isActive);
     if (isActive) a.setAttribute('aria-current', 'page');

@@ -118,8 +118,21 @@ function createWorkerHarness(initialFetch) {
 
 function networkResponse(body, contentType, responseUrl = '') {
   const response = new Response(body, { status: 200, headers: { 'Content-Type': contentType } });
+  Object.defineProperty(response, 'type', { value: 'basic' });
   if (responseUrl) Object.defineProperty(response, 'url', { value: new URL(responseUrl, ORIGIN).href });
   return response;
+}
+
+function shellResponse(request, prefix = 'shell') {
+  const url = typeof request === 'string' ? request : request.url;
+  const pathname = new URL(url, ORIGIN).pathname;
+  if (pathname === '/' || pathname === '/index.html') {
+    return networkResponse(fs.readFileSync(path.join(PUBLIC, 'index.html'), 'utf8'), 'text/html', url);
+  }
+  const mime = pathname.endsWith('.js') ? 'text/javascript'
+    : pathname.endsWith('.css') ? 'text/css'
+      : pathname.endsWith('.png') ? 'image/png' : 'application/manifest+json';
+  return networkResponse(`${prefix}:${url}`, mime, url);
 }
 
 function collectModuleDependencies(entry) {
@@ -147,6 +160,7 @@ function collectModuleDependencies(entry) {
 }
 
 function verifyShellInventory(shell) {
+  assert.match(workerSource, /const CACHE_VERSION = 'jmw-shell-v17'/, '外壳及下载恢复变更必须升级缓存版本');
   const shellSet = new Set(shell);
   assert.strictEqual(shellSet.size, shell.length, 'SHELL 不得包含重复缓存键');
   assert(shellSet.has('/js/navigation.js'), 'SHELL 必须包含 app.js 的 navigation.js 依赖');
@@ -268,7 +282,7 @@ function verifyShellInventory(shell) {
     precacheFetches++;
     const url = typeof request === 'string' ? request : request.url;
     if (url === '/js/navigation.js') return new Response('missing', { status: 404 });
-    return networkResponse(`shell:${url}`, 'application/octet-stream');
+    return shellResponse(request);
   });
   await assert.rejects(() => failedInstallHarness.precache(), /无法预缓存/);
   const failedInstallNames = await failedInstallHarness.cacheStorage.keys();
@@ -279,11 +293,57 @@ function verifyShellInventory(shell) {
   assert.ok(!failedInstallNames.includes(`${failedInstallHarness.cacheVersion}-staging`),
     '预缓存失败必须清理临时缓存');
 
+  // HTTP 200 并不代表外壳有效：反代错误页/登录重定向不能替换整套可用缓存。
+  for (const badPath of ['/', '/js/app.js', '/css/app.css', '/icons/icon-192.png']) {
+    const poisonHarness = createWorkerHarness(async (request) => request === badPath
+      ? networkResponse('<html>proxy error</html>', 'text/html') : shellResponse(request));
+    await assert.rejects(() => poisonHarness.precache(), /无法预缓存/,
+      `必须拒绝错误的预缓存响应：${badPath}`);
+    assert.deepStrictEqual(await poisonHarness.cacheStorage.keys(), [], '无效外壳不得留下缓存');
+  }
+  const redirectHarness = createWorkerHarness(async (request) => request === '/js/app.js'
+    ? networkResponse('export {}', 'text/javascript', '/signin') : shellResponse(request));
+  await assert.rejects(() => redirectHarness.precache(), /无法预缓存/, '重定向资源不得预缓存');
+
+  // 多标签同时准备离线外壳必须合并，不能竞争同一个 staging 缓存。
+  let concurrentFetches = 0;
+  let releaseFetches;
+  const fetchBarrier = new Promise((resolve) => { releaseFetches = resolve; });
+  const concurrentHarness = createWorkerHarness(async (request) => {
+    concurrentFetches++;
+    await fetchBarrier;
+    return shellResponse(request);
+  });
+  const preloads = [concurrentHarness.precache(), concurrentHarness.precache()];
+  releaseFetches();
+  await Promise.all(preloads);
+  assert.strictEqual(concurrentFetches, concurrentHarness.shell.length, '并发预缓存只能下载一套外壳');
+  await concurrentHarness.precache();
+  assert.strictEqual(concurrentFetches, concurrentHarness.shell.length * 2, '完成后应允许重新刷新');
+  failedInstallHarness.setFetch((request) => shellResponse(request));
+  await failedInstallHarness.precache(); // 失败的 single-flight 也必须释放。
+
+  const staticCacheHarness = createWorkerHarness((request) => shellResponse(request));
+  const boundedCache = await staticCacheHarness.cacheStorage.open(staticCacheHarness.cacheVersion);
+  await staticCacheHarness.staticRequest('/js/app.js');
+  assert.ok(await boundedCache.match('/js/app.js'), '合法模块必须可离线缓存');
+  staticCacheHarness.setFetch(async () => networkResponse('<html>proxy error</html>', 'text/html'));
+  const validFallback = await staticCacheHarness.staticRequest('/js/app.js');
+  assert.strictEqual(await validFallback.text(), 'shell:https://jm-web.test/js/app.js',
+    '错误 MIME 的 HTTP 200 必须使用现有模块，而不是破坏启动');
+  assert.strictEqual(await (await boundedCache.match('/js/app.js')).text(), 'shell:https://jm-web.test/js/app.js');
+  staticCacheHarness.setFetch((request) => shellResponse(request));
+  for (let index = 0; index < 12; index++) {
+    await staticCacheHarness.staticRequest(`/js/app.js?nonce=${index}`);
+    await staticCacheHarness.staticRequest(`/not-shell-${index}.js`);
+  }
+  assert.strictEqual(boundedCache.entries.size, 1, '随机路径和 query 不得无限扩张离线外壳缓存');
+
   // 同版本缓存刷新期间若目标 put 失败，不得留下新旧模块混合；
   // 让目标缓存只在第二个键写入时失败，验证事务性回滚。
   const rollbackHarness = createWorkerHarness(async (request) => {
     const url = typeof request === 'string' ? request : request.url;
-    return networkResponse(`new:${url}`, 'application/octet-stream');
+    return shellResponse(request, 'new');
   });
   const rollbackCache = await rollbackHarness.cacheStorage.open(rollbackHarness.cacheVersion);
   for (const url of rollbackHarness.shell) {

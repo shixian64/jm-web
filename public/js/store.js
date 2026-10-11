@@ -54,6 +54,8 @@ const defaultSetting = {
   nsfwWarningDismissed: false,
   homeGridColumns: 0,
   collectGridColumns: 0,
+  favoriteOrder: 'mr',   // 收藏入口记住排序；快捷更新入口显式指定 mp
+  favoriteFolder: '0',   // 只保存 UI 偏好，账号/数据源变化时重置分组
   downloadGridColumns: 0,
   historyGridColumns: 0,
   searchGridColumns: 0,

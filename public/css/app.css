@@ -403,6 +403,9 @@ body.reading #main { padding: 0; }
   width: 44px; height: 44px; border-radius: 12px; color: #eee;
   transition: color .16s ease, background-color .16s ease, transform .16s ease;
 }
+#reader .icon-btn.r-favorites-back {
+  width: auto; flex-shrink: 0; gap: 3px; padding-inline: 6px; font-size: 12px; white-space: nowrap;
+}
 #reader .r-progress {
   position: absolute; top: env(safe-area-inset-top); left: 0; height: 3px;
   background: var(--primary); width: 0; z-index: 31; pointer-events: none;

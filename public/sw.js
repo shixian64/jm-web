@@ -4,7 +4,7 @@
 
 'use strict';
 
-const CACHE_VERSION = 'jmw-shell-v15';
+const CACHE_VERSION = 'jmw-shell-v17';
 const SHELL = [
   '/',
   '/index.html',
@@ -41,7 +41,16 @@ const SHELL = [
   '/js/views.js',
 ];
 
-async function precache() {
+// 多标签消息共用一轮预缓存，避免相互删除/覆盖共享 staging 缓存。
+let precacheInFlight = null;
+function precache() {
+  if (!precacheInFlight) {
+    precacheInFlight = populateShellCache().finally(() => { precacheInFlight = null; });
+  }
+  return precacheInFlight;
+}
+
+async function populateShellCache() {
   const stagingName = `${CACHE_VERSION}-staging`;
   const existingNames = await caches.keys();
   const targetExisted = existingNames.includes(CACHE_VERSION);
@@ -49,7 +58,7 @@ async function precache() {
   try {
     const responses = await Promise.all(SHELL.map(async (url) => {
       const response = await fetch(url, { cache: 'reload', credentials: 'same-origin' });
-      if (!response.ok) throw new Error(`无法预缓存 ${url}（${response.status}）`);
+      if (!await isShellResponse(url, response)) throw new Error(`无法预缓存 ${url}（${response.status}，响应无效）`);
       return [url, response];
     }));
 
@@ -139,6 +148,22 @@ async function isAppEntryHtml(request, response) {
   }
 }
 
+// 只缓存清单内的完整静态资源；HTTP 200 的代理错误页也必须拒绝。
+async function isShellResponse(value, response) {
+  const url = new URL(value, self.location.origin);
+  if (url.origin !== self.location.origin || !SHELL.includes(url.pathname)
+    || !response || response.status !== 200) return false;
+  const finalUrl = new URL(response.url || url.href, self.location.origin);
+  if (finalUrl.origin !== url.origin || finalUrl.pathname !== url.pathname || finalUrl.search !== url.search) return false;
+  if (isAppEntryUrl(url.href)) return isAppEntryHtml({ url: url.href }, response);
+  const mime = String(response.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
+  if (url.pathname.endsWith('.js')) return /^(?:text|application)\/(?:javascript|ecmascript)$/.test(mime);
+  if (url.pathname.endsWith('.css')) return mime === 'text/css';
+  if (url.pathname.endsWith('.png')) return mime === 'image/png';
+  if (url.pathname.endsWith('.webmanifest')) return mime === 'application/manifest+json' || mime === 'application/json';
+  return false;
+}
+
 async function openShellCache() {
   try {
     return await caches.open(CACHE_VERSION);
@@ -169,7 +194,10 @@ async function navigationResponse(request) {
 }
 
 async function staticResponse(request) {
-  const cache = await openShellCache();
+  const url = new URL(request.url);
+  // 未版本化外壳仅有 SHELL 中的固定键；不缓存任意资源或无限 query 变体。
+  const cacheable = url.origin === self.location.origin && !url.search && SHELL.includes(url.pathname);
+  const cache = cacheable ? await openShellCache() : null;
   let cached;
   if (cache) {
     try { cached = await cache.match(request, { ignoreSearch: false }); } catch (_) {}
@@ -178,10 +206,12 @@ async function staticResponse(request) {
     // 在线时先做 ETag 协商，部署新静态文件后立即生效；断网才回退离线副本。
     // 旧的 cache-first 会在 sw.js 本身未改动时永久返回上一版模块。
     const response = await fetch(request, { cache: 'no-cache' });
-    if (cache && response.ok && response.type === 'basic') {
-      cache.put(request, response.clone()).catch(() => {});
+    const valid = !cacheable || await isShellResponse(request.url, response);
+    if (cache && valid && response.type === 'basic') {
+      // 把写缓存纳入 respondWith 生命周期，不能让 worker 提前终止后台 put。
+      await cache.put(request, response.clone()).catch(() => {});
     }
-    return response.ok || !cached ? response : cached;
+    return (response.ok && valid) || !cached ? response : cached;
   } catch (_) {
     return cached || Response.error();
   }

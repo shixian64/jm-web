@@ -1,11 +1,12 @@
 // 阅读器：滚动 / 左右翻页 / 纯点击，Canvas 解扰，预加载，章节抽屉与阅读中设置
 // 协议与还原算法对齐 jm-mobile 的 ComicReadViewModel + ComicPicImageState
-import { chapterImgSrc, imgSrc, selectedDataSource } from './api.js';
+import { apiRequest, chapterImgSrc, imgSrc, selectedDataSource } from './api.js';
 import { setting, updateSetting, recordAlbumHistory } from './store.js';
 import { needsScramble, decodeFromBlob } from './descramble.js';
 import { h } from './ui.js';
 import { icon } from './icons.js';
 import { createReaderSettings } from './reader-settings.js';
+import { favoritesReturnTarget, returnToFavorites, replaceRouteHash } from './navigation.js';
 import {
   getOfflineAlbum, getOfflineChapter, getOfflineImage, deleteOfflineImage,
   listOfflineChapters, listOfflineImages,
@@ -300,23 +301,7 @@ export function mountReader(root, photoId, query, options = {}) {
   }
 
   async function readerRequest(path) {
-    let res;
-    try {
-      res = await fetch('/api' + path, {
-        headers: { 'Content-Type': 'application/json', 'X-JMW-Data-Source': selectedDataSource() },
-        signal,
-      });
-    } catch (e) {
-      if (signal.aborted || e.name === 'AbortError') throw abortError();
-      throw new Error('网络错误：' + e.message);
-    }
-    let json = null;
-    try { json = await res.json(); } catch (_) {}
-    if (!res.ok) {
-      const err = new Error((json && json.error) || `请求失败（${res.status}）`);
-      err.status = res.status;
-      throw err;
-    }
+    const json = await apiRequest(path, { signal });
     if (json === null) throw new Error('服务器返回了无法识别的响应');
     return json;
   }
@@ -377,9 +362,13 @@ export function mountReader(root, photoId, query, options = {}) {
     container?.classList.toggle('tap-only', state.mode === 'tap');
   }
 
+  const fromFavorites = !offline && !!favoritesReturnTarget();
   const backBtn = h('button', {
-    class: 'icon-btn', type: 'button', title: '返回', 'aria-label': '退出阅读器', onclick: close,
-  }, icon('arrow-left', 20));
+    class: 'icon-btn' + (fromFavorites ? ' r-favorites-back' : ''), type: 'button',
+    title: fromFavorites ? '返回收藏' : '返回',
+    'aria-label': fromFavorites ? '返回收藏' : '退出阅读器',
+    onclick: fromFavorites ? closeToFavorites : close,
+  }, icon('arrow-left', 20), fromFavorites ? h('span', null, '返回收藏') : null);
   const titleEl = h('div', { class: 'title' }, '加载中…');
   const drawerBtn = h('button', {
     class: 'icon-btn', type: 'button', title: '章节目录', 'aria-label': '打开章节目录',
@@ -636,7 +625,7 @@ export function mountReader(root, photoId, query, options = {}) {
     }
     flushHistory();
     // 替换当前阅读路由，退出时不会逐章退回。
-    location.replace(chapterHref(chapter, start ?? (delta < 0 ? 'last' : 0)));
+    replaceRouteHash(chapterHref(chapter, start ?? (delta < 0 ? 'last' : 0)));
   }
 
   function toggleSettings(on) {
@@ -785,7 +774,14 @@ export function mountReader(root, photoId, query, options = {}) {
     readerTopbar.inert = on || !container.classList.contains('toolbar-on');
   }
 
+  function closeToFavorites() {
+    if (state.destroyed) return;
+    destroy();
+    if (!returnToFavorites()) replaceRouteHash('#/favorites');
+  }
+
   function close() {
+    if (state.destroyed) return;
     destroy();
     if (state.aid && history.length > 1) history.back();
     else location.hash = offline ? '#/downloads' : (state.aid ? `#/album/${state.aid}` : '#/');
@@ -993,7 +989,7 @@ export function mountReader(root, photoId, query, options = {}) {
             toggleDrawer(false);
             if (i !== state.curChapterIdx) {
               flushHistory();
-              location.replace(chapterHref(c, 0));
+              replaceRouteHash(chapterHref(c, 0));
             }
           },
         }, chapterLabel(c, i))
@@ -1631,8 +1627,11 @@ export function mountReader(root, photoId, query, options = {}) {
         onclick: () => { location.hash = '#/downloads'; },
       }, '返回下载中心');
     }
+    if (fromFavorites) {
+      return h('button', { class: 'btn primary', type: 'button', onclick: closeToFavorites }, '返回收藏');
+    }
     return state.aid
-      ? h('button', { class: 'btn', type: 'button', style: 'color:#dde;background:#26272e;border-color:#333', onclick: () => { location.hash = `#/album/${state.aid}`; } }, '返回详情')
+      ? h('button', { class: 'btn', type: 'button', style: 'color:#dde;background:#26272e;border-color:#333', onclick: () => { replaceRouteHash(`#/album/${state.aid}`); } }, '返回详情')
       : null;
   }
 

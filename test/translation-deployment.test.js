@@ -35,4 +35,8 @@ for (const name of ['Dockerfile', '.dockerignore', 'requirements.txt', 'pipeline
 }
 assert.match(read('translation-service-poc/Dockerfile'), /^USER appuser$/m);
 assert.match(read('.env.example'), /^TRANSLATION_SERVICE_URL=http:\/\/translation-service:8091$/m);
+assert.match(translation, /TRANSLATION_MAX_UPLOAD_WAITERS: "\$\{TRANSLATION_MAX_UPLOAD_WAITERS:-16\}"/,
+  'Compose 必须传递翻译上传等待队列上限');
+assert.match(read('.env.example'), /^TRANSLATION_MAX_UPLOAD_WAITERS=16$/m);
+assert.match(read('README.md'), /TRANSLATION_MAX_UPLOAD_WAITERS/);
 console.log('translation deployment checks pass');
