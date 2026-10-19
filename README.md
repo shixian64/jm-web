@@ -109,7 +109,7 @@ Compose 默认只将 `127.0.0.1:3210` 发布到宿主机，适合同机 Nginx/Ca
 
 单实例默认限制为 `1.0` CPU、`512m` 内存和 `256` 个进程，Docker `json-file` 日志按 `10m × 3` 轮转；图片代理默认最多同时处理 `12` 个请求，单个客户端最多 `6` 个，另有 `96` 个等待队列（单请求最多等待 3 秒）。可通过 `.env` 中的 `JMW_CPU_LIMIT`、`JMW_MEMORY_LIMIT`、`JMW_PIDS_LIMIT`、`JMW_LOG_MAX_SIZE`、`JMW_LOG_MAX_FILE`、`JMW_MAX_IMAGE_CONCURRENCY`、`JMW_MAX_IMAGE_CONCURRENCY_PER_IP`、`JMW_IMAGE_QUEUE_LIMIT`、`JMW_IMAGE_QUEUE_TIMEOUT` 调整。调整前应基于容量测试确定水位，不能直接删除上限。
 
-图片代理只做白名单校验、并发控制和流式转发，不在服务端把整章下载到内存或执行解扰；封面/缩略图会进入有界的进程内 LRU 缓存（默认总计 64 MiB、单张 2 MiB、保存 24 小时），章节正文仍保持流式转发，重启后缓存自动清空。上游暂时超时或 5xx 时，前端会以退避方式有限重试，后端也会短暂跳过故障线路。解扰在浏览器中进行。支持的浏览器会把解扰放入模块 Worker/OffscreenCanvas，减少阅读器主线程卡顿；旧 Safari/WebView 自动回退主线程 Canvas。阅读器会按设备内存以字节预算回收原图缓存，并在创建 Canvas 前拒绝超大或单轴过长的条漫图片。公网部署仍建议保持访问口令、反向代理和单实例资源上限，不要把它当作多人共享的无认证图片代理。
+图片代理只做白名单校验、并发控制和流式转发，不在服务端把整章下载到内存或执行解扰；封面/缩略图会进入有界的进程内 LRU 缓存（默认总计 64 MiB、单张 2 MiB、保存 24 小时），章节正文仍保持流式转发，重启后缓存自动清空。上游暂时超时或 5xx 时，前端会以退避方式有限重试，后端也会短暂跳过故障线路；单张图片最多尝试 4 条线路，同一资源被 2 条线路明确拒绝（4xx、非图片内容等）即停止换线，并对该资源做 5 分钟负缓存，避免失败图片长时间占用代理槽位。快速成功的图片请求不逐条写日志，每 5 分钟输出一行 `[image-stats]` 汇总（请求数、缓存命中率、上游 p50/p90/p99、错误分类、熔断线路数），失败、慢请求（≥3 秒）和换线成功仍逐条记录。解扰在浏览器中进行。支持的浏览器会把解扰放入模块 Worker/OffscreenCanvas，减少阅读器主线程卡顿；旧 Safari/WebView 自动回退主线程 Canvas。阅读器会按设备内存以字节预算回收原图缓存，并在创建 Canvas 前拒绝超大或单轴过长的条漫图片。公网部署仍建议保持访问口令、反向代理和单实例资源上限，不要把它当作多人共享的无认证图片代理。
 
 #### 漫画翻译服务（随主服务统一管理）
 
@@ -131,7 +131,7 @@ docker compose restart
 docker compose down
 ```
 
-翻译容器只加入 Compose 内部网络，不对宿主机发布 8091 端口；`jm-web` 通过 `http://translation-service:8091` 访问。设置 `TRANSLATION_SERVICE_URL=` 可关闭主站翻译调用，但翻译容器仍会随 Compose 启动。**安全契约：`TRANSLATION_SERVICE_TOKEN` 为空时，主站与翻译容器都会禁用翻译能力并明确提示（不再默认放行）**；需要翻译时请在 `.env` 为两侧配置同一个强随机令牌。主站代理禁止自动跟随翻译接口及结果下载的重定向，在读取上传体之前获取有界并发槽位，且单请求受整体截止时间约束（`TRANSLATION_MAX_CONCURRENT` 等可调）；翻译容器 `/healthz` 为存活探针、`/readyz` 为就绪探针（OCR 初始化失败时返回 503），Compose 健康检查使用 `/readyz`。当前后端仅覆盖繁体中文到简体中文的 `fast` 路径；复杂背景会安全回退原图。翻译结果保存在 Docker 命名卷 `translation-cache` 中。
+翻译容器只加入 Compose 内部网络，不对宿主机发布 8091 端口；`jm-web` 通过 `http://translation-service:8091` 访问。设置 `TRANSLATION_SERVICE_URL=` 可关闭主站翻译调用，但翻译容器仍会随 Compose 启动。**安全契约：`TRANSLATION_SERVICE_TOKEN` 为空时，主站与翻译容器都会禁用翻译能力并明确提示（不再默认放行）**；需要翻译时请在 `.env` 为两侧配置同一个强随机令牌。主站代理禁止自动跟随翻译接口及结果下载的重定向，在读取上传体之前获取有界并发槽位，且单请求受整体截止时间约束（`TRANSLATION_MAX_CONCURRENT` 等可调）；翻译容器 `/healthz` 为存活探针、`/readyz` 为就绪探针（OCR 初始化失败时返回 503），Compose 健康检查使用 `/readyz`，探针请求不写访问日志。翻译是可选能力：`jm-web` 只要求翻译容器已启动（`condition: service_started`、`required: false`，需 Docker Compose v2.20+），翻译容器构建失败或不健康不会阻断主站。翻译镜像的 Python 依赖由 `translation-service-poc/constraints.txt` 锁定到精确版本（含传递依赖），基础镜像固定补丁版本。当前后端仅覆盖繁体中文到简体中文的 `fast` 路径；复杂背景会安全回退原图。翻译结果保存在 Docker 命名卷 `translation-cache` 中。
 
 已有部署请保留原 `.env`，将其中的 `TRANSLATION_SERVICE_URL` 改为 `http://translation-service:8091`，再执行 `docker compose up -d --build`；不要用示例覆盖生产配置。第一次构建需要下载 Python/OCR 依赖。翻译容器默认上限为 2 CPU、2 GiB 内存，2 个工作线程、8 个在途任务，可通过 `.env` 的 `TRANSLATION_*` 调整。
 
@@ -303,7 +303,8 @@ JMW_TRUST_PROXY=172.18.0.5,172.19.0.0/24
 | API 协议 | 与 jm-mobile 一致：`token` / `tokenparam` 请求头签名，响应 `data` 字段 AES-256-ECB 解密 |
 | 会话 | 每个浏览器一个 Cookie Jar（AVS 等），持久化到 `data/sessions/`，重启不丢登录态；空会话 7 天、登录会话默认 365 天自动清理，可由 `JMW_SESSION_TTL_SECONDS` 调整（7 天至 2 年） |
 | 图片 | 服务端按 HTTPS 域名白名单逐跳流式代理并限制大小/并发；解扰由浏览器 Worker/Canvas 完成 |
-| 前端 | 原生 ES Module 单页应用，无构建步骤；Hash 路由；响应式（手机底部 Tab + 桌面顶部导航） |
+| 前端 | 原生 ES Module 单页应用，无构建步骤；Hash 路由；响应式（手机底部 Tab + 桌面顶部导航）；阅读器、下载管理、用户页按路由懒加载 |
+| 静态资源 | ETag 取自内容哈希；入口 HTML 注入 import map，把模块映射为 `?v=<内容哈希>` 并以 `immutable` 长缓存返回，无版本 URL 仍走协商缓存；文本资源按 `Accept-Encoding` 返回 br/gzip |
 | 图片还原 | 浏览器模块 Worker/OffscreenCanvas（不支持时回退主线程 Canvas）；`seed = seedMap[md5(id+page)]`，按漫画 ID 区间取模，纵向分片反序重排 |
 
 ## 目录结构
@@ -315,13 +316,15 @@ jm-web/
 │   ├── jm-api.js        上游 API 客户端（签名 / AES 解密 / 域名故障切换）
 │   ├── photo.js         chapter_view_template HTML 解析
 │   ├── sessions.js      会话（Cookie Jar）持久化
-│   └── settings.js      服务器设置持久化
+│   ├── settings.js      服务器设置持久化
+│   └── static-assets.js 静态资源内容哈希 ETag、import map 版本化与压缩
 ├── public/              前端（无构建，直接静态服务）
 │   ├── index.html
 │   ├── css/app.css
 │   └── js/              app.js 路由外壳 / views.js 页面 / reader.js 阅读器
 │                        user.js 用户页 / descramble*.js 图片解扰 / md5.js
 ├── data/                运行时生成（会话、设置，已被 Git/Docker 构建上下文排除）
+├── scripts/             制品校验与生产发布残留清理脚本
 ├── test/                单元/后端回归测试与静态检查（npm test / npm run check）
 ├── .env.example         Docker Compose 环境变量安全示例
 ├── .github/workflows/   GitHub Actions 多架构镜像发布
@@ -349,6 +352,13 @@ RELEASE_BUILD_STATUS=PASS npm run validate:artifact -- /path/to/release-artifact
 ```
 
 校验脚本会递归检查禁止内容、Dockerfile 的运行文件清单和生产路径；未明确传入构建成功标志不会输出 `RELEASE-MANIFEST: PASS`。生产切换仍应遵循备份、隔离候选验证、健康检查、原子更新 `current` 和保留旧版本回滚的顺序。
+
+候选验证结束后（无论成功或失败）清理发布残留：过期 Release、`incoming/` 旧制品与脚本、候选容器/镜像/数据目录。脚本默认只打印计划，确认后加 `--apply`；它不会触碰 `data/`、`shared/`、`current` 指向或被容器引用的 Release。`--prune-build-cache` 会清理 7 天前的 Docker 构建缓存（同机其他项目共享，按需开启）。
+
+```bash
+ssh <host> 'bash -s -- --root /home/shixian/project/jm-web' < scripts/prune-release-leftovers.sh
+ssh <host> 'bash -s -- --root /home/shixian/project/jm-web --apply' < scripts/prune-release-leftovers.sh
+```
 
 ## License
 

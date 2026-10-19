@@ -4,7 +4,7 @@
 
 'use strict';
 
-const CACHE_VERSION = 'jmw-shell-v17';
+const CACHE_VERSION = 'jmw-shell-v18';
 const SHELL = [
   '/',
   '/index.html',
@@ -193,23 +193,33 @@ async function navigationResponse(request) {
   }
 }
 
+// 入口 HTML 的 import map 把模块映射为 `?v=<内容哈希>`；只认这一种 query。
+function isVersionedRequest(url) {
+  const keys = [...url.searchParams.keys()];
+  return keys.length === 1 && keys[0] === 'v' && /^[A-Za-z0-9_-]{8,64}$/.test(url.searchParams.get('v'));
+}
+
 async function staticResponse(request) {
   const url = new URL(request.url);
-  // 未版本化外壳仅有 SHELL 中的固定键；不缓存任意资源或无限 query 变体。
-  const cacheable = url.origin === self.location.origin && !url.search && SHELL.includes(url.pathname);
+  const shellPath = url.origin === self.location.origin && SHELL.includes(url.pathname);
+  const versioned = shellPath && isVersionedRequest(url);
+  // 外壳仅以 SHELL 中的无 query 路径为键；版本化请求写回同一路径，
+  // 不缓存任意资源或无限 query 变体。
+  const cacheable = shellPath && (!url.search || versioned);
   const cache = cacheable ? await openShellCache() : null;
   let cached;
   if (cache) {
-    try { cached = await cache.match(request, { ignoreSearch: false }); } catch (_) {}
+    try { cached = await cache.match(url.pathname); } catch (_) {}
   }
   try {
-    // 在线时先做 ETag 协商，部署新静态文件后立即生效；断网才回退离线副本。
-    // 旧的 cache-first 会在 sw.js 本身未改动时永久返回上一版模块。
-    const response = await fetch(request, { cache: 'no-cache' });
+    // 无版本 URL 在线时先做 ETag 协商，部署新静态文件后立即生效；
+    // 版本化 URL 内容不可变，交给浏览器 HTTP 缓存（服务端 immutable），
+    // 避免每次启动都对全部模块逐个回源校验。断网时都回退离线副本。
+    const response = versioned ? await fetch(request) : await fetch(request, { cache: 'no-cache' });
     const valid = !cacheable || await isShellResponse(request.url, response);
     if (cache && valid && response.type === 'basic') {
       // 把写缓存纳入 respondWith 生命周期，不能让 worker 提前终止后台 put。
-      await cache.put(request, response.clone()).catch(() => {});
+      await cache.put(url.pathname, response.clone()).catch(() => {});
     }
     return (response.ok && valid) || !cached ? response : cached;
   } catch (_) {

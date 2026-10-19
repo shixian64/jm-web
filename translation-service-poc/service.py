@@ -28,6 +28,26 @@ except ImportError:  # pragma: no cover - direct script/module execution path
     from pipeline import PIPELINE_VERSION, PipelineStats, TranslationPipeline
 
 LOG = logging.getLogger("translation-service")
+
+
+class ProbeAccessFilter(logging.Filter):
+    """丢弃健康检查探针的访问日志。
+
+    Compose 每 15 秒探测一次 /readyz，否则访问日志几乎全是探针行，
+    真实翻译请求和错误会被挤出有限的 json-file 轮转窗口。
+    """
+
+    PROBE_PATHS = frozenset({"/healthz", "/readyz"})
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # uvicorn.access 的参数为 (client, method, path_with_query, http_version, status)。
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            return args[2].split("?", 1)[0] not in self.PROBE_PATHS
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(ProbeAccessFilter())
 KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 SAFE_META_RE = re.compile(r"^[\w.:-]{1,128}$", re.UNICODE)
 RASTER_MIMES = frozenset(
@@ -518,8 +538,8 @@ def create_app(
                 "请配置令牌，或去掉 TRANSLATION_REQUIRE_TOKEN 以空令牌禁用翻译能力。"
             )
         # 空令牌 = 翻译能力整体禁用：跳过 OCR warmup。否则禁用状态下的一次
-        # warmup 失败会让 /readyz 返回 503，经 service_healthy 阻断整站启动，
-        # 与“空 token 禁用翻译、不阻断整站”的契约冲突。
+        # warmup 失败会让 /readyz 长期返回 503、容器显示 unhealthy，
+        # 与“空 token 禁用翻译、不影响整站”的契约冲突。
         if not token_disabled and os.getenv("TRANSLATION_WARMUP", "1").lower() not in {"0", "false", "no"}:
             try:
                 await asyncio.to_thread(service_manager.warmup)

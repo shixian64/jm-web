@@ -4,20 +4,58 @@ import { api } from './api.js';
 import { h, toast, errorBox, routeErrorMessage } from './ui.js';
 import { icon } from './icons.js';
 import { homeView, searchView, categoryView, categoryListView, promoteListView, weekView, albumView } from './views.js';
-import { mountReader } from './reader.js';
-import { downloadsView } from './download-view.js';
 import { registerOfflineWorker } from './offline.js';
 import { NAV_STATE_KEY, hashRouteKey, rememberRouteEntry } from './navigation.js';
+// advanced.js 承载本地应用锁，必须在任何网络探测前就绪，因此保持静态导入。
 import {
   advancedHubView, blockedTagsView, paletteView, securityView, backupView, personasView,
   aiView, networkView, logsView, extractCodeView, cacheView, aboutView,
   prepareAdvancedRuntime, installAdvancedRuntime, isLocalAppLocked,
 } from './advanced.js';
-import {
-  userView, signinView, favoritesView, watchHistoryView, localHistoryView, myCommentsView, settingsView,
-} from './user.js';
 
 applyTheme();
+
+// 阅读器、下载管理与“我的”页面只在对应路由使用，按需加载以缩小首屏模块图。
+// import map 把它们解析到与当前入口同一版本的 `?v=<内容哈希>` URL。
+function lazyModule(loader) {
+  let pending = null;
+  return () => {
+    if (!pending) pending = loader().catch((error) => { pending = null; throw error; });
+    return pending;
+  };
+}
+const loadReader = lazyModule(() => import('./reader.js'));
+const loadDownloadView = lazyModule(() => import('./download-view.js'));
+const loadUser = lazyModule(() => import('./user.js'));
+
+// 模块加载期间路由可能已经离开；此时不得再向共享的 main 渲染旧页面。
+function lazyView(loader, mount) {
+  return async (r, m, q, ctx) => {
+    const mod = await loader();
+    if (!ctx.isActive()) return undefined;
+    return mount(mod, r, m, q, ctx);
+  };
+}
+
+function mountReaderView(mod, r, chapterId, params, options) {
+  const inst = mod.mountReader(r, chapterId, params, options);
+  return () => inst && inst.destroy();
+}
+
+// 首屏完成后在空闲时预取阅读器（只下载解析、不执行），从详情页进入阅读不再多等一跳。
+function preloadReaderModules() {
+  const resolve = typeof import.meta.resolve === 'function' ? import.meta.resolve.bind(import.meta) : null;
+  if (!resolve) return;
+  const run = () => {
+    for (const specifier of ['./reader.js', './reader-settings.js']) {
+      try {
+        document.head.append(h('link', { rel: 'modulepreload', href: resolve(specifier) }));
+      } catch (_) {}
+    }
+  };
+  if (typeof requestIdleCallback === 'function') requestIdleCallback(run, { timeout: 5000 });
+  else setTimeout(run, 2000);
+}
 
 const app = document.getElementById('app');
 const main = h('main', { id: 'main', tabindex: '-1' });
@@ -75,26 +113,22 @@ const routes = [
   { re: /^\/category\/?$/, view: (r, _m, _q, ctx) => categoryView(r, ctx) },
   { re: /^\/week\/?$/, view: (r, _m, q, ctx) => weekView(r, q, ctx) },
   { re: /^\/album\/(\d+)\/?$/, view: (r, m, _q, ctx) => albumView(r, m[1], ctx) },
-  { re: /^\/downloads\/?$/, view: (r) => downloadsView(r) },
-  { re: /^\/offline\/(\d+)\/(\d+)\/?$/, view: (r, m, q) => {
+  { re: /^\/downloads\/?$/, view: lazyView(loadDownloadView, (mod, r) => mod.downloadsView(r)) },
+  { re: /^\/offline\/(\d+)\/(\d+)\/?$/, view: lazyView(loadReader, (mod, r, m, q) => {
     const params = new URLSearchParams(q);
     params.set('aid', m[1]);
-    const inst = mountReader(r, m[2], params, { offline: true });
-    return () => inst && inst.destroy();
-  } },
+    return mountReaderView(mod, r, m[2], params, { offline: true });
+  }) },
   {
     re: /^\/read\/(\d+)\/?$/,
-    view: (r, m, q) => {
-      const inst = mountReader(r, m[1], q);
-      return () => inst && inst.destroy();
-    },
+    view: lazyView(loadReader, (mod, r, m, q) => mountReaderView(mod, r, m[1], q)),
   },
-  { re: /^\/user\/?$/, view: (r, _m, _q, ctx) => userView(r, ctx) },
-  { re: /^\/signin\/?$/, view: (r, _m, _q, ctx) => signinView(r, ctx) },
-  { re: /^\/favorites\/?$/, view: (r, _m, q, ctx) => favoritesView(r, q, ctx) },
-  { re: /^\/watch-history\/?$/, view: (r, _m, _q, ctx) => watchHistoryView(r, ctx) },
-  { re: /^\/local-history\/?$/, view: (r, _m, _q, ctx) => localHistoryView(r, ctx) },
-  { re: /^\/my-comments\/?$/, view: (r, _m, q, ctx) => myCommentsView(r, q, ctx) },
+  { re: /^\/user\/?$/, view: lazyView(loadUser, (mod, r, _m, _q, ctx) => mod.userView(r, ctx)) },
+  { re: /^\/signin\/?$/, view: lazyView(loadUser, (mod, r, _m, _q, ctx) => mod.signinView(r, ctx)) },
+  { re: /^\/favorites\/?$/, view: lazyView(loadUser, (mod, r, _m, q, ctx) => mod.favoritesView(r, q, ctx)) },
+  { re: /^\/watch-history\/?$/, view: lazyView(loadUser, (mod, r, _m, _q, ctx) => mod.watchHistoryView(r, ctx)) },
+  { re: /^\/local-history\/?$/, view: lazyView(loadUser, (mod, r, _m, _q, ctx) => mod.localHistoryView(r, ctx)) },
+  { re: /^\/my-comments\/?$/, view: lazyView(loadUser, (mod, r, _m, q, ctx) => mod.myCommentsView(r, q, ctx)) },
   { re: /^\/advanced\/?$/, view: (r) => advancedHubView(r) },
   { re: /^\/blocked-tags\/?$/, view: (r) => blockedTagsView(r) },
   { re: /^\/palette\/?$/, view: (r) => paletteView(r) },
@@ -107,7 +141,7 @@ const routes = [
   { re: /^\/extract\/?$/, view: (r) => extractCodeView(r) },
   { re: /^\/cache\/?$/, view: (r) => cacheView(r) },
   { re: /^\/about\/?$/, view: (r, m, q, ctx) => aboutView(r, m, q, ctx) },
-  { re: /^\/settings\/?$/, view: (r, _m, _q, ctx) => settingsView(r, ctx) },
+  { re: /^\/settings\/?$/, view: lazyView(loadUser, (mod, r, _m, _q, ctx) => mod.settingsView(r, ctx)) },
 ];
 
 let currentCleanup = null;
@@ -401,6 +435,7 @@ function startApplication() {
   refreshAvatar();
   installAdvancedRuntime();
   registerOfflineWorker().catch((error) => console.warn('[offline] Service Worker 注册失败:', error.message));
+  preloadReaderModules();
 }
 
 async function boot() {

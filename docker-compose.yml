@@ -74,9 +74,13 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # 翻译是可选能力：只要求先创建/启动，不等待 healthy，也不因翻译容器
+    # 构建、OCR 初始化失败而阻断主站（主站代理在不可用时返回 503 并回退原图）。
+    # required: false 需要 Docker Compose v2.20+。
     depends_on:
       translation-service:
-        condition: service_healthy
+        condition: service_started
+        required: false
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m
     logging:

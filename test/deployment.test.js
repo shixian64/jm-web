@@ -188,7 +188,7 @@ try {
   }
   for (const dir of ['lib', 'public']) fs.cpSync(path.join(root, dir), path.join(artifact, dir), { recursive: true });
   fs.mkdirSync(path.join(artifact, 'translation-service-poc'));
-  for (const item of ['.dockerignore', 'Dockerfile', 'requirements.txt', 'pipeline.py', 'service.py']) {
+  for (const item of ['.dockerignore', 'Dockerfile', 'requirements.txt', 'constraints.txt', 'pipeline.py', 'service.py']) {
     fs.copyFileSync(path.join(root, 'translation-service-poc', item), path.join(artifact, 'translation-service-poc', item));
   }
   const output = runValidator(artifact);

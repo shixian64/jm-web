@@ -160,7 +160,7 @@ function collectModuleDependencies(entry) {
 }
 
 function verifyShellInventory(shell) {
-  assert.match(workerSource, /const CACHE_VERSION = 'jmw-shell-v17'/, '外壳及下载恢复变更必须升级缓存版本');
+  assert.match(workerSource, /const CACHE_VERSION = 'jmw-shell-v18'/, '外壳/版本化模块策略变更必须升级缓存版本');
   const shellSet = new Set(shell);
   assert.strictEqual(shellSet.size, shell.length, 'SHELL 不得包含重复缓存键');
   assert(shellSet.has('/js/navigation.js'), 'SHELL 必须包含 app.js 的 navigation.js 依赖');
@@ -338,6 +338,31 @@ function verifyShellInventory(shell) {
     await staticCacheHarness.staticRequest(`/not-shell-${index}.js`);
   }
   assert.strictEqual(boundedCache.entries.size, 1, '随机路径和 query 不得无限扩张离线外壳缓存');
+
+  // import map 版本化模块：不强制 no-cache 回源（交给 immutable HTTP 缓存），
+  // 成功响应写回同一路径的外壳键，断网时按路径回退。
+  const versionedInits = [];
+  const versionedHarness = createWorkerHarness(async (request, init) => {
+    versionedInits.push(init);
+    return shellResponse(request, 'versioned');
+  });
+  const versionedCache = await versionedHarness.cacheStorage.open(versionedHarness.cacheVersion);
+  const versionedResponse = await versionedHarness.staticRequest('/js/api.js?v=AbCdEf123456_-xy');
+  assert.strictEqual(await versionedResponse.text(), 'versioned:https://jm-web.test/js/api.js?v=AbCdEf123456_-xy');
+  assert.strictEqual(versionedInits[0], undefined, '版本化模块不得附加 cache: no-cache');
+  assert.strictEqual(await (await versionedCache.match('/js/api.js')).text(),
+    'versioned:https://jm-web.test/js/api.js?v=AbCdEf123456_-xy', '版本化模块应写回无 query 外壳键');
+  assert.strictEqual(versionedCache.entries.size, 1, '版本化请求不得新增 query 缓存键');
+  await versionedHarness.staticRequest('/js/api.js');
+  assert.strictEqual(versionedInits[1] && versionedInits[1].cache, 'no-cache', '无版本 URL 仍需 ETag 协商');
+  versionedHarness.setFetch(async () => { throw new TypeError('offline'); });
+  const versionedOffline = await versionedHarness.staticRequest('/js/api.js?v=ZZZZZZZZZZZZ');
+  assert.match(await versionedOffline.text(), /^versioned:/, '断网时版本化模块按路径回退离线副本');
+  for (const search of ['?v=short', '?v=AbCdEf123456&x=1', '?x=AbCdEf123456']) {
+    versionedHarness.setFetch((request) => shellResponse(request, 'other'));
+    await versionedHarness.staticRequest(`/js/store.js${search}`);
+  }
+  assert.ok(!(await versionedCache.match('/js/store.js')), '非版本化 query 不得写入外壳缓存');
 
   // 同版本缓存刷新期间若目标 put 失败，不得留下新旧模块混合；
   // 让目标缓存只在第二个键写入时失败，验证事务性回滚。

@@ -18,7 +18,9 @@ assert.doesNotMatch(translation, /^\s+ports:/m, '不得向宿主机公开翻译�
 for (const key of ['read_only', 'cpus', 'mem_limit', 'pids_limit', 'healthcheck']) {
   assert.match(translation, new RegExp(`^    ${key}:`, 'm'), `翻译容器必须配置 ${key}`);
 }
-assert.match(web, /depends_on:\s+translation-service:\s+condition: service_healthy/);
+assert.match(web, /depends_on:\s+translation-service:\s+condition: service_started\s+required: false/,
+  '翻译为可选能力，翻译容器不健康或启动失败不得阻断主站');
+assert.doesNotMatch(web, /condition: service_healthy/, '主站不得等待翻译容器 healthy');
 assert.match(web, /TRANSLATION_SERVICE_URL: "\$\{TRANSLATION_SERVICE_URL-http:\/\/translation-service:8091\}"/,
   '必须默认使用服务名连接，并允许显式空值关闭翻译');
 assert.equal((compose.match(/TRANSLATION_SERVICE_TOKEN: "\$\{TRANSLATION_SERVICE_TOKEN:-\}"/g) || []).length, 2,
@@ -30,10 +32,27 @@ assert.match(workflow, /component: translation/);
 assert.match(workflow, /suffix: "-translation"/);
 assert.match(workflow, /Build translation test image/);
 assert.match(workflow, /linux\/amd64,linux\/arm64/);
-for (const name of ['Dockerfile', '.dockerignore', 'requirements.txt', 'pipeline.py', 'service.py']) {
+for (const name of ['Dockerfile', '.dockerignore', 'requirements.txt', 'constraints.txt', 'pipeline.py', 'service.py']) {
   assert.ok(fs.statSync(path.join(root, 'translation-service-poc', name)).isFile(), `缺少翻译运行文件 ${name}`);
 }
 assert.match(read('translation-service-poc/Dockerfile'), /^USER appuser$/m);
+// Python 依赖与基础镜像必须可复现：直接依赖都在 constraints.txt 中锁定到精确版本。
+const translationDockerfile = read('translation-service-poc/Dockerfile');
+assert.match(translationDockerfile, /-r requirements\.txt -c constraints\.txt/, '安装必须使用锁定约束');
+assert.match(translationDockerfile, /^ARG PYTHON_IMAGE=python:\d+\.\d+\.\d+-slim-[a-z]+$/m, '基础镜像必须固定补丁版本');
+const normalizeName = (name) => name.toLowerCase().replace(/[-_.]+/g, '-');
+const pinned = new Map(read('translation-service-poc/constraints.txt').split('\n')
+  .map((line) => line.trim()).filter((line) => line && !line.startsWith('#'))
+  .map((line) => {
+    const match = line.match(/^([A-Za-z0-9_.-]+)==([^\s;]+)$/);
+    assert.ok(match, `constraints.txt 只能包含精确版本：${line}`);
+    return [normalizeName(match[1]), match[2]];
+  }));
+for (const line of read('translation-service-poc/requirements.txt').split('\n')) {
+  const name = (line.trim().match(/^([A-Za-z0-9_.-]+)/) || [])[1];
+  if (!name || line.trim().startsWith('#')) continue;
+  assert.ok(pinned.has(normalizeName(name)), `直接依赖 ${name} 必须在 constraints.txt 中锁定`);
+}
 assert.match(read('.env.example'), /^TRANSLATION_SERVICE_URL=http:\/\/translation-service:8091$/m);
 assert.match(translation, /TRANSLATION_MAX_UPLOAD_WAITERS: "\$\{TRANSLATION_MAX_UPLOAD_WAITERS:-16\}"/,
   'Compose 必须传递翻译上传等待队列上限');

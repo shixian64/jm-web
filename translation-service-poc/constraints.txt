@@ -1,0 +1,38 @@
+# 翻译服务完整依赖锁定（含传递依赖），由 Dockerfile 以 `-c constraints.txt` 约束安装。
+# requirements.txt 只声明直接依赖的兼容范围；这里固定实际安装版本，避免每次重建
+# 解析到不同的 opencv/onnxruntime/numpy 组合。
+#
+# 版本来源：2026-10-19 生产容器 jm-translation（Release 20261011T032414Z-2928523bc0cd）
+# 的 `pip freeze`，即已经通过生产验收的组合。升级时在候选容器中验证后整体更新：
+#   docker exec <candidate> pip freeze > translation-service-poc/constraints.txt
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.0
+click==8.5.0
+fastapi==0.141.1
+flatbuffers==25.12.19
+h11==0.16.0
+httptools==0.8.0
+idna==3.19
+numpy==2.5.2
+onnxruntime==1.29.0
+opencc-python-reimplemented==0.1.7
+opencv-python==4.14.0.94
+packaging==26.3
+pillow==12.3.0
+protobuf==7.36.1
+pyclipper==1.4.0
+pydantic==2.13.5
+pydantic_core==2.46.5
+python-dotenv==1.2.3
+PyYAML==6.0.3
+rapidocr-onnxruntime==1.2.3
+shapely==2.1.2
+six==1.17.0
+starlette==1.6.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+uvicorn==0.52.4
+uvloop==0.22.1
+watchfiles==1.2.0
+websockets==17.1

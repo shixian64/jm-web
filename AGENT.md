@@ -53,6 +53,7 @@ jm-web/
 │   ├── features.js           DoH、AI、搜索、更新检查和运行日志
 │   ├── chapter-ai.js         章节视觉分析：容量有界的队列/记录、合并写盘与任务预算
 │   ├── translation-proxy.js  /api/translation/page 代理：准入先于上传、整体截止时间
+│   ├── static-assets.js      静态资源内容哈希 ETag、入口 import map 版本化、br/gzip 压缩
 │   └── origin-guard.js       非幂等 API 集中同源校验与可信代理解析（clientIp/Secure）
 ├── public/
 │   ├── index.html            应用入口
@@ -78,6 +79,7 @@ jm-web/
 │       ├── descramble-core.js 浏览器端图片解扰共享算法
 │       ├── descramble-worker.js 模块 Worker / OffscreenCanvas 解扰
 │       └── descramble.js     Worker 调度与主线程兼容回退
+├── scripts/                  制品校验、生产发布残留清理（默认 dry-run）
 ├── test/                     单元、后端、安全、移动端和部署回归
 ├── translation-service-poc/  Python OCR/繁简转换服务、Dockerfile 与独立测试
 ├── data/                     运行状态；不进入 Git 或普通发布制品
@@ -117,7 +119,8 @@ jm-web/
 
 ### 4.4 离线能力
 
-- Service Worker 只负责应用静态外壳，不缓存登录 API 或图片代理响应。仅缓存 SHELL 清单的无查询静态键；预缓存与在线更新校验响应 MIME、最终 URL 和入口 HTML 标记，拒绝 HTTP 200 错误页。并发预缓存合并为一轮，响应校验失败不覆盖旧外壳。
+- 静态资源 ETag 取自内容哈希（发布制品 mtime 统一为 0，不能再用 size/mtime）。`server.js` 为入口 HTML 注入 import map，把 `/js/*.js` 映射为 `?v=<内容哈希>`，CSS 链接同样版本化；只有 `?v=` 与当前内容一致时返回 `immutable` 长缓存，版本不匹配按协商缓存返回当前内容。入口 `app.js` 保持无版本 URL，兼容旧 Service Worker 的入口校验。内联 import map 由 CSP 内容哈希放行。
+- Service Worker 只负责应用静态外壳，不缓存登录 API 或图片代理响应。版本化模块请求不附加 `no-cache`（交给 immutable HTTP 缓存），成功后写回同路径的无 query 外壳键，断网按路径回退；其他 query 变体一律不缓存。仅缓存 SHELL 清单的无查询静态键；预缓存与在线更新校验响应 MIME、最终 URL 和入口 HTML 标记，拒绝 HTTP 200 错误页。并发预缓存合并为一轮，响应校验失败不覆盖旧外壳。
 - 收藏与详情另有仅当前标签页内存保存的返回导航缓存（最多 48 项、序列化估算总计 8 MiB、单项 4 MiB）。收藏完整分页快照最多保留 30 分钟，超过 2 分钟时后台顺序重验证已加载分页并原子替换；详情新鲜窗口 60 秒、最长 10 分钟。更新只提示用户点击应用，不重排活动列表；下拉刷新绕过收藏快照并重取收藏夹元数据。
 - 收藏筛选状态按 history entry 保存，返回时同步恢复已加载分页后再由路由恢复滚动。认证/数据源/API Host 变更与收藏操作统一在 API 层失效，跨标签仅通过 localStorage 广播失效元数据、不持久化业务缓存；旧世代或全部消费者取消的请求不得回填。重验证失败保留旧快照，401 必须移除旧账号内容。
 - 收藏快捷入口显式选择 `o=mp&folder=0`；普通入口读取 `jmw_setting` 中的 `favoriteOrder` / `favoriteFolder` UI 偏好并原地规范化 URL。认证失效、登录/退出和数据源变更重置分组，排序可保留；不将收藏分页或筛选业务快照持久化。
@@ -153,7 +156,9 @@ test/backend.test.js 或 test/deployment.test.js
 ```
 
 当前图片相关默认保护为：单章节最多 2000 张、单文件 25 MiB、全局代理并发 12、
-单客户端代理并发 6；封面进程内缓存总计 64 MiB、单项 2 MiB、TTL 24 小时，
+单客户端代理并发 6；单张图片最多尝试 4 条线路，同一资源被 2 条线路明确拒绝（4xx、
+非图片 MIME、超限、安全拒绝）即停止换线并负缓存 5 分钟（瞬时故障不负缓存，留给前端重试与线路熔断）；
+`/api/chapter` 解析结果按数据源/章节/分流共享缓存 10 分钟并 single-flight，失败不缓存；封面进程内缓存总计 64 MiB、单项 2 MiB、TTL 24 小时，
 图片等待队列最多 96 项、单项排队 3 秒。chapter-ai 状态默认上限为队列 1000 条、
 记录 5000 条、热度 2000 条、状态文件 8 MiB；单任务预算为 60 页、累计 24 MiB 编码
 图片、单图 40M 像素、10 分钟完整截止期限（含元数据读取）与 4 MiB 模型响应体；未配置 AI Key 时章节分析
@@ -182,11 +187,12 @@ chapter-ai 每个已接受任务预留 4 KiB 队列/运行/重试记录空间，
 - 手机布局使用 `100dvh`、safe-area 和可滚动模态；至少回归竖屏、横屏和 PWA 模式。
 - 图片加载要控制并发和生命周期；离开首页后不能继续用大量封面占用阅读器图片通道。
 - 阅读器首图属于关键路径，标题、封面和章节抽屉等非关键元数据不得无条件阻塞首图。
-- Service Worker 在线策略目前优先获取新文件以避免永久旧缓存；未建立内容哈希和升级协议前，不要单独改成永久 cache-first。
+- Service Worker 对无版本 URL 仍在线优先协商；只有 import map 生成的内容哈希 URL 才可依赖长缓存。不要对无版本 URL 改成 cache-first，也不要绕过 `lib/static-assets.js` 手写版本号。
+- `app.js` 只静态导入首屏与应用锁所需模块（`advanced.js` 承载本地锁，必须静态导入）；阅读器、下载管理、用户页经 `lazyView` 按路由懒加载，加载完成时路由已离开则不得渲染。新增懒加载模块必须保持无顶层副作用，并仍列入 SW `SHELL`。
 
 ## 7. 持久化状态与秘密
 
-翻译生成结果单独保存到 Compose 命名卷 `translation-cache`（容器内 `/app/cache`），不覆盖原图或主站 `data/`。普通停止、重启、`down` 不删除缓存；不要用 `down -v` 进行升级。两个服务共享根 `.env` 的 `TRANSLATION_SERVICE_TOKEN`，翻译端口不发布到宿主机。`TRANSLATION_SERVICE_TOKEN` 为空时双方一致禁用翻译能力并明确提示（主站 `/api/config` 报告不可用、代理返回 503；翻译容器 `/v1/*` 返回 503 disabled），`/readyz` 不因此失败、不阻断整站启动；严格部署可用 `TRANSLATION_REQUIRE_TOKEN=1` 让翻译容器拒绝启动。主站翻译代理在读取上传体之前获取全局/单客户端槽位（等待有界），整体截止时间覆盖上传到结果回传全程。翻译接口与结果下载都禁止自动跟随重定向。翻译容器活跃上传默认最多 8 个、等待最多 16 个（`TRANSLATION_MAX_UPLOAD_WAITERS`），最多等待 5 秒；等待数或等待时间为 0 时不排队，满队列返回 429。
+翻译生成结果单独保存到 Compose 命名卷 `translation-cache`（容器内 `/app/cache`），不覆盖原图或主站 `data/`。普通停止、重启、`down` 不删除缓存；不要用 `down -v` 进行升级。两个服务共享根 `.env` 的 `TRANSLATION_SERVICE_TOKEN`，翻译端口不发布到宿主机。`TRANSLATION_SERVICE_TOKEN` 为空时双方一致禁用翻译能力并明确提示（主站 `/api/config` 报告不可用、代理返回 503；翻译容器 `/v1/*` 返回 503 disabled），`/readyz` 不因此失败、不阻断整站启动；主站 `depends_on` 只要求翻译容器 `service_started` 且 `required: false`（Compose v2.20+），翻译容器构建失败或 unhealthy 不得阻断主站；严格部署可用 `TRANSLATION_REQUIRE_TOKEN=1` 让翻译容器拒绝启动。主站翻译代理在读取上传体之前获取全局/单客户端槽位（等待有界），整体截止时间覆盖上传到结果回传全程。翻译接口与结果下载都禁止自动跟随重定向。翻译容器活跃上传默认最多 8 个、等待最多 16 个（`TRANSLATION_MAX_UPLOAD_WAITERS`），最多等待 5 秒；等待数或等待时间为 0 时不排队，满队列返回 429。
 
 容器内状态目录：
 
@@ -268,6 +274,9 @@ docker compose --project-name jm-web \
 6. **制品**：白名单打包，记录 Release ID、Git SHA、制品 SHA；排除 Git、测试数据、生产环境和凭据。
 7. **候选验证**：使用隔离容器和隔离数据目录，不挂载生产 Session。
 8. **原子部署**：候选 healthy 后再切换 `current`，使用已经核验的镜像重建生产容器。
+   候选验证结束后（成功或失败）都要清理候选容器、镜像与数据目录：先以 dry-run 运行
+   `scripts/prune-release-leftovers.sh --root <生产根目录>` 核对计划，再加 `--apply`；
+   它只删除过期 Release、`incoming/` 旧条目和候选残留，不触碰 `data/`、`shared/` 与 `current`。
 9. **生产验收**：分别验证笔记本直连、入口代理和公网域名。
 10. **失败回滚**：恢复原 `current` 和旧镜像；不得覆盖或回滚生产数据，除非有独立的数据恢复方案。
 
@@ -288,7 +297,7 @@ docker compose --project-name jm-web \
 
 ### 网络受限时的只读源码发布（备用）
 
-- 仅在 Node 锁文件、Python requirements 与运行时兼容性均未变化时使用；依赖或基础系统需要升级时仍须部署新镜像，不能用此方式绕过。
+- 仅在 Node 锁文件、Python requirements/constraints 与运行时兼容性均未变化时使用；依赖或基础系统需要升级时仍须部署新镜像，不能用此方式绕过。
 - 固定已经运行验证过的镜像 ID，将新不可变 Release 的 `server.js`、`lib/`、`public/`、包清单及 Python `service.py` / `pipeline.py` 以只读 bind mount 覆盖对应运行路径；生产数据和翻译缓存挂载保持不变。
 - Dockerfile 的启动参数变化必须在 Compose `command` 中完整复现。候选使用独立数据、缓存和合成凭据，验证真实图片编解码、OCR/翻译、业务接口与全部运行源文件/静态资产哈希后才能切换。
 - 此方式下镜像的旧标签或 OCI revision **不代表当前运行代码版本**；使用 `com.jmw.release.revision` / `com.jmw.release.id` / `com.jmw.release.method` 记录 Release，并以只读挂载来源和运行文件哈希确认代码。
@@ -313,6 +322,7 @@ server.js
 translation-service-poc/.dockerignore
 translation-service-poc/Dockerfile
 translation-service-poc/requirements.txt
+translation-service-poc/constraints.txt
 translation-service-poc/pipeline.py
 translation-service-poc/service.py
 ```
@@ -384,7 +394,7 @@ docker compose --env-file .env.example \
 
 - 阅读器已先渲染已就绪的章节图片、详情元数据（标题/封面/章节抽屉）由并行请求后台补齐，慢详情不再阻塞首图；该行为有测试锁定，修改启动顺序前先复现回归。
 - 首页一次创建大量卡片；封面现由 IntersectionObserver、有界图片队列和后端缓存共同控制，仍需持续观察低端移动设备的首屏加载水位。
-- `app.js` 静态导入阅读器、下载、高级和用户模块，首屏模块图偏大；路由级动态导入需单独设计应用锁和 SW 升级兼容。
+- 首屏模块图已由 22 个模块（576 KB）降到 13 个（约 300 KB，br 约 78 KB）；`advanced.js`（含应用锁）仍静态导入，拆分应用锁需单独设计。
 - 长章节滚动定位会遍历页面槽位；预取应只在页码实际变化时触发。
 - 超过单张 Canvas 上限的超长条漫当前会保护性拒绝，尚未实现分块重排和分块展示。
 - 下载队列启动会恢复 `queued` 调度，获取章节锁后重读 IndexedDB 防止重跑/复活其他标签已完成或删除的任务；worker 全部停止后才释放锁。已有隔离运行态回归，真实浏览器冻结/解冻和不支持 Web Locks 的降级协调仍待验证。
@@ -392,7 +402,7 @@ docker compose --env-file .env.example \
 ### 后端与安全
 
 - API Host 缺少完善的跨请求熔断/成功线路提升，坏首线路可能让每个请求重复等待。
-- 图片路径代理已对超时/DNS/429/5xx 做短期负缓存，对相同封面启用 single-flight，并已实现跨请求指数退避熔断、EWMA 延迟/失败打分与半开探测；仍缺的是熔断与命中率的指标观测。
+- 图片路径代理已对超时/DNS/429/5xx 做短期负缓存，对相同封面启用 single-flight，并已实现跨请求指数退避熔断、EWMA 延迟/失败打分与半开探测；每 5 分钟输出 `[image-stats]` 汇总（命中率、负缓存命中、上游 p50/p90/p99、错误分类、熔断线路数）。
 - 普通上游 API 缺少统一并发准入；图片、AI 和搜索已有独立上限。
 - `ACCESS_PASSWORD` 同时授予实例运维能力；若向非互信用户开放，需要独立管理员认证和 AI 配额，而不是只分享访问口令。
 - `/healthz` 不是 readiness；生产数据不可写或上游全挂时仍可能显示 healthy。
@@ -402,7 +412,7 @@ docker compose --env-file .env.example \
 - 生产 `data/` 是唯一状态，必须建立加密备份、保留策略和恢复演练。
 - 入口 Caddy 配置在另一台主机，尚未成为本仓库可复放的部署声明；排障时要单独保留入口证据。
 - 图片成功请求和入口链路可观测性不足；漫画慢不能只看应用 CPU/内存，应分段测 DNS、connect、TLS、TTFB、total 和连接复用。
-- 静态资源尚无内容哈希和长期 immutable 缓存，不能只在 Cloudflare 上强行缓存未版本化模块。
+- 静态资源已按内容哈希版本化（import map + `?v=`）并对版本化 URL 返回 immutable；仍不能在 Cloudflare 上强行缓存未版本化模块或入口 HTML。
 
 ## 12. 明确禁止的操作
 

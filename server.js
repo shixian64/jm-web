@@ -44,6 +44,10 @@ const settings = require('./lib/settings');
 const features = require('./lib/features');
 const { ChapterAiScheduler, chapterSourceTitle, effectiveChapterTitle } = require('./lib/chapter-ai');
 const { createTranslationProxy } = require('./lib/translation-proxy');
+const {
+  createStaticAssets, etagMatches, preferredEncoding, isVersionedAssetPath,
+  COMPRESSIBLE_EXTS, IMMUTABLE_CACHE_CONTROL,
+} = require('./lib/static-assets');
 
 const configuredPort = Number(process.env.PORT || 3210);
 const portIsValid = Number.isInteger(configuredPort) && configuredPort >= 1 && configuredPort <= 65535;
@@ -54,6 +58,7 @@ if (process.env.PORT && !portIsValid) {
 // 直接运行默认只监听回环；容器内需要端口发布时由镜像显式设置 0.0.0.0。
 const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const staticAssets = createStaticAssets({ publicDir: PUBLIC_DIR });
 const ACCESS_PASSWORD = process.env.ACCESS_PASSWORD || '';
 const SESSION_COOKIE_MAX_AGE = (() => {
   const fallback = 365 * 24 * 3600;
@@ -106,6 +111,17 @@ const IMAGE_QUEUE_TIMEOUT = Math.min(
 );
 const IMAGE_DRAIN_TIMEOUT = 15000;
 const IMAGE_PATH_TOTAL_TIMEOUT = 30000;
+// 单张图片最多尝试的线路数与“资源本身被拒绝”的停止阈值。生产 7 天日志里
+// 成功请求最多换线 3 次（第 4 条线路），换线 6 次以上的请求全部失败，
+// 却各自占用图片槽位 11-14 秒。
+const MAX_IMAGE_HOST_ATTEMPTS = 4;
+const IMAGE_DEFINITIVE_FAILURE_LIMIT = 2;
+// 被线路明确拒绝（4xx、非图片 MIME、超限、安全拒绝）的资源短期负缓存；
+// 前端重试和多标签页在 TTL 内直接得到同一失败，不再逐线回源。
+// 超时/5xx 等瞬时故障不进入该缓存，由线路熔断处理，避免让前端重试失效。
+const IMAGE_FAILURE_CACHE_TTL_MS = 5 * 60 * 1000;
+const IMAGE_FAILURE_CACHE_LIMIT = 2000;
+const CACHEABLE_IMAGE_FAILURES = new Set(['upstream_http', 'mime', 'too_large', 'security']);
 const TRANSLATION_SERVICE_URL = String(process.env.TRANSLATION_SERVICE_URL || '').trim().replace(/\/+$/, '');
 const TRANSLATION_SERVICE_TOKEN = String(process.env.TRANSLATION_SERVICE_TOKEN || '');
 const TRANSLATION_MAX_PAGE_BYTES = Math.min(
@@ -313,6 +329,12 @@ const CSP = [
   "form-action 'self'",
 ].join('; ');
 
+// 入口 HTML 内联的 import map 也受 script-src 约束，只按内容哈希放行。
+function cspWithScriptHashes(hashes) {
+  if (!Array.isArray(hashes) || !hashes.length) return CSP;
+  return CSP.replace("script-src 'self'", `script-src 'self' ${hashes.join(' ')}`);
+}
+
 /* ----------------------------- 工具函数 ----------------------------- */
 
 function baseHeaders(extra) {
@@ -334,6 +356,7 @@ function sendJson(res, status, obj, extraHeaders = {}) {
 const publicApiCache = new Map();
 const publicApiFlights = new Map();
 const PUBLIC_API_CACHE_LIMIT = 256;
+const CHAPTER_CACHE_TTL_MS = 10 * 60 * 1000;
 
 async function cachedPublicApi(key, ttlMs, loader) {
   const cacheKey = String(key || '');
@@ -840,6 +863,42 @@ function imageCacheStats() {
     maxBytes: MAX_IMAGE_CACHE_BYTES,
     maxEntryBytes: MAX_IMAGE_CACHE_ENTRY_BYTES,
   };
+}
+
+const imageFailureCache = new Map();
+
+// 键只取图片来源（path 或 u），忽略前端的 _jmw_retry 等重试参数。
+function imageFailureKey(abs, upath) {
+  if (abs) return `u:${abs}`;
+  if (!upath) return '';
+  return `p:${upath.startsWith('/') ? upath : '/' + upath}`;
+}
+
+function getImageFailure(key, now = Date.now()) {
+  if (!key) return null;
+  const hit = imageFailureCache.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt <= now) {
+    imageFailureCache.delete(key);
+    return null;
+  }
+  return hit;
+}
+
+function rememberImageFailure(key, status, message, type, now = Date.now()) {
+  if (!key || !CACHEABLE_IMAGE_FAILURES.has(type)) return false;
+  imageFailureCache.delete(key);
+  imageFailureCache.set(key, {
+    status, message, type, expiresAt: now + IMAGE_FAILURE_CACHE_TTL_MS,
+  });
+  while (imageFailureCache.size > IMAGE_FAILURE_CACHE_LIMIT) {
+    imageFailureCache.delete(imageFailureCache.keys().next().value);
+  }
+  return true;
+}
+
+function clearImageFailureCache() {
+  imageFailureCache.clear();
 }
 
 /** 从请求入口开始监听客户端断开，便于取消 DNS、fetch 和响应体读取。 */
@@ -1453,6 +1512,7 @@ async function proxyImage(res, urlStr, cacheDays = 7, clientSignal) {
     }
   }
   const trace = imageTrace(res);
+  const failureKey = imageFailureKey(urlStr, '');
   const deadline = Date.now() + IMAGE_PATH_TOTAL_TIMEOUT;
   let attempts = 0;
   let lastError = null;
@@ -1460,6 +1520,7 @@ async function proxyImage(res, urlStr, cacheDays = 7, clientSignal) {
   try {
     for (const target of imageUrlCandidates(urlStr)) {
       if ((clientSignal && clientSignal.aborted) || res.destroyed) return;
+      if (attempts >= MAX_IMAGE_HOST_ATTEMPTS) break;
       const host = target.origin;
       if (!reserveImageHost(host)) continue;
       const remaining = deadline - Date.now();
@@ -1489,7 +1550,9 @@ async function proxyImage(res, urlStr, cacheDays = 7, clientSignal) {
             continue;
           }
           markImageHostHealthy(host);
-          return sendJson(res, 502, { error: `图片获取失败（HTTP ${response.status}）` });
+          const message = `图片获取失败（HTTP ${response.status}）`;
+          rememberImageFailure(failureKey, 502, message, trace?.error_type);
+          return sendJson(res, 502, { error: message });
         }
         if (trace) trace.error_type = '';
         await sendUpstreamImage(
@@ -1515,7 +1578,9 @@ async function proxyImage(res, urlStr, cacheDays = 7, clientSignal) {
           continue;
         }
         markImageHostHealthy(host);
-        return sendJson(res, lastStatus, { error: publicErrorMessage(error, '图片获取失败') });
+        const message = publicErrorMessage(error, '图片获取失败');
+        rememberImageFailure(failureKey, lastStatus, message, trace?.error_type);
+        return sendJson(res, lastStatus, { error: message });
       } finally {
         noteImageHostResult(host, Date.now() - attemptStarted, hostHealthy);
         if (fetched) fetched.cleanup();
@@ -1568,8 +1633,13 @@ async function proxyImagePath(res, p, clientSignal) {
     let lastError = '所有图片域名均无法获取该资源';
     let lastStatus = 502;
     let attempts = 0;
+    // 网络/5xx 是线路问题，换线有意义；4xx、非图片 MIME 等说明资源本身
+    // 被拒绝，多条线路一致时继续遍历全部线路只会延长失败并占用槽位。
+    let definitiveFailures = 0;
+    const failureKey = imageFailureKey('', p);
     for (const host of hosts) {
       if (clientSignal && clientSignal.aborted) return;
+      if (attempts >= MAX_IMAGE_HOST_ATTEMPTS || definitiveFailures >= IMAGE_DEFINITIVE_FAILURE_LIMIT) break;
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
         lastError = '图片获取总时间已超限';
@@ -1592,7 +1662,10 @@ async function proxyImagePath(res, p, clientSignal) {
           await cancelBody(response);
           noteImageFailure(res, response.status);
           if (isTransientImageFailure(response.status)) markImageHostFailed(host, response.status);
-          else markImageHostHealthy(host);
+          else {
+            markImageHostHealthy(host);
+            definitiveFailures++;
+          }
           continue;
         }
         if (trace) trace.error_type = '';
@@ -1624,7 +1697,10 @@ async function proxyImagePath(res, p, clientSignal) {
         // 网络、超时、上游 5xx/429 才进入短负缓存；MIME/重定向安全拒绝
         // 不污染域名健康状态，避免误伤其他正常资源。
         if (isTransientImageFailure(e)) markImageHostFailed(host, e);
-        else markImageHostHealthy(host);
+        else {
+          markImageHostHealthy(host);
+          definitiveFailures++;
+        }
         /* 尝试下一个域名 */
       } finally {
         noteImageHostResult(host, Date.now() - attemptStarted, hostHealthy);
@@ -1639,6 +1715,11 @@ async function proxyImagePath(res, p, clientSignal) {
     const publicLastError = lastStatus >= 500
       ? '图片获取失败'
       : (typeof lastError === 'string' ? lastError : '图片获取失败');
+    // 只有每次实际尝试都被明确拒绝（或达到一致拒绝阈值）才短期负缓存；
+    // 混有瞬时故障时留给前端重试与线路熔断。
+    if (attempts > 0 && definitiveFailures >= Math.min(IMAGE_DEFINITIVE_FAILURE_LIMIT, attempts)) {
+      rememberImageFailure(failureKey, lastStatus, publicLastError, trace?.error_type);
+    }
     sendJson(res, lastStatus, { error: publicLastError });
   } finally {
     if (cacheFlight) finishImageCacheFlight(cacheKey, cacheFlight, getImageCache(cacheKey));
@@ -2204,22 +2285,31 @@ async function api(req, res, u, requestSignal) {
       const id = q.get('id');
       const shunt = q.get('shunt') || '1';
       if (!id || !/^\d+$/.test(id)) return sendJson(res, 400, { error: '缺少 id' });
-      const html = await call({ path: '/chapter_view_template', query: {
-        id,
-        app_img_shunt: shunt,
-        mode: 'vertical',
-        page: '0',
-        express: 'off',
-        v: String(Math.floor(Date.now() / 1000)),
-      } });
-      let parsed;
-      try {
-        parsed = parsePhotoHtml(String(html));
-      } catch (e) {
-        // 上游返回异常页面属上游问题，按 502 返回而非 500 内部错误
-        throw new ApiError(e.message || '解析章节 HTML 失败', 502);
-      }
-      if (parsed.imghost) settings.addImageHost(parsed.imghost);
+      // 章节图片清单与用户无关；返回详情再进、切章回看、多标签同时打开会
+      // 反复请求同一章节（生产均值约 1.1 秒）。短期共享缓存 + single-flight，
+      // 失败不缓存。
+      const parsed = await cachedPublicApi(
+        publicApiKey('/chapter', dataSource, { id, shunt }), CHAPTER_CACHE_TTL_MS,
+        async () => {
+          const html = await call({ path: '/chapter_view_template', signal: null, query: {
+            id,
+            app_img_shunt: shunt,
+            mode: 'vertical',
+            page: '0',
+            express: 'off',
+            v: String(Math.floor(Date.now() / 1000)),
+          } });
+          let result;
+          try {
+            result = parsePhotoHtml(String(html));
+          } catch (e) {
+            // 上游返回异常页面属上游问题，按 502 返回而非 500 内部错误
+            throw new ApiError(e.message || '解析章节 HTML 失败', 502);
+          }
+          if (result.imghost) settings.addImageHost(result.imghost);
+          return result;
+        },
+      );
       // 用户访问章节即记录为后台候选；不绑定用户身份，按访问自然提升优先级。
       try { const aid = parsed.aid || id; const hotPriority = chapterAi.touchPopularity(aid, { photoId: id, weight: 2 }); chapterAi.enqueue(aid, id, hotPriority + 100); } catch (_) {}
       return sendJson(res, 200, { code: 200, data: parsed });
@@ -2238,6 +2328,14 @@ async function api(req, res, u, requestSignal) {
         return;
       }
       const trace = imageTrace(res);
+      const knownFailure = getImageFailure(imageFailureKey(abs, upath));
+      if (knownFailure) {
+        if (trace) {
+          trace.error_type = knownFailure.type;
+          trace.negative_cache = true;
+        }
+        return sendJson(res, knownFailure.status, { error: knownFailure.message });
+      }
       const queueStarted = Date.now();
       const releaseImageSlot = await waitForImageRequestSlot(clientIp(req), requestSignal);
       addImageTraceDuration(trace, 'queue_ms', queueStarted);
@@ -2377,7 +2475,7 @@ async function api(req, res, u, requestSignal) {
 
 /* ----------------------------- 静态文件 ----------------------------- */
 
-function serveStatic(req, res, u) {
+async function serveStatic(req, res, u) {
   // 静态错误不能被浏览器或 CDN 负缓存。否则一次发布时序或拼写错误
   // 可能让随后已经存在的同名资源继续返回缓存的 404。
   const staticErrorHeaders = () => baseHeaders({
@@ -2405,68 +2503,78 @@ function serveStatic(req, res, u) {
     return res.end('Forbidden');
   }
 
-  const sendKnownFile = (target, st, isSpaFallback = false) => {
-    if (!st || !st.isFile()) {
-      if (isSpaFallback) {
-        res.writeHead(500, staticErrorHeaders());
-        return res.end('index.html missing');
-      }
-      return fallbackOrNotFound();
-    }
-    const ext = path.extname(target).toLowerCase();
-    const etag = `W/"${st.size}-${st.mtimeMs}"`;
-    if (req.headers['if-none-match'] === etag) {
-      res.writeHead(304, baseHeaders({ ETag: etag }));
-      return res.end();
-    }
-    const headers = baseHeaders({
-      'Content-Type': MIME[ext] || 'application/octet-stream',
-      'Cache-Control': 'no-cache',
-      'Content-Length': st.size,
-      ETag: etag,
-    });
-    if (ext === '.html') headers['Content-Security-Policy'] = CSP;
-
-    // HEAD 必须返回与 GET 相同的元数据，但不应为此把整个静态资源读入内存。
-    if (req.method === 'HEAD') {
-      res.writeHead(200, headers);
-      return res.end();
-    }
-    fs.readFile(target, (error, buf) => {
-      if (error) {
-        if (isSpaFallback) {
-          res.writeHead(500, staticErrorHeaders());
-          return res.end('index.html missing');
-        }
-        return fallbackOrNotFound();
-      }
-      // stat/read 间文件若被原子替换，以实际发送长度为准，避免响应被截断。
-      headers['Content-Length'] = buf.length;
-      res.writeHead(200, headers);
-      res.end(buf);
-    });
+  const indexFile = path.join(PUBLIC_DIR, 'index.html');
+  const sendMissingIndex = () => {
+    res.writeHead(500, staticErrorHeaders());
+    return res.end('index.html missing');
   };
 
-  const fallbackOrNotFound = () => {
+  const sendKnownFile = async (target, st, isSpaFallback = false) => {
+    if (!st || !st.isFile()) {
+      if (isSpaFallback) return sendMissingIndex();
+      return fallbackOrNotFound();
+    }
+    let entry;
+    try {
+      entry = target === indexFile
+        ? await staticAssets.loadIndex(target, st)
+        : await staticAssets.load(target, st);
+    } catch (_) {
+      if (isSpaFallback) return sendMissingIndex();
+      return fallbackOrNotFound();
+    }
+    if (res.destroyed) return;
+    // 只有 `?v=` 与当前内容哈希一致时才是不可变资源；版本不匹配（例如发布
+    // 后旧页面懒加载模块）按当前内容协商返回，绝不把它长期缓存到旧版本键下。
+    const requestedVersion = isSpaFallback ? null : u.searchParams.get('v');
+    const immutable = !!requestedVersion && requestedVersion === entry.hash && isVersionedAssetPath(p);
+    const common = {
+      'Cache-Control': immutable ? IMMUTABLE_CACHE_CONTROL : 'no-cache',
+      ETag: entry.etag,
+    };
+    if (COMPRESSIBLE_EXTS.has(entry.ext)) common.Vary = 'Accept-Encoding';
+    if (etagMatches(req.headers['if-none-match'], entry.etag)) {
+      res.writeHead(304, baseHeaders(common));
+      return res.end();
+    }
+    const encoding = preferredEncoding(req.headers['accept-encoding']);
+    const encoded = await staticAssets.encodedBody(entry, encoding);
+    if (res.destroyed) return;
+    const body = encoded || entry.body;
+    const headers = baseHeaders({
+      'Content-Type': MIME[entry.ext] || 'application/octet-stream',
+      ...common,
+      'Content-Length': body.length,
+    });
+    if (encoded) headers['Content-Encoding'] = encoding;
+    if (entry.ext === '.html') headers['Content-Security-Policy'] = cspWithScriptHashes(entry.inlineScriptHashes);
+    // HEAD 返回与 GET 相同的元数据（含编码后的长度），但不发送实体。
+    res.writeHead(200, headers);
+    return res.end(req.method === 'HEAD' ? undefined : body);
+  };
+
+  const fallbackOrNotFound = async () => {
     // SPA 回退：非资源请求一律回 index.html；回退页也具备完整 HEAD/ETag 语义。
     if (!path.extname(p)) {
-      const index = path.join(PUBLIC_DIR, 'index.html');
-      return fs.stat(index, (error, st) => {
-        if (error) {
-          res.writeHead(500, staticErrorHeaders());
-          return res.end('index.html missing');
-        }
-        sendKnownFile(index, st, true);
-      });
+      let st;
+      try {
+        st = await fs.promises.stat(indexFile);
+      } catch (_) {
+        return sendMissingIndex();
+      }
+      return sendKnownFile(indexFile, st, true);
     }
     res.writeHead(404, staticErrorHeaders());
     return res.end('Not Found');
   };
 
-  fs.stat(file, (error, st) => {
-    if (error) return fallbackOrNotFound();
-    sendKnownFile(file, st);
-  });
+  let st;
+  try {
+    st = await fs.promises.stat(file);
+  } catch (_) {
+    return fallbackOrNotFound();
+  }
+  return sendKnownFile(file, st);
 }
 
 /* ----------------------------- 服务器 ----------------------------- */
@@ -2494,9 +2602,78 @@ function imageCompletionMeta(trace, res, started, clientClosed = false) {
     retry_count: metric('retry_count'),
     queue_ms: metric('queue_ms'),
     cache_hit: trace.cache_hit === true,
+    negative_cache: trace.negative_cache === true,
     bytes: metric('bytes'),
     client_aborted: trace.client_aborted === true,
   };
+}
+
+// 图片日志：快速成功的请求占绝大多数（生产约 1.8 万行/天），逐条输出会让
+// json-file 只保留数天、运维日志环约 1 小时即被冲掉。它们只计入周期汇总；
+// 失败、慢请求和换线后成功仍逐条记录。
+const IMAGE_SLOW_LOG_MS = 3000;
+const IMAGE_STATS_INTERVAL_MS = 5 * 60 * 1000;
+const IMAGE_STATS_SAMPLE_LIMIT = 5000;
+
+function newImageStats(now = Date.now()) {
+  return {
+    since: now, requests: 0, ok: 0, cacheHits: 0, negativeHits: 0,
+    retried: 0, slow: 0, bytes: 0, errors: {}, upstreamDurations: [],
+  };
+}
+let imageStats = newImageStats();
+
+function shouldLogImageRequest(meta) {
+  return meta.status >= 400 || meta.retry_count > 0 || meta.duration_ms >= IMAGE_SLOW_LOG_MS;
+}
+
+function recordImageStats(meta) {
+  const stats = imageStats;
+  stats.requests++;
+  if (meta.status >= 200 && meta.status < 400) stats.ok++;
+  if (meta.cache_hit) stats.cacheHits++;
+  if (meta.negative_cache) stats.negativeHits++;
+  if (meta.retry_count > 0) stats.retried++;
+  if (meta.duration_ms >= IMAGE_SLOW_LOG_MS) stats.slow++;
+  stats.bytes += meta.bytes;
+  if (meta.error_type) stats.errors[meta.error_type] = (stats.errors[meta.error_type] || 0) + 1;
+  if (meta.status === 200 && !meta.cache_hit && stats.upstreamDurations.length < IMAGE_STATS_SAMPLE_LIMIT) {
+    stats.upstreamDurations.push(meta.duration_ms);
+  }
+}
+
+function percentile(sorted, ratio) {
+  if (!sorted.length) return 0;
+  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * ratio))];
+}
+
+/** 输出并重置当前窗口的图片代理汇总；窗口内无请求时不输出。 */
+function flushImageStats(now = Date.now()) {
+  const stats = imageStats;
+  imageStats = newImageStats(now);
+  if (!stats.requests) return null;
+  const durations = stats.upstreamDurations.sort((a, b) => a - b);
+  let openCircuits = 0;
+  for (const health of imageHostHealth.values()) if (now < health.openUntil) openCircuits++;
+  const summary = {
+    window_s: Math.max(0, Math.round((now - stats.since) / 1000)),
+    requests: stats.requests,
+    ok: stats.ok,
+    cache_hit_ratio: Number((stats.cacheHits / stats.requests).toFixed(3)),
+    negative_cache_hits: stats.negativeHits,
+    retried: stats.retried,
+    slow: stats.slow,
+    bytes: stats.bytes,
+    upstream_p50_ms: percentile(durations, 0.5),
+    upstream_p90_ms: percentile(durations, 0.9),
+    upstream_p99_ms: percentile(durations, 0.99),
+    open_circuits: openCircuits,
+    errors: stats.errors,
+  };
+  console.log(`[image-stats] ${JSON.stringify(summary)}`);
+  features.addLog(stats.ok < stats.requests ? 'warn' : 'info',
+    `图片代理 ${summary.window_s}s 汇总：${stats.requests} 次，成功 ${stats.ok}`, summary);
+  return summary;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -2520,6 +2697,8 @@ const server = http.createServer(async (req, res) => {
       if (imageLogged) return;
       imageLogged = true;
       const meta = imageCompletionMeta(res.jmwImageTrace, res, started, clientClosed);
+      recordImageStats(meta);
+      if (!shouldLogImageRequest(meta)) return;
       const message = `${req.method} /api/img -> ${meta.status} (${meta.duration_ms}ms)`;
       const level = meta.status >= 500 || meta.status === 499 ? 'error' : meta.status >= 400 ? 'warn' : 'info';
       console.log(`[image] ${JSON.stringify(meta)}`);
@@ -2619,10 +2798,23 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(405, baseHeaders());
     return res.end();
   }
-  serveStatic(req, res, u);
+  serveStatic(req, res, u).catch((error) => {
+    console.error('[static] 发送失败:', error && error.message);
+    if (!res.headersSent) {
+      res.writeHead(500, baseHeaders({ 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }));
+      res.end('Internal Server Error');
+    } else if (!res.destroyed) {
+      res.destroy();
+    }
+  });
 });
 
+let imageStatsTimer = null;
 function startServer() {
+  if (!imageStatsTimer) {
+    imageStatsTimer = setInterval(() => flushImageStats(), IMAGE_STATS_INTERVAL_MS);
+    imageStatsTimer.unref();
+  }
   return server.listen(PORT, HOST, () => {
     console.log(`JM Web 已启动: http://localhost:${PORT}  (Node ${process.version})`);
     if (ACCESS_PASSWORD) console.log('访问口令保护已开启');
@@ -2638,6 +2830,7 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`\n收到 ${signal}，正在保存状态…`);
+  try { flushImageStats(); } catch (_) {}
   try { chapterAi.stop(); chapterAi.flushSync(); } catch (_) {}
   try { sessions.flushAll(); } catch (_) {}
   try { settings.flushNow(); } catch (_) {}
@@ -2653,6 +2846,7 @@ if (require.main === module) {
 module.exports = {
   server,
   startServer,
+  staticAssets,
   API_METHODS,
   clientIp,
   requestIsSecure,
@@ -2690,5 +2884,12 @@ module.exports = {
   clearImageHostHealth,
   classifyImageFailure,
   imageUrlCandidates,
+  imageFailureKey,
+  getImageFailure,
+  flushImageStats,
+  shouldLogImageRequest,
+  clearImageFailureCache,
+  MAX_IMAGE_HOST_ATTEMPTS,
+  IMAGE_DEFINITIVE_FAILURE_LIMIT,
   SAFE_RASTER_MIME,
 };

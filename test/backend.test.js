@@ -68,6 +68,13 @@ const {
   clearImageHostHealth,
   classifyImageFailure,
   imageUrlCandidates,
+  imageFailureKey,
+  getImageFailure,
+  clearImageFailureCache,
+  flushImageStats,
+  shouldLogImageRequest,
+  MAX_IMAGE_HOST_ATTEMPTS,
+  IMAGE_DEFINITIVE_FAILURE_LIMIT,
 } = require('../server');
 
 const publicDns = async () => [{ address: '93.184.216.34', family: 4 }];
@@ -434,18 +441,89 @@ class MockServerResponse extends EventEmitter {
     }
 
     // 静态资源和 SPA 回退的 HEAD 元数据应与 GET 一致，且绝不返回实体。
+    // 固定 identity 编码以便比较实体字节；压缩协商另有断言。
+    const identity = { 'accept-encoding': 'identity' };
     for (const pathname of ['/js/app.js', '/js/descramble-worker.js', '/a-client-route']) {
-      const get = await originalFetch(`http://127.0.0.1:${port}${pathname}`);
+      const get = await originalFetch(`http://127.0.0.1:${port}${pathname}`, { headers: identity });
       if (pathname.endsWith('.js')) {
         assert.match(get.headers.get('content-type') || '', /^text\/javascript\b/i, pathname);
       }
       const getBytes = (await get.arrayBuffer()).byteLength;
-      const head = await originalFetch(`http://127.0.0.1:${port}${pathname}`, { method: 'HEAD' });
+      const head = await originalFetch(`http://127.0.0.1:${port}${pathname}`, { method: 'HEAD', headers: identity });
       assert.strictEqual(head.status, get.status, pathname);
       assert.strictEqual(Number(head.headers.get('content-length')), getBytes, pathname);
       assert.strictEqual(head.headers.get('etag'), get.headers.get('etag'), pathname);
       assert.strictEqual((await head.arrayBuffer()).byteLength, 0, pathname);
     }
+
+    // ETag 必须来自内容哈希：发布制品 mtime 统一为 0，旧的 size-mtime ETag
+    // 会让同字节数的新模块被 304 命中旧版本。
+    const appJsBytes = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'app.js'));
+    const appJsHash = crypto.createHash('sha256').update(appJsBytes).digest('base64url').slice(0, 16);
+    response = await originalFetch(`http://127.0.0.1:${port}/js/app.js`, { headers: identity });
+    assert.strictEqual(response.headers.get('etag'), `W/"${appJsHash}"`);
+    assert.strictEqual(response.headers.get('cache-control'), 'no-cache', '无版本 URL 必须协商缓存');
+    await response.arrayBuffer();
+    response = await originalFetch(`http://127.0.0.1:${port}/js/app.js`, {
+      headers: { 'if-none-match': `"x", W/"${appJsHash}"` },
+    });
+    assert.strictEqual(response.status, 304, 'If-None-Match 列表中的弱 ETag 应命中');
+    response = await originalFetch(`http://127.0.0.1:${port}/js/app.js`, {
+      headers: { ...identity, 'if-none-match': `W/"${appJsBytes.length}-0"` },
+    });
+    assert.strictEqual(response.status, 200, '旧的 size-mtime ETag 不得再命中');
+    await response.arrayBuffer();
+
+    // 入口注入 import map：模块映射到内容哈希版本，CSP 只按哈希放行该内联脚本。
+    response = await originalFetch(`http://127.0.0.1:${port}/`, { headers: identity });
+    const indexHtml = await response.text();
+    const importMapText = (indexHtml.match(/<script type="importmap">([\s\S]*?)<\/script>/) || [])[1];
+    assert.ok(importMapText, '入口 HTML 必须注入 import map');
+    assert.ok(indexHtml.indexOf('type="importmap"') < indexHtml.indexOf('type="module"'),
+      'import map 必须先于模块脚本');
+    assert.match(indexHtml, /<script type="module" src="\/js\/app\.js"><\/script>/,
+      '入口脚本保持无版本 URL，兼容旧 Service Worker 的入口校验');
+    const importMap = JSON.parse(importMapText).imports;
+    assert.strictEqual(importMap['/js/app.js'], `/js/app.js?v=${appJsHash}`);
+    assert.ok(importMap['/js/reader.js'] && importMap['/js/user.js'], '懒加载模块也必须版本化');
+    assert.match(indexHtml, /href="\/css\/app\.css\?v=[A-Za-z0-9_-]{16}"/, 'CSS 链接必须版本化');
+    const importMapHash = crypto.createHash('sha256').update(importMapText).digest('base64');
+    assert.ok((response.headers.get('content-security-policy') || '').includes(`script-src 'self' 'sha256-${importMapHash}'`),
+      'CSP 必须以内容哈希放行 import map');
+
+    // 与当前内容一致的版本化 URL 才是 immutable；过期版本按协商缓存返回当前内容。
+    response = await originalFetch(`http://127.0.0.1:${port}${importMap['/js/app.js']}`, { headers: identity });
+    assert.strictEqual(response.headers.get('cache-control'), 'public, max-age=31536000, immutable');
+    assert.strictEqual((await response.arrayBuffer()).byteLength, appJsBytes.length);
+    response = await originalFetch(`http://127.0.0.1:${port}/js/app.js?v=stale-version-0000`, { headers: identity });
+    assert.strictEqual(response.headers.get('cache-control'), 'no-cache', '版本不匹配不得长期缓存');
+    await response.arrayBuffer();
+    response = await originalFetch(`http://127.0.0.1:${port}/icons/icon-192.png?v=${appJsHash}`);
+    assert.strictEqual(response.headers.get('cache-control'), 'no-cache', '非版本化目录不得 immutable');
+    await response.arrayBuffer();
+
+    // 文本资源按 Accept-Encoding 压缩，Vary 声明协商维度；图片不压缩。
+    for (const encoding of ['br', 'gzip']) {
+      const raw = await new Promise((resolve, reject) => {
+        const req = require('http').get({
+          host: '127.0.0.1', port, path: '/js/app.js', headers: { 'accept-encoding': encoding },
+        }, (res) => {
+          const chunks = [];
+          res.on('data', (chunk) => chunks.push(chunk));
+          res.on('end', () => resolve({ headers: res.headers, body: Buffer.concat(chunks) }));
+        });
+        req.on('error', reject);
+      });
+      assert.strictEqual(raw.headers['content-encoding'], encoding);
+      assert.strictEqual(raw.headers.vary, 'Accept-Encoding');
+      assert.strictEqual(Number(raw.headers['content-length']), raw.body.length);
+      const zlib = require('zlib');
+      const decoded = encoding === 'br' ? zlib.brotliDecompressSync(raw.body) : zlib.gunzipSync(raw.body);
+      assert.ok(decoded.equals(appJsBytes), `${encoding} 解压后必须与原文一致`);
+    }
+    response = await originalFetch(`http://127.0.0.1:${port}/icons/icon-192.png`, { headers: { 'accept-encoding': 'br' } });
+    assert.strictEqual(response.headers.get('content-encoding'), null, '已压缩的图片不得再次编码');
+    await response.arrayBuffer();
 
     // 根级与资源目录的静态 404 都必须禁止负缓存；否则 CDN 可能在
     // 新版本资源已经上线后继续命中旧的 404。
@@ -1006,6 +1084,47 @@ class MockServerResponse extends EventEmitter {
     assert.deepStrictEqual(folderResult.data.folder_list.map((x) => x.id), ['0']);
     response = await postJson('favorite_folder', { type: 'move', aid: '123', folder_id: folder.id });
     assert.strictEqual(response.status, 404, '已删除收藏夹不得继续接收漫画');
+
+    // 章节清单与用户无关：同一章节/分流在 TTL 内共享缓存与 single-flight，
+    // 上游失败不缓存，不同章节互不串用。
+    const chapterImageHost = settings.imageHosts()[0];
+    let chapterCalls = 0;
+    let chapterFail = false;
+    global.fetch = async (url) => {
+      const target = new URL(String(url));
+      if (target.pathname !== '/chapter_view_template') throw new Error(`unexpected upstream request: ${target.href}`);
+      chapterCalls++;
+      if (chapterFail) return new Response('<html>busy</html>', { status: 200, headers: { 'Content-Type': 'text/html' } });
+      const id = target.searchParams.get('id');
+      return new Response(`<script>const result = { images: ['00001.webp', '00002.webp'] };
+const config = { jmid: '${id}', imghost: '${chapterImageHost}', cache: '' };
+var aid = 5005; var scramble_id = 220980; var speed = '';</script>`, { status: 200, headers: { 'Content-Type': 'text/html' } });
+    };
+    const chapterUrl = (id, extra = '') => `http://127.0.0.1:${port}/api/chapter?id=${id}${extra}`;
+    const chapterResponses = await Promise.all([1, 2, 3].map(() => originalFetch(chapterUrl('7101'))));
+    for (const item of chapterResponses) {
+      assert.strictEqual(item.status, 200);
+      const body = await item.json();
+      assert.strictEqual(body.data.images.length, 2);
+      assert.strictEqual(body.data.jmid, '7101');
+    }
+    assert.strictEqual(chapterCalls, 1, '并发请求同一章节只能回源一次');
+    response = await originalFetch(chapterUrl('7101', '&_=1'));
+    assert.strictEqual(response.status, 200);
+    await response.arrayBuffer();
+    assert.strictEqual(chapterCalls, 1, 'TTL 内再次打开同一章节应命中缓存');
+    response = await originalFetch(chapterUrl('7101', '&shunt=2'));
+    assert.strictEqual((await response.json()).data.jmid, '7101');
+    assert.strictEqual(chapterCalls, 2, '不同分流线路必须独立缓存');
+    chapterFail = true;
+    response = await originalFetch(chapterUrl('7102'));
+    assert.strictEqual(response.status, 502);
+    await response.arrayBuffer();
+    chapterFail = false;
+    response = await originalFetch(chapterUrl('7102'));
+    assert.strictEqual(response.status, 200, '解析失败不得被缓存');
+    assert.strictEqual((await response.json()).data.jmid, '7102');
+
     global.fetch = originalFetch;
     features.dohLookup = originalDohLookup;
 
@@ -1111,12 +1230,68 @@ class MockServerResponse extends EventEmitter {
       return new Response('', { status: 404, headers: { 'Content-Type': 'image/webp' } });
     };
     for (let i = 0; i < 2; i++) {
+      // 清掉资源级负缓存，单独验证“404 不开启域名熔断”。
+      clearImageFailureCache();
       response = await originalFetch(`http://127.0.0.1:${port}/api/img?u=${encodeURIComponent(absoluteUrl)}`);
       assert.strictEqual(response.status, 502);
       await response.arrayBuffer();
     }
     assert.strictEqual(notFoundCalls, 2);
+
+    // 同一资源被明确拒绝后短期负缓存：前端带 _jmw_retry 的重试直接得到
+    // 同一失败，不再占用图片槽位回源。
+    response = await originalFetch(`http://127.0.0.1:${port}/api/img?u=${encodeURIComponent(absoluteUrl)}&_jmw_retry=1`);
+    assert.strictEqual(response.status, 502);
+    await response.arrayBuffer();
+    assert.strictEqual(notFoundCalls, 2, '负缓存命中不得再次回源');
+    assert.ok(getImageFailure(imageFailureKey(absoluteUrl, '')), '明确拒绝的资源应进入负缓存');
+    await new Promise((resolve) => setImmediate(resolve));
+    const negativeLog = features.getLogs(5).find((item) => item.meta && item.meta.negative_cache === true);
+    assert.ok(negativeLog, '负缓存命中必须在图片日志中可区分');
+
+    // path 形式：资源被两条线路明确拒绝即停止，不遍历全部线路；
+    // 瞬时故障换线也有上限，避免单张图长时间占用槽位。
+    clearImageFailureCache();
     clearImageHostHealth();
+    assert.ok(settings.imageHosts().length > MAX_IMAGE_HOST_ATTEMPTS, '测试需要多于尝试上限的线路');
+    notFoundCalls = 0;
+    response = await originalFetch(`http://127.0.0.1:${port}/api/img?path=${encodeURIComponent('/media/photos/1/missing.webp')}`);
+    assert.strictEqual(response.status, 502);
+    await response.arrayBuffer();
+    assert.strictEqual(notFoundCalls, IMAGE_DEFINITIVE_FAILURE_LIMIT, '资源 404 达到一致拒绝阈值后必须停止换线');
+    assert.ok(getImageFailure(imageFailureKey('', '/media/photos/1/missing.webp')));
+    clearImageHostHealth();
+    let serverErrorCalls = 0;
+    global.fetch = async () => {
+      serverErrorCalls++;
+      return new Response('', { status: 503, headers: { 'Content-Type': 'text/plain' } });
+    };
+    response = await originalFetch(`http://127.0.0.1:${port}/api/img?path=${encodeURIComponent('/media/photos/1/flaky.webp')}`);
+    assert.strictEqual(response.status, 502);
+    await response.arrayBuffer();
+    assert.strictEqual(serverErrorCalls, MAX_IMAGE_HOST_ATTEMPTS, '瞬时故障换线不得超过尝试上限');
+    assert.strictEqual(getImageFailure(imageFailureKey('', '/media/photos/1/flaky.webp')), null,
+      '瞬时故障不得进入资源负缓存，留给前端重试');
+    clearImageFailureCache();
+    clearImageHostHealth();
+
+    // 快速成功的图片请求只进周期汇总；失败、慢请求、换线成功仍逐条记录。
+    assert.strictEqual(shouldLogImageRequest({ status: 200, retry_count: 0, duration_ms: 20 }), false);
+    assert.strictEqual(shouldLogImageRequest({ status: 200, retry_count: 1, duration_ms: 20 }), true);
+    assert.strictEqual(shouldLogImageRequest({ status: 200, retry_count: 0, duration_ms: 5000 }), true);
+    assert.strictEqual(shouldLogImageRequest({ status: 502, retry_count: 0, duration_ms: 5 }), true);
+    await new Promise((resolve) => setImmediate(resolve));
+    const imageSummary = flushImageStats();
+    assert.ok(imageSummary && imageSummary.requests >= 3, '汇总必须包含窗口内全部图片请求');
+    assert.ok(imageSummary.ok >= 1 && imageSummary.requests > imageSummary.ok);
+    assert.ok(imageSummary.errors.upstream_http >= 1, '汇总必须按错误类型计数');
+    assert.ok(imageSummary.negative_cache_hits >= 1);
+    for (const field of ['cache_hit_ratio', 'upstream_p50_ms', 'upstream_p90_ms', 'upstream_p99_ms', 'open_circuits']) {
+      assert.ok(Number.isFinite(imageSummary[field]), field);
+    }
+    assert.ok(features.getLogs(3).some((item) => item.meta && item.meta.requests === imageSummary.requests),
+      '汇总必须进入运维日志');
+    assert.strictEqual(flushImageStats(), null, '空窗口不得输出汇总');
     settings.setPreferredImageHost(absoluteHosts[0]);
     global.fetch = originalFetch;
     features.dohLookup = originalDohLookup;

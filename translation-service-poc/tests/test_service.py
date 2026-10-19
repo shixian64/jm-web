@@ -439,3 +439,23 @@ def test_empty_token_skips_warmup_so_readyz_stays_ok(tmp_path, monkeypatch):
         ready = client.get("/readyz")
         assert ready.status_code == 200, "空 token 禁用模式下 warmup 失败不得让 readiness 失败"
         assert ready.json()["ready"] is True
+
+
+def test_probe_access_log_filter_drops_health_checks_only():
+    import logging
+
+    from service import ProbeAccessFilter
+
+    probe_filter = ProbeAccessFilter()
+
+    def access(path: str) -> logging.LogRecord:
+        return logging.LogRecord(
+            "uvicorn.access", logging.INFO, __file__, 1,
+            '%s - "%s %s HTTP/%s" %d', ("127.0.0.1:1", "GET", path, "1.1", 200), None,
+        )
+
+    assert probe_filter.filter(access("/readyz")) is False
+    assert probe_filter.filter(access("/healthz?probe=1")) is False
+    assert probe_filter.filter(access("/v1/translate/page")) is True
+    assert probe_filter.filter(logging.LogRecord("x", logging.INFO, __file__, 1, "plain", None, None)) is True
+    assert any(isinstance(f, ProbeAccessFilter) for f in logging.getLogger("uvicorn.access").filters)

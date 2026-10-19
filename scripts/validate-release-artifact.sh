@@ -48,7 +48,8 @@ required=(
   .dockerignore .env.example AGENT.md AGENTS.md Dockerfile LICENSE README.md
   docker-compose.yml lib package.json package-lock.json public server.js
   translation-service-poc/.dockerignore translation-service-poc/Dockerfile
-  translation-service-poc/requirements.txt translation-service-poc/pipeline.py
+  translation-service-poc/requirements.txt translation-service-poc/constraints.txt
+  translation-service-poc/pipeline.py
   translation-service-poc/service.py
 )
 for item in "${required[@]}"; do
@@ -76,7 +77,7 @@ const allowedTopLevel = new Set([
   'public', 'server.js', 'translation-service-poc',
 ]);
 const allowedTranslation = new Set([
-  '.dockerignore', 'Dockerfile', 'requirements.txt', 'pipeline.py', 'service.py',
+  '.dockerignore', 'Dockerfile', 'requirements.txt', 'constraints.txt', 'pipeline.py', 'service.py',
 ]);
 for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
   if (!allowedTopLevel.has(entry.name)) {
