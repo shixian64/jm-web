@@ -252,15 +252,21 @@ Cloudflare
 └── data/                              唯一持久化运行状态
 ```
 
-进入代码和查看服务：
+进入代码和查看服务（所有 Compose 路径都使用物理绝对路径）：
 
 ```bash
-cd /home/shixian/project/jm-web/current
-docker compose --project-name jm-web \
-  --file docker-compose.yml \
-  --file ../../shared/docker-compose.prod.yml \
-  --env-file ../../shared/.env ps
+ROOT=/home/shixian/project/jm-web
+REL="$(readlink -f "$ROOT/current")"   # current 是软链接，必须先解析为物理路径
+docker compose --project-name jm-web --project-directory "$REL" \
+  --file "$REL/docker-compose.yml" \
+  --file "$ROOT/shared/docker-compose.prod.yml" \
+  --env-file "$ROOT/shared/.env" ps
 ```
+
+不要 `cd current` 后再用 `../../shared/...` 相对路径：Docker Compose 按 shell 的逻辑
+`$PWD`（`.../jm-web/current`）解析相对路径，`../../shared/.env` 会变成
+`/home/shixian/project/shared/.env`，`up` 直接失败（2026-10-19 发布时实际发生，
+自动回滚分支也因同样原因未能执行 `up`）。
 
 生产 Release 不含 `.git` 和测试目录。不要在 `current` 中执行 `git pull`，也不要手工修改文件。
 
@@ -278,7 +284,7 @@ docker compose --project-name jm-web \
    `scripts/prune-release-leftovers.sh --root <生产根目录>` 核对计划，再加 `--apply`；
    它只删除过期 Release、`incoming/` 旧条目和候选残留，不触碰 `data/`、`shared/` 与 `current`。
 9. **生产验收**：分别验证笔记本直连、入口代理和公网域名。
-10. **失败回滚**：恢复原 `current` 和旧镜像；不得覆盖或回滚生产数据，除非有独立的数据恢复方案。
+10. **失败回滚**：恢复原 `current`、原 Compose 覆盖文件和旧镜像；不得覆盖或回滚生产数据，除非有独立的数据恢复方案。
 
 ### GHCR 预构建镜像（可选）
 
@@ -295,13 +301,47 @@ docker compose --project-name jm-web \
 - 发布或升级后用 `docker buildx imagetools inspect <image>:<tag>` 确认两个平台都存在；
   不要把 `data/`、`.env` 或任何 Session 打进镜像。
 
-### 网络受限时的只读源码发布（备用）
+### 只读源码发布（不重新构建镜像）
 
-- 仅在 Node 锁文件、Python requirements/constraints 与运行时兼容性均未变化时使用；依赖或基础系统需要升级时仍须部署新镜像，不能用此方式绕过。
+适用条件与约束：
+
+- 仅在 Node 锁文件、Python requirements/constraints 与运行时兼容性均未变化时使用；依赖或基础系统需要升级时仍须部署新镜像，不能用此方式绕过。网络受限或不允许在生产构建时优先采用。
 - 固定已经运行验证过的镜像 ID，将新不可变 Release 的 `server.js`、`lib/`、`public/`、包清单及 Python `service.py` / `pipeline.py` 以只读 bind mount 覆盖对应运行路径；生产数据和翻译缓存挂载保持不变。
 - Dockerfile 的启动参数变化必须在 Compose `command` 中完整复现。候选使用独立数据、缓存和合成凭据，验证真实图片编解码、OCR/翻译、业务接口与全部运行源文件/静态资产哈希后才能切换。
 - 此方式下镜像的旧标签或 OCI revision **不代表当前运行代码版本**；使用 `com.jmw.release.revision` / `com.jmw.release.id` / `com.jmw.release.method` 记录 Release，并以只读挂载来源和运行文件哈希确认代码。
-- 保留原 Compose 覆盖文件与镜像 ID；回滚须同时恢复原覆盖配置及 `current`，仍不得自动覆盖生产数据。Compose 调用方式不变，所有启动明确使用 `--no-build --pull never`。
+- 保留原 Compose 覆盖文件与镜像 ID；回滚须同时恢复原覆盖配置及 `current`，仍不得自动覆盖生产数据。所有启动明确使用 `--no-build --pull never`，Compose 路径一律为物理绝对路径（见第 8 节）。
+
+实际做法（2026-10-19 Release `20261019T142319Z-d4a258811d3e` 按此执行并通过验收）：
+
+1. **制品**：在干净的开发工作区按发布白名单 `git archive <sha> <白名单路径…> | gzip -n -9`
+   生成 `<release-id>.tar.gz`，Release ID 为 `<UTC YYYYMMDDTHHMMSSZ>-<sha 前 12 位>`；同时生成
+   `.sha256` 与 `.manifest.txt`（记录 `git_head`、`archive_sha256`、
+   `release_method=readonly-source-mount`、`base_images=<两个镜像 ID>`）。解包后运行
+   `RELEASE_BUILD_STATUS=PASS scripts/validate-release-artifact.sh <目录>`；此时 PASS 表示复用的镜像
+   已在生产验证、未重新构建。Windows 的 GNU tar 会把 `C:` 当远程主机，需 `--force-local` 或相对路径。
+2. **落盘**：上传到 `incoming/` 并 `sha256sum -c`；以 `umask 022` 解包到 `releases/<id>.tmp`，
+   `chmod 700` 顶层目录后 `mv -T` 为 `releases/<id>`。文件须保持 `0644`：翻译容器以 uid 10001
+   读取单文件 bind mount。
+3. **候选**：用生产同一镜像 ID `docker run`，保持 `--read-only`、`--cap-drop ALL`、
+   `no-new-privileges`、CPU/内存/PID 上限，只读挂载 `releases/<id>` 中的运行文件；容器名
+   `jm-web-candidate-<id>` 与 `jm-web-candidate-<id>-translation`（清理脚本据此识别）。jm-web 候选绑定
+   `<root>/.candidate-data-<id>`、使用随机合成 `ACCESS_PASSWORD`、仅发布到 `127.0.0.1` 随机端口、
+   `TRANSLATION_SERVICE_URL=` 置空；翻译候选使用随机合成 `TRANSLATION_SERVICE_TOKEN` 以触发 OCR warmup，
+   `/app/cache` 用 `tmpfs`（`uid=10001`）。验收：`/healthz`、入口 import map 与 CSP 哈希、版本化资产
+   `immutable` + br、`/api/auth` 后 `config`/`home`/`album`/`chapter`（二次请求命中缓存）、封面图片 MIME、
+   翻译 `/readyz` ready。
+4. **切换**：先做预部署备份 `shared/backups/predeploy-<id>/`（`.env`、`data/`、当前覆盖文件），并把当前
+   覆盖文件另存为 `shared/docker-compose.prod.<旧 id>.yml`。新覆盖文件保持两个镜像 ID 不变，追加
+   `com.jmw.release.*` labels（含 `base-image-release: <旧 id>`）和指向 `releases/<id>` 的物理绝对路径只读
+   bind（jm-web：`server.js`、`lib`、`public`、`package.json`、`package-lock.json`；翻译：`service.py`、
+   `pipeline.py`）。`config --quiet` 校验通过后替换覆盖文件，`ln -sfn releases/<id> current.new &&
+   mv -Tf current.new current` 原子切换，再 `up -d --no-build --pull never`。只有 `jm-web` 为 `healthy`
+   且其 `com.jmw.release.id` 等于新 ID 才算成功；否则恢复旧覆盖文件与 `current` 后重新 `up`。
+5. **验收**：容器内 `/app/server.js`、`/app/lib/*`、`/app/public/*`、`/app/service.py` 的 sha256 与
+   `releases/<id>` 一致，源码挂载 `rw=false`，其余按第 10 节“生产最低验收”。不使用生产访问口令做业务
+   接口验收时，以候选结果加生产门禁 401、静态资产哈希和切换后真实流量日志为准。
+6. **清理**：删除本次候选容器和 `.candidate-data-<id>`，再按第 9 节以 dry-run → `--apply` 运行
+   `scripts/prune-release-leftovers.sh`。
 
 发布制品至少包含运行所需文件和项目说明：
 
@@ -413,6 +453,7 @@ docker compose --env-file .env.example \
 - 入口 Caddy 配置在另一台主机，尚未成为本仓库可复放的部署声明；排障时要单独保留入口证据。
 - 图片成功请求和入口链路可观测性不足；漫画慢不能只看应用 CPU/内存，应分段测 DNS、connect、TLS、TTFB、total 和连接复用。
 - 静态资源已按内容哈希版本化（import map + `?v=`）并对版本化 URL 返回 immutable；仍不能在 Cloudflare 上强行缓存未版本化模块或入口 HTML。
+- 公网入口当前会把响应改写为 `Cache-Control: no-cache, no-store, must-revalidate`（`cf-cache-status: BYPASS`，2026-10-19 验证），版本化资源的 immutable 只在 Tailscale 直连生效；需在入口 Caddy 对上游已带 `Cache-Control` 的响应保留原值后，浏览器/CDN 长缓存才在公网生效。
 
 ## 12. 明确禁止的操作
 
