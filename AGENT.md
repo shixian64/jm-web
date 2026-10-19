@@ -239,6 +239,18 @@ Cloudflare
 - 生产根目录：`/home/shixian/project/jm-web`
 - 旧目录 `/srv/jm-web` 已停用，禁止在新脚本中继续硬编码。
 - Caddy 在入口服务器，普通 `jm-web` 发布不要顺手修改入口配置。
+- 入口 Caddy 位置：Tailscale 节点 `shixian-clone`（`100.103.161.103`，root 经 Tailscale SSH，需额外校验），
+  容器 `bbw-edge-caddy-1`（`caddy:2.10-alpine`，Compose 目录 `/home/project/xbly`，`compose.edge.yaml`），
+  配置文件 `/home/project/xbly/Caddyfile` 以**单文件只读 bind mount** 挂入容器。该 Caddy 同时代理
+  xbly、images、grok、wxai、arena、aqtw、sub2、card、hgt 等站点，只能修改 `jm.shixinn.com` 站点块。
+- 修改入口配置的做法：先 `cp -a Caddyfile Caddyfile.bak.<用途>-<时间>` 备份；在容器内
+  `caddy validate --adapter caddyfile` 校验候选文件；用 `cat 候选 > Caddyfile` **原地写入**（`sed -i`/`mv`
+  会换 inode，容器内仍看到旧文件）；全局配置为 `admin off`，不能热重载，须 `docker restart bbw-edge-caddy-1`，
+  所有站点会中断数秒，需事先告知并在改前后对比各站点状态码。`/home/project/xbly` 是另一个项目的仓库，
+  不要在其中提交。
+- 入口 `jm.shixinn.com` 的缓存头规则（2026-10-19 起）：`/sw.js` 与**不带 `v` 参数**的 `/js/*`、`/css/*`
+  被强制改写为 `no-cache, no-store, must-revalidate`；带 `?v=` 的请求保留源站 `Cache-Control`，
+  版本化资源经公网返回 `immutable` 并由 Cloudflare 边缘缓存。
 
 生产目录结构：
 
@@ -453,7 +465,7 @@ docker compose --env-file .env.example \
 - 入口 Caddy 配置在另一台主机，尚未成为本仓库可复放的部署声明；排障时要单独保留入口证据。
 - 图片成功请求和入口链路可观测性不足；漫画慢不能只看应用 CPU/内存，应分段测 DNS、connect、TLS、TTFB、total 和连接复用。
 - 静态资源已按内容哈希版本化（import map + `?v=`）并对版本化 URL 返回 immutable；仍不能在 Cloudflare 上强行缓存未版本化模块或入口 HTML。
-- 公网入口当前会把响应改写为 `Cache-Control: no-cache, no-store, must-revalidate`（`cf-cache-status: BYPASS`，2026-10-19 验证），版本化资源的 immutable 只在 Tailscale 直连生效；需在入口 Caddy 对上游已带 `Cache-Control` 的响应保留原值后，浏览器/CDN 长缓存才在公网生效。
+- 版本号与当前内容不一致的 `?v=` 请求，源站返回 `no-cache`；Cloudflare 边缘会回源校验（`REVALIDATED`），但其浏览器缓存 TTL 设置把浏览器侧头改写为 `max-age=14400`。发布后旧页面懒加载到的“旧版本号 + 新内容”可能在浏览器缓存 4 小时，若期间回滚会混用版本。源站应对不匹配版本返回 `no-store`（Cloudflare 不改写 `no-store`）。
 
 ## 12. 明确禁止的操作
 
