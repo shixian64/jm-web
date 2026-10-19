@@ -2524,12 +2524,15 @@ async function serveStatic(req, res, u) {
       return fallbackOrNotFound();
     }
     if (res.destroyed) return;
-    // 只有 `?v=` 与当前内容哈希一致时才是不可变资源；版本不匹配（例如发布
-    // 后旧页面懒加载模块）按当前内容协商返回，绝不把它长期缓存到旧版本键下。
+    // 只有 `?v=` 与当前内容哈希一致时才是不可变资源。版本不匹配（例如发布
+    // 后旧页面懒加载模块）返回当前内容但禁止任何缓存：`no-cache` 会被
+    // Cloudflare 的浏览器缓存 TTL 改写为 max-age，回滚时旧版本键下会留着新内容。
     const requestedVersion = isSpaFallback ? null : u.searchParams.get('v');
-    const immutable = !!requestedVersion && requestedVersion === entry.hash && isVersionedAssetPath(p);
+    const versionedPath = isVersionedAssetPath(p);
+    const immutable = !!requestedVersion && requestedVersion === entry.hash && versionedPath;
+    const staleVersion = !!requestedVersion && !immutable && versionedPath;
     const common = {
-      'Cache-Control': immutable ? IMMUTABLE_CACHE_CONTROL : 'no-cache',
+      'Cache-Control': immutable ? IMMUTABLE_CACHE_CONTROL : staleVersion ? 'no-store' : 'no-cache',
       ETag: entry.etag,
     };
     if (COMPRESSIBLE_EXTS.has(entry.ext)) common.Vary = 'Accept-Encoding';

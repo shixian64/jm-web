@@ -495,8 +495,18 @@ class MockServerResponse extends EventEmitter {
     response = await originalFetch(`http://127.0.0.1:${port}${importMap['/js/app.js']}`, { headers: identity });
     assert.strictEqual(response.headers.get('cache-control'), 'public, max-age=31536000, immutable');
     assert.strictEqual((await response.arrayBuffer()).byteLength, appJsBytes.length);
+    // 版本不匹配必须 no-store：no-cache 会被 Cloudflare 浏览器缓存 TTL 改写为 max-age，
+    // 回滚后旧版本键下会残留新内容。304 协商响应也必须携带同样的缓存指令。
     response = await originalFetch(`http://127.0.0.1:${port}/js/app.js?v=stale-version-0000`, { headers: identity });
-    assert.strictEqual(response.headers.get('cache-control'), 'no-cache', '版本不匹配不得长期缓存');
+    assert.strictEqual(response.headers.get('cache-control'), 'no-store', '版本不匹配不得被任何一层缓存');
+    assert.strictEqual((await response.arrayBuffer()).byteLength, appJsBytes.length, '版本不匹配仍返回当前内容');
+    response = await originalFetch(`http://127.0.0.1:${port}/js/app.js?v=stale-version-0000`, {
+      headers: { 'if-none-match': `W/"${appJsHash}"` },
+    });
+    assert.strictEqual(response.status, 304);
+    assert.strictEqual(response.headers.get('cache-control'), 'no-store', '304 也必须保持 no-store');
+    response = await originalFetch(`http://127.0.0.1:${port}/css/app.css?v=stale-version-0000`, { headers: identity });
+    assert.strictEqual(response.headers.get('cache-control'), 'no-store', 'CSS 版本不匹配同样 no-store');
     await response.arrayBuffer();
     response = await originalFetch(`http://127.0.0.1:${port}/icons/icon-192.png?v=${appJsHash}`);
     assert.strictEqual(response.headers.get('cache-control'), 'no-cache', '非版本化目录不得 immutable');

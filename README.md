@@ -304,7 +304,7 @@ JMW_TRUST_PROXY=172.18.0.5,172.19.0.0/24
 | 会话 | 每个浏览器一个 Cookie Jar（AVS 等），持久化到 `data/sessions/`，重启不丢登录态；空会话 7 天、登录会话默认 365 天自动清理，可由 `JMW_SESSION_TTL_SECONDS` 调整（7 天至 2 年） |
 | 图片 | 服务端按 HTTPS 域名白名单逐跳流式代理并限制大小/并发；解扰由浏览器 Worker/Canvas 完成 |
 | 前端 | 原生 ES Module 单页应用，无构建步骤；Hash 路由；响应式（手机底部 Tab + 桌面顶部导航）；阅读器、下载管理、用户页按路由懒加载 |
-| 静态资源 | ETag 取自内容哈希；入口 HTML 注入 import map，把模块映射为 `?v=<内容哈希>` 并以 `immutable` 长缓存返回，无版本 URL 仍走协商缓存；文本资源按 `Accept-Encoding` 返回 br/gzip |
+| 静态资源 | ETag 取自内容哈希；入口 HTML 注入 import map，把模块映射为 `?v=<内容哈希>` 并以 `immutable` 长缓存返回，版本不匹配时返回当前内容且 `no-store`，无版本 URL 仍走协商缓存；文本资源按 `Accept-Encoding` 返回 br/gzip |
 | 图片还原 | 浏览器模块 Worker/OffscreenCanvas（不支持时回退主线程 Canvas）；`seed = seedMap[md5(id+page)]`，按漫画 ID 区间取模，纵向分片反序重排 |
 
 ## 目录结构

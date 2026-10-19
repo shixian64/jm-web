@@ -119,7 +119,7 @@ jm-web/
 
 ### 4.4 离线能力
 
-- 静态资源 ETag 取自内容哈希（发布制品 mtime 统一为 0，不能再用 size/mtime）。`server.js` 为入口 HTML 注入 import map，把 `/js/*.js` 映射为 `?v=<内容哈希>`，CSS 链接同样版本化；只有 `?v=` 与当前内容一致时返回 `immutable` 长缓存，版本不匹配按协商缓存返回当前内容。入口 `app.js` 保持无版本 URL，兼容旧 Service Worker 的入口校验。内联 import map 由 CSP 内容哈希放行。
+- 静态资源 ETag 取自内容哈希（发布制品 mtime 统一为 0，不能再用 size/mtime）。`server.js` 为入口 HTML 注入 import map，把 `/js/*.js` 映射为 `?v=<内容哈希>`，CSS 链接同样版本化；只有 `?v=` 与当前内容一致时返回 `immutable` 长缓存，版本不匹配返回当前内容且为 `no-store`（`no-cache` 会被 Cloudflare 浏览器缓存 TTL 改写为 `max-age`，回滚后旧版本键下会残留新内容）。入口 `app.js` 保持无版本 URL，兼容旧 Service Worker 的入口校验。内联 import map 由 CSP 内容哈希放行。
 - Service Worker 只负责应用静态外壳，不缓存登录 API 或图片代理响应。版本化模块请求不附加 `no-cache`（交给 immutable HTTP 缓存），成功后写回同路径的无 query 外壳键，断网按路径回退；其他 query 变体一律不缓存。仅缓存 SHELL 清单的无查询静态键；预缓存与在线更新校验响应 MIME、最终 URL 和入口 HTML 标记，拒绝 HTTP 200 错误页。并发预缓存合并为一轮，响应校验失败不覆盖旧外壳。
 - 收藏与详情另有仅当前标签页内存保存的返回导航缓存（最多 48 项、序列化估算总计 8 MiB、单项 4 MiB）。收藏完整分页快照最多保留 30 分钟，超过 2 分钟时后台顺序重验证已加载分页并原子替换；详情新鲜窗口 60 秒、最长 10 分钟。更新只提示用户点击应用，不重排活动列表；下拉刷新绕过收藏快照并重取收藏夹元数据。
 - 收藏筛选状态按 history entry 保存，返回时同步恢复已加载分页后再由路由恢复滚动。认证/数据源/API Host 变更与收藏操作统一在 API 层失效，跨标签仅通过 localStorage 广播失效元数据、不持久化业务缓存；旧世代或全部消费者取消的请求不得回填。重验证失败保留旧快照，401 必须移除旧账号内容。
@@ -465,7 +465,7 @@ docker compose --env-file .env.example \
 - 入口 Caddy 配置在另一台主机，尚未成为本仓库可复放的部署声明；排障时要单独保留入口证据。
 - 图片成功请求和入口链路可观测性不足；漫画慢不能只看应用 CPU/内存，应分段测 DNS、connect、TLS、TTFB、total 和连接复用。
 - 静态资源已按内容哈希版本化（import map + `?v=`）并对版本化 URL 返回 immutable；仍不能在 Cloudflare 上强行缓存未版本化模块或入口 HTML。
-- 版本号与当前内容不一致的 `?v=` 请求，源站返回 `no-cache`；Cloudflare 边缘会回源校验（`REVALIDATED`），但其浏览器缓存 TTL 设置把浏览器侧头改写为 `max-age=14400`。发布后旧页面懒加载到的“旧版本号 + 新内容”可能在浏览器缓存 4 小时，若期间回滚会混用版本。源站应对不匹配版本返回 `no-store`（Cloudflare 不改写 `no-store`）。
+- Cloudflare 的浏览器缓存 TTL（4 小时）会把非 `no-store` 的静态响应改写为 `max-age=14400`；需要禁止浏览器缓存的静态响应必须用 `no-store`，不能只写 `no-cache`（版本不匹配的 `?v=` 已按此处理，2026-10-19）。
 
 ## 12. 明确禁止的操作
 
