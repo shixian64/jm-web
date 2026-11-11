@@ -93,6 +93,48 @@ function retryImageUrl(source, attempt) {
 
 let retryImageObserver = null;
 const retryImageStarts = new WeakMap();
+const imageRetryCleanups = new WeakMap();
+const imageRetryRootObservers = new WeakMap();
+
+function disposeImageRetryTree(root, keepRoot = null) {
+  const dispose = (image) => {
+    if (!keepRoot?.contains(image)) imageRetryCleanups.get(image)?.();
+  };
+  dispose(root); // removedNodes 及调用方的 root 都可能就是 img。
+  for (const image of root?.querySelectorAll?.('img') || []) dispose(image);
+}
+
+/** 刷新/替换子树也要取消旧封面；仅观察当前路由 main，不持有全局图片列表。 */
+export function observeImageRetries(root) {
+  if (!root || typeof MutationObserver !== 'function' || imageRetryRootObservers.has(root)) return;
+  const cleanupRemoved = (records) => {
+    for (const record of records) {
+      for (const node of record.removedNodes) {
+        // 同一 root 内移动/同步重插仍有效，不能误取消；子树内也逐图检查。
+        if (!root.contains(node)) disposeImageRetryTree(node, root);
+      }
+    }
+  };
+  const observer = new MutationObserver((records) => {
+    // disconnect 后迟到的旧回调不能影响同一个 main 上的新路由。
+    if (imageRetryRootObservers.get(root)?.observer === observer) cleanupRemoved(records);
+  });
+  imageRetryRootObservers.set(root, { observer, cleanupRemoved });
+  observer.observe(root, { childList: true, subtree: true });
+}
+
+/** 路由销毁时撤销在途/待观察的封面，给阅读器释放图片通道。 */
+export function disposeImageRetries(root) {
+  const watcher = imageRetryRootObservers.get(root);
+  if (watcher) {
+    // 同一任务内先 replaceChildren 再退出时，移除记录尚未异步交付。
+    watcher.cleanupRemoved(watcher.observer.takeRecords());
+    watcher.observer.disconnect();
+    imageRetryRootObservers.delete(root);
+  }
+  disposeImageRetryTree(root);
+}
+
 
 function getRetryImageObserver() {
   if (retryImageObserver || typeof IntersectionObserver !== 'function') return retryImageObserver;
@@ -122,6 +164,7 @@ function getRetryImageObserver() {
  */
 export function installImageRetry(image, source, options = {}) {
   if (!image || typeof image.addEventListener !== 'function') return () => {};
+  imageRetryCleanups.get(image)?.();
   options = options && typeof options === 'object' ? options : {};
   const original = typeof source === 'string' ? source.trim() : '';
   const configuredRetries = Number(options.maxRetries);
@@ -133,6 +176,7 @@ export function installImageRetry(image, source, options = {}) {
   let attempts = 0;
   let timer = null;
   let finished = false;
+  let disposed = false;
   let started = false;
   let observer = null;
 
@@ -145,6 +189,7 @@ export function installImageRetry(image, source, options = {}) {
   const markBroken = () => {
     if (finished) return;
     finished = true;
+    imageRetryCleanups.delete(image);
     clearTimer();
     if (observer) observer.unobserve(image);
     retryImageStarts.delete(image);
@@ -156,6 +201,7 @@ export function installImageRetry(image, source, options = {}) {
   const onLoad = () => {
     if (finished) return;
     finished = true;
+    imageRetryCleanups.delete(image);
     clearTimer();
     if (observer) observer.unobserve(image);
     retryImageStarts.delete(image);
@@ -184,6 +230,23 @@ export function installImageRetry(image, source, options = {}) {
     started = true;
     image.setAttribute('src', original);
   };
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    const ownsImage = imageRetryCleanups.get(image) === dispose;
+    const cancelRequest = ownsImage && started && !finished;
+    finished = true;
+    clearTimer();
+    if (ownsImage) {
+      if (observer) observer.unobserve(image);
+      retryImageStarts.delete(image);
+      imageRetryCleanups.delete(image);
+    }
+    image.removeEventListener?.('load', onLoad);
+    image.removeEventListener?.('error', onError);
+    if (cancelRequest) image.removeAttribute?.('src');
+  };
+  imageRetryCleanups.set(image, dispose);
   image.addEventListener('load', onLoad);
   image.addEventListener('error', onError);
   if (original) {
@@ -193,14 +256,7 @@ export function installImageRetry(image, source, options = {}) {
       observer.observe(image);
     } else start();
   } else markBroken();
-  return () => {
-    finished = true;
-    clearTimer();
-    if (observer) observer.unobserve(image);
-    retryImageStarts.delete(image);
-    image.removeEventListener?.('load', onLoad);
-    image.removeEventListener?.('error', onError);
-  };
+  return dispose;
 }
 
 /** 封面卡片（3:4 封面 + 两行标题） */

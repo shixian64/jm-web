@@ -968,6 +968,69 @@ class MockServerResponse extends EventEmitter {
       assert.strictEqual(favoriteCalls[0].target.origin, authHosts[1]);
       assert.match(favoriteCalls[0].opts.headers.Cookie || '', /(?:^|; )AVS=avs-from-login(?:;|$)/);
 
+      // 公共章节换线只能恢复阅读，不能把登录首选线路改成没有 AVS 的域名。
+      const chapterAuthCalls = [];
+      global.fetch = async (url, opts = {}) => {
+        const target = new URL(String(url));
+        chapterAuthCalls.push({ target, opts });
+        if (target.pathname === '/chapter_view_template') {
+          return new Response(target.origin === authHosts[1] ? '<html>busy</html>'
+            : `const result = { images: ['00001.webp'] }; const config = { jmid: '${target.searchParams.get('id')}', imghost: 'https://images.example', cache: '' }; var aid = 7191;`);
+        }
+        if (target.pathname === '/comment_vote' && target.origin === authHosts[1]
+            && opts.headers.Cookie === 'AVS=avs-from-login') {
+          return encryptedResponse(opts.headers.token, { ok: true });
+        }
+        return new Response('', { status: 401 });
+      };
+      const voteWithLogin = async () => {
+        const result = await originalFetch(`http://127.0.0.1:${port}/api/comment_vote`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: loginSidCookie },
+          body: JSON.stringify({ comment_id: '7191', vote_type: 'up' }),
+        });
+        await result.arrayBuffer();
+        return result.status;
+      };
+      assert.strictEqual(await voteWithLogin(), 200);
+      response = await originalFetch(`http://127.0.0.1:${port}/api/chapter?id=7191`, {
+        headers: { Cookie: loginSidCookie },
+      });
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual((await response.json()).data.jmid, '7191');
+      assert.strictEqual(await voteWithLogin(), 200, '章节换线后投票仍应命中携带 AVS 的原登录线路');
+      assert.strictEqual(loginJar.apiHost, authHosts[1], '公共章节不得提升认证首选域名');
+      const chapterOnlyCalls = chapterAuthCalls.filter((x) => x.target.pathname === '/chapter_view_template');
+      assert.deepStrictEqual(chapterOnlyCalls.map((x) => x.target.origin), [authHosts[1], authHosts[0]]);
+      assert.strictEqual(chapterOnlyCalls[0].opts.headers.Cookie, 'AVS=avs-from-login');
+      assert.ok(!chapterOnlyCalls[1].opts.headers.Cookie, '不得跨域复制 AVS');
+      const votesAfterChapter = chapterAuthCalls.filter((x) => x.target.pathname === '/comment_vote');
+      assert.strictEqual(votesAfterChapter.length, 2, '两次投票各只发送一次，不能靠重放 POST 掩盖选线错误');
+      assert.ok(votesAfterChapter.every((x) => x.target.origin === authHosts[1] && x.opts.headers.Cookie === 'AVS=avs-from-login'));
+      sessions.flushAll();
+      assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dataDir, 'sessions', `${loginSid}.json`), 'utf8')).apiHost, authHosts[1]);
+
+      // 匿名请求同样可换线；共享缓存命中不能改变任何消费者的认证首选域名。
+      const anonymousJar = sessions.createJar();
+      anonymousJar.apiHost = authHosts[1];
+      const callsBeforeAnonymous = chapterAuthCalls.length;
+      response = await originalFetch(`http://127.0.0.1:${port}/api/chapter?id=7192`, {
+        headers: { Cookie: `jmw_sid=${anonymousJar.sid}` },
+      });
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual((await response.json()).data.jmid, '7192');
+      const anonymousCalls = chapterAuthCalls.slice(callsBeforeAnonymous);
+      assert.deepStrictEqual(anonymousCalls.map((x) => x.target.origin), [authHosts[1], authHosts[0]]);
+      assert.ok(anonymousCalls.every((x) => !x.opts.headers.Cookie));
+      assert.strictEqual(anonymousJar.apiHost, authHosts[1]);
+      const callsBeforeCacheHit = chapterAuthCalls.length;
+      response = await originalFetch(`http://127.0.0.1:${port}/api/chapter?id=7192`, {
+        headers: { Cookie: loginSidCookie },
+      });
+      assert.strictEqual(response.status, 200);
+      await response.arrayBuffer();
+      assert.strictEqual(chapterAuthCalls.length, callsBeforeCacheHit);
+      assert.strictEqual(loginJar.apiHost, authHosts[1]);
+
       // 若首选 origin 的 AVS 已失效，GET 收藏允许在另一个已有 AVS 的
       // 受信 origin 重试；两条都失效时清除本地登录态并返回可操作提示。
       loginJar.cookiesByOrigin[authHosts[0]] = { AVS: 'avs-other-origin' };
@@ -991,6 +1054,7 @@ class MockServerResponse extends EventEmitter {
       assert.strictEqual(authCalls.filter((x) => x.target.pathname === '/favorite').length, 2);
       assert.strictEqual(authCalls[0].target.origin, authHosts[0]);
       assert.strictEqual(authCalls[1].target.origin, authHosts[1]);
+      assert.strictEqual(loginJar.apiHost, authHosts[1], '认证 GET 的有效 AVS 换线仍应更新首选域名');
 
       global.fetch = async (_url) => new Response('', { status: 401 });
       response = await originalFetch(`http://127.0.0.1:${port}/api/favorites`, {
@@ -1063,10 +1127,19 @@ class MockServerResponse extends EventEmitter {
     assert.strictEqual(response.status, 200);
     const voteCall = endpointCalls.find((x) => x.target.pathname === '/comment_vote');
     assert.strictEqual(voteCall.opts.method, 'POST');
-    assert.match(voteCall.opts.body.toString(), /name="comment_id"\r\n\r\n77\r\n/);
-    assert.match(voteCall.opts.body.toString(), /name="vote_type"\r\n\r\ndown\r\n/);
+    // jmcomic-next ComicService.likeComment 使用 @FormUrlEncoded / @Field。
+    assert.strictEqual(voteCall.opts.headers['Content-Type'], 'application/x-www-form-urlencoded');
+    assert.strictEqual(voteCall.opts.body.toString(), 'comment_id=77&vote_type=down');
     response = await postJson('comment_vote', { comment_id: 'oops', vote_type: 'up' });
     assert.strictEqual(response.status, 400);
+
+    const voteCallCount = endpointCalls.filter((x) => x.target.pathname === '/comment_vote').length;
+    response = await postJson('comment_vote', { comment_id: '77', vote_type: 'invalid' });
+    assert.strictEqual(response.status, 400, '无效投票类型不能静默变成点赞');
+    assert.strictEqual(endpointCalls.filter((x) => x.target.pathname === '/comment_vote').length, voteCallCount);
+    response = await postJson('comment_vote', { comment_id: '78' });
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(endpointCalls.filter((x) => x.target.pathname === '/comment_vote').at(-1).opts.body.toString(), 'comment_id=78&vote_type=up');
 
     response = await originalFetch(`http://127.0.0.1:${port}/api/like?id=88`, {
       method: 'POST', headers: { Cookie: sidCookie },
@@ -1134,6 +1207,21 @@ var aid = 5005; var scramble_id = 220980; var speed = '';</script>`, { status: 2
     response = await originalFetch(chapterUrl('7102'));
     assert.strictEqual(response.status, 200, '解析失败不得被缓存');
     assert.strictEqual((await response.json()).data.jmid, '7102');
+
+    // 端到端：异常 HTTP-200 章节页面不能在解析前固定为成功线路。
+    const validChapterFetch = global.fetch;
+    const chapterOrigins = [];
+    global.fetch = async (url, opts) => {
+      chapterOrigins.push(new URL(String(url)).origin);
+      return chapterOrigins.length === 1
+        ? new Response('<html>maintenance</html>', { status: 200 })
+        : validChapterFetch(url, opts);
+    };
+    response = await originalFetch(chapterUrl('7103'), { headers: { Cookie: sidCookie } });
+    assert.strictEqual(response.status, 200, '异常主线路应自动切换到能解析章节的备用线路');
+    assert.strictEqual((await response.json()).data.jmid, '7103');
+    assert.strictEqual(chapterOrigins.length, 2);
+    assert.notStrictEqual(chapterOrigins[0], chapterOrigins[1]);
 
     global.fetch = originalFetch;
     features.dohLookup = originalDohLookup;

@@ -160,11 +160,12 @@ function collectModuleDependencies(entry) {
 }
 
 function verifyShellInventory(shell) {
-  assert.match(workerSource, /const CACHE_VERSION = 'jmw-shell-v18'/, '外壳/版本化模块策略变更必须升级缓存版本');
+  assert.match(workerSource, /const CACHE_VERSION = 'jmw-shell-v21'/, '外壳/版本化模块策略变更必须升级缓存版本');
   const shellSet = new Set(shell);
   assert.strictEqual(shellSet.size, shell.length, 'SHELL 不得包含重复缓存键');
   assert(shellSet.has('/js/navigation.js'), 'SHELL 必须包含 app.js 的 navigation.js 依赖');
   assert(shellSet.has('/js/navigation-cache.js'), 'SHELL 必须包含返回导航缓存模块');
+  for (const url of ['/js/analytics-client.js', '/js/analytics-view.js', '/css/analytics.css']) assert(shellSet.has(url), `统计资源必须预缓存：${url}`);
 
   for (const url of shell) {
     const pathname = url === '/' ? '/index.html' : new URL(url, ORIGIN).pathname;

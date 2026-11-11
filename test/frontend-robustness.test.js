@@ -85,7 +85,7 @@ function jsonResponse(body, status = 200) {
     COMMENT_PAGE_SIZE, imgSrc, chapterImgSrc, commentAvatarSrc, commentContentText,
     commentPageCount, commentPageHasMore, isCommentSpoiler,
   } = await import(apiUrl);
-  const { comicCard, installImageRetry } = await import(uiUrl);
+  const { comicCard, installImageRetry, disposeImageRetries, observeImageRetries } = await import(uiUrl);
   const { commentItem } = await import(viewsUrl);
 
   // 列表上游字段异常时，封面地址和卡片渲染都必须退化为安全空值，
@@ -170,6 +170,131 @@ function jsonResponse(body, status = 200) {
   retryImage.onerror();
   assert.strictEqual(Object.prototype.hasOwnProperty.call(retryImage.attributes, 'src'), false);
   stopRetry();
+
+  // 路由离开不仅停止未来重试，也要撤销正在下载的封面和未开始的观察项。
+  const inFlightCover = new FakeElement('img');
+  installImageRetry(inFlightCover, '/api/img?path=cover-fixture', { delays: [100] });
+  assert.strictEqual(inFlightCover.attributes.src, '/api/img?path=cover-fixture');
+  inFlightCover.onerror(); // 同时覆盖已安排退避重试的清理。
+  const watched = new Set();
+  let imageObserverCallback;
+  global.IntersectionObserver = class {
+    constructor(callback) { imageObserverCallback = callback; }
+    observe(image) { watched.add(image); }
+    unobserve(image) { watched.delete(image); }
+  };
+  const pendingCover = new FakeElement('img');
+  installImageRetry(pendingCover, '/api/img?path=pending-fixture', { lazy: true });
+  assert(watched.has(pendingCover));
+  disposeImageRetries({ querySelectorAll: () => [inFlightCover, pendingCover] });
+  assert.strictEqual(inFlightCover.attributes.src, undefined, '离开路由必须撤销在途封面 src');
+  await new Promise((resolve) => setTimeout(resolve, 130));
+  assert.strictEqual(inFlightCover.attributes.src, undefined, '已清理的计时器不能重新启动请求');
+  assert.strictEqual(watched.size, 0, '已离开路由的封面必须解除观察');
+  imageObserverCallback([{ target: pendingCover, isIntersecting: true }]);
+  assert.strictEqual(pendingCover.attributes.src, undefined, '迟到的观察回调不能启动旧路由请求');
+  disposeImageRetries({ querySelectorAll: () => [inFlightCover, pendingCover] });
+  const reusedCover = new FakeElement('img');
+  const oldDispose = installImageRetry(reusedCover, '/api/img?path=old-fixture');
+  installImageRetry(reusedCover, '/api/img?path=new-fixture', { lazy: true });
+  oldDispose();
+  assert(watched.has(reusedCover), '过期清理函数不得注销新加载器的 lazy 观察项');
+  imageObserverCallback([{ target: reusedCover, isIntersecting: true }]);
+  assert.strictEqual(reusedCover.attributes.src, '/api/img?path=new-fixture');
+  disposeImageRetries({ querySelectorAll: () => [reusedCover] });
+  assert.strictEqual(reusedCover.attributes.src, undefined, '过期清理函数不得注销新加载器');
+
+  // 已完成的旧加载器也不能在同节点重新绑定后注销新 lazy 加载器。
+  const loadedCover = new FakeElement('img');
+  const loadedDispose = installImageRetry(loadedCover, '/api/img?path=loaded-fixture');
+  loadedCover.onload();
+  installImageRetry(loadedCover, '/api/img?path=reloaded-fixture', { lazy: true });
+  loadedDispose();
+  assert(watched.has(loadedCover));
+  imageObserverCallback([{ target: loadedCover, isIntersecting: true }]);
+  assert.strictEqual(loadedCover.attributes.src, '/api/img?path=reloaded-fixture');
+  disposeImageRetries(loadedCover);
+  assert.strictEqual(loadedCover.attributes.src, undefined, 'root 本身是 img 时也必须取消');
+
+  const reboundLazy = new FakeElement('img');
+  const oldLazyDispose = installImageRetry(reboundLazy, '/api/img?path=old-lazy', { lazy: true });
+  installImageRetry(reboundLazy, '/api/img?path=new-lazy', { lazy: true });
+  oldLazyDispose();
+  assert(watched.has(reboundLazy), '旧 lazy cleanup 不得 unobserve 新 lazy 加载器');
+  imageObserverCallback([{ target: reboundLazy, isIntersecting: true }]);
+  assert.strictEqual(reboundLazy.attributes.src, '/api/img?path=new-lazy');
+  disposeImageRetries(reboundLazy);
+
+  // 刷新先替换 DOM 后，路由扫描已找不到旧节点；必须在移除子树时清理。
+  assert.strictEqual(typeof observeImageRetries, 'function');
+  const mutations = [];
+  global.MutationObserver = class {
+    constructor(callback) { this.callback = callback; this.records = []; mutations.push(this); }
+    observe(root, options) { this.root = root; this.options = options; }
+    takeRecords() { const records = this.records; this.records = []; return records; }
+    disconnect() { this.disconnected = true; this.records = []; }
+    deliver() { this.callback(this.takeRecords()); }
+  };
+  const activeImages = new Set();
+  const routeRoot = { contains: (image) => activeImages.has(image), querySelectorAll: () => [...activeImages] };
+  observeImageRetries(routeRoot);
+  observeImageRetries(routeRoot);
+  assert.strictEqual(mutations.length, 1, '同一路由根节点不能重复注册 Observer');
+  const mutation = mutations[0];
+  assert.deepStrictEqual(mutation.options, { childList: true, subtree: true });
+  const removedLoading = new FakeElement('img');
+  const removedPending = new FakeElement('img');
+  const movedCover = new FakeElement('img');
+  installImageRetry(removedLoading, '/api/img?path=removed-loading', { delays: [100] });
+  removedLoading.onerror();
+  installImageRetry(removedPending, '/api/img?path=removed-pending', { lazy: true });
+  installImageRetry(movedCover, '/api/img?path=moved-cover', { lazy: true });
+  activeImages.add(movedCover); // 同一 root 内移动/重插：最终仍然属于此路由。
+  removedLoading.isConnected = false;
+  removedPending.isConnected = false;
+  const removedSubtree = { querySelectorAll: () => [removedLoading, removedPending, movedCover] };
+  mutation.records.push({ removedNodes: [removedSubtree, movedCover] });
+  mutation.deliver();
+  assert.strictEqual(removedLoading.attributes.src, undefined);
+  assert(!watched.has(removedPending), '已脱离 DOM 的离屏封面必须解除观察');
+  assert(watched.has(movedCover), 'root 内移动不能误取消仍有效的图片');
+  imageObserverCallback([{ target: movedCover, isIntersecting: true }]);
+  assert.strictEqual(movedCover.attributes.src, '/api/img?path=moved-cover');
+  removedPending.isConnected = true; // 迟到 IO 即使看到节点已连接，也不能复活旧加载器。
+  imageObserverCallback([{ target: removedPending, isIntersecting: true }]);
+  assert.strictEqual(removedPending.attributes.src, undefined);
+  await new Promise((resolve) => setTimeout(resolve, 130));
+  assert.strictEqual(removedLoading.attributes.src, undefined, '移除节点的重试计时器不得复活');
+
+  // 同一任务中先刷新再退出，MO 尚未回调：销毁必须同步排空 pending records。
+  const pendingRemoval = new FakeElement('img');
+  const pendingOffscreen = new FakeElement('img');
+  installImageRetry(pendingRemoval, '/api/img?path=pending-removal');
+  installImageRetry(pendingOffscreen, '/api/img?path=pending-offscreen', { lazy: true });
+  mutation.records.push({ removedNodes: [pendingRemoval, pendingOffscreen] });
+  disposeImageRetries(routeRoot);
+  assert.strictEqual(pendingRemoval.attributes.src, undefined);
+  assert(!watched.has(pendingOffscreen));
+  assert.strictEqual(movedCover.attributes.src, undefined);
+  assert(mutation.disconnected, '离开路由必须断开 DOM Observer');
+  disposeImageRetries(routeRoot);
+
+  // 旧路由的迟到 MO 回调不能取消新路由复用节点上的加载器。
+  observeImageRetries(routeRoot);
+  activeImages.delete(movedCover); // 新加载器已安装，但其子树尚未插入 main。
+  installImageRetry(movedCover, '/api/img?path=new-route', { lazy: true });
+  mutation.callback([{ removedNodes: [movedCover] }]);
+  assert(watched.has(movedCover));
+  activeImages.add(movedCover);
+  imageObserverCallback([{ target: movedCover, isIntersecting: true }]);
+  assert.strictEqual(movedCover.attributes.src, '/api/img?path=new-route');
+  disposeImageRetries(routeRoot);
+  assert.strictEqual(watched.size, 0);
+  delete global.MutationObserver;
+  delete global.IntersectionObserver;
+  const cleanupAppSource = require('fs').readFileSync(path.resolve(__dirname, '../public/js/app.js'), 'utf8');
+  assert.match(cleanupAppSource, /controller\.abort\(\);\s+disposeImageRetries\(main\);/, '路由销毁必须实际调用图片清理');
+  assert.match(cleanupAppSource, /observeImageRetries\(main\);[\s\S]*?route\.view\(main, m, search, ctx\)/, '渲染 View 前必须注册移除节点清理');
 
   assert.deepStrictEqual(normalizeChapterImages(null), []);
   assert.deepStrictEqual(normalizeChapterImages({}), []);

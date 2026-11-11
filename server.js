@@ -42,6 +42,7 @@ const { parsePhotoHtml } = require('./lib/photo');
 const sessions = require('./lib/sessions');
 const settings = require('./lib/settings');
 const features = require('./lib/features');
+const { Analytics } = require('./lib/analytics');
 const { ChapterAiScheduler, chapterSourceTitle, effectiveChapterTitle } = require('./lib/chapter-ai');
 const { createTranslationProxy } = require('./lib/translation-proxy');
 const {
@@ -239,6 +240,8 @@ const API_METHODS = Object.freeze({
   '/config/api-host': ['POST'],
   '/auth': ['POST'],
   '/me': ['GET'],
+  '/analytics': ['GET'],
+  '/analytics/event': ['POST'],
   '/login': ['POST'],
   '/logout': ['POST'],
   '/daily': ['GET'],
@@ -572,6 +575,22 @@ if (!ACCESS_SECRET) {
   } catch (e) {
     console.warn('[警告] 无法持久化访问密钥，重启后口令 Cookie 将失效:', e.message);
   }
+}
+
+const analytics = new Analytics({ dataDir: settings.DATA_DIR, secret: ACCESS_SECRET, warn: console.warn });
+function ensureVisitor(req, res) {
+  if (req.jmwVisitor) return req.jmwVisitor;
+  const visitor = analytics.visitor(getCookie(req, 'jmw_visitor'));
+  req.jmwVisitor = visitor;
+  if (visitor.fresh) {
+    const existing = res.getHeader('Set-Cookie');
+    const cookie = `jmw_visitor=${visitor.cookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${cookieSecurity(req)}`;
+    res.setHeader('Set-Cookie', [...(Array.isArray(existing) ? existing : existing ? [existing] : []), cookie]);
+  }
+  return visitor;
+}
+function analyticsProof(req, res, aid, title) {
+  return analytics.proof(ensureVisitor(req, res).id, aid, title);
 }
 
 function authToken() {
@@ -1784,8 +1803,9 @@ async function api(req, res, u, requestSignal) {
   const q = u.searchParams;
   // /api/auth 在口令验证前调用；/api/img 只依赖站点门禁和服务端图片白名单。
   // 两者都不创建 JM Session，避免首屏并发图片生成大量空 jmw_sid 文件。
-  const stateless = route === '/auth' || route === '/img' || route === '/translation/page';
+  const stateless = route === '/auth' || route === '/img' || route === '/translation/page' || route === '/analytics';
   const jar = stateless ? { cookiesByOrigin: {}, user: null, apiHost: '' } : ensureJar(req, res);
+  if (route === '/me') ensureVisitor(req, res);
 
   // 数据源由浏览器设置选择，但只能是固定枚举；实际 origin 始终来自服务端白名单。
   const dataSource = settings.normalizeDataSource(String(req.headers['x-jmw-data-source'] || 'mixed'));
@@ -1797,9 +1817,10 @@ async function api(req, res, u, requestSignal) {
   }
   // 透传到上游的快捷封装（会话内 API 域名覆盖优先）。成功响应会记住
   // 实际成功的精确 origin；登录可能走备用域名，后续请求必须继续使用同一
-  // origin，避免 Cookie 按域隔离后再次落到没有 AVS 的线路。
+  // origin，避免 Cookie 按域隔离后再次落到没有 AVS 的线路。公共章节
+  // 的选线与认证能力无关，必须用 rememberHost: false 禁止提升。
   const call = (opts = {}) => {
-    const { onSuccess, ...rest } = opts;
+    const { onSuccess, rememberHost = true, ...rest } = opts;
     return upstreamRequest({
       hosts: settings.apiHostsForSource(dataSource, jar.apiHost),
       cookieHosts: settings.allDataSourceHosts(),
@@ -1819,7 +1840,7 @@ async function api(req, res, u, requestSignal) {
           upstream_ms: Math.max(0, Number(meta && meta.durationMs) || Number(req.jmwApiTrace.upstream_ms) || 0),
           error_type: '',
         });
-        if (origin && settings.isTrustedApiHost(origin) && jar.apiHost !== origin) {
+        if (rememberHost && origin && settings.isTrustedApiHost(origin) && jar.apiHost !== origin) {
           jar.apiHost = origin;
           changed = true;
         }
@@ -1918,6 +1939,29 @@ async function api(req, res, u, requestSignal) {
     }
 
     /* ---- 用户 ---- */
+    case '/analytics': {
+      if (!rateLimit(`analytics-read:${clientIp(req)}`, 90, 60000) || !rateLimit('analytics-read:global', 600, 60000)) return sendJson(res, 429, { error: '统计查询过于频繁' });
+      const days = Number(q.get('days') || 7);
+      const page = Number(q.get('page') || 1);
+      if (![1, 7, 30].includes(days) || !Number.isInteger(page) || page < 1 || page > 100000) return sendJson(res, 400, { error: '统计参数无效' });
+      const summary = analytics.summary(days);
+      const { ranking, ...rest } = summary;
+      const actualPage = Math.min(page, Math.max(1, Math.ceil(ranking.length / 20)));
+      return sendJson(res, 200, { ...rest, ranking: ranking.slice((actualPage - 1) * 20, actualPage * 20), page: actualPage, pageSize: 20, total: ranking.length });
+    }
+    case '/analytics/event': {
+      if (!rateLimit(`analytics-write:${clientIp(req)}`, 300, 60000) || !rateLimit('analytics-write:global', 3000, 60000)) return sendJson(res, 429, { error: '统计上报过于频繁' });
+      const body = await readJsonBody(req);
+      if (!['page', 'active', 'comic'].includes(body.kind)) return sendJson(res, 400, { error: '统计事件无效' });
+      const visitor = ensureVisitor(req, res);
+      if (!rateLimit(`analytics-visitor:${visitor.id}`, 120, 60000)) return sendJson(res, 429, { error: '统计上报过于频繁' });
+      const comic = body.kind === 'comic' ? analytics.verifyProof(body.proof, visitor.id) : null;
+      if (body.kind === 'comic' && !comic) return sendJson(res, 400, { error: '浏览凭据无效或已过期' });
+      const uid = sessions.hasUpstreamAuth(jar) ? String(jar.user?.uid || jar.user?.id || jar.user?.user_id || '') : '';
+      const accepted = analytics.record({ visitorId: visitor.id, uid, kind: body.kind, comic });
+      return sendJson(res, 200, { ok: true, accepted });
+    }
+
     case '/me':
       // 旧版本可能只保存了用户资料却没有按 origin 保存 AVS；这类状态
       // 不能继续显示为“已登录”，否则收藏页会稳定收到上游 401。
@@ -2017,7 +2061,7 @@ async function api(req, res, u, requestSignal) {
           return row;
         });
       }
-      return sendJson(res, 200, out);
+      return sendJson(res, 200, { ...out, analyticsProof: analyticsProof(req, res, aid, value?.name) });
     }
 
     case '/search':
@@ -2101,9 +2145,12 @@ async function api(req, res, u, requestSignal) {
       const body = await readJsonBody(req);
       const commentId = String(body.comment_id || '');
       if (!/^\d+$/.test(commentId)) return sendJson(res, 400, { error: '评论 ID 不合法' });
-      return sendJson(res, 200, await call({ method: 'POST', path: '/comment_vote', form: [
+      const voteType = body.vote_type === undefined ? 'up' : body.vote_type;
+      if (!['up', 'down'].includes(voteType)) return sendJson(res, 400, { error: '投票类型不合法' });
+      // 对齐 jmcomic-next 的 @FormUrlEncoded；其它 @Multipart 端点不变。
+      return sendJson(res, 200, await call({ method: 'POST', path: '/comment_vote', formEncoding: 'urlencoded', form: [
         { name: 'comment_id', value: commentId },
-        { name: 'vote_type', value: body.vote_type === 'down' ? 'down' : 'up' },
+        { name: 'vote_type', value: voteType },
       ] }));
     }
 
@@ -2291,7 +2338,7 @@ async function api(req, res, u, requestSignal) {
       const parsed = await cachedPublicApi(
         publicApiKey('/chapter', dataSource, { id, shunt }), CHAPTER_CACHE_TTL_MS,
         async () => {
-          const html = await call({ path: '/chapter_view_template', signal: null, query: {
+          const html = await call({ path: '/chapter_view_template', rememberHost: false, signal: null, query: {
             id,
             app_img_shunt: shunt,
             mode: 'vertical',
@@ -2312,7 +2359,7 @@ async function api(req, res, u, requestSignal) {
       );
       // 用户访问章节即记录为后台候选；不绑定用户身份，按访问自然提升优先级。
       try { const aid = parsed.aid || id; const hotPriority = chapterAi.touchPopularity(aid, { photoId: id, weight: 2 }); chapterAi.enqueue(aid, id, hotPriority + 100); } catch (_) {}
-      return sendJson(res, 200, { code: 200, data: parsed });
+      return sendJson(res, 200, { code: 200, data: parsed, analyticsProof: analyticsProof(req, res, parsed.aid, '') });
     }
 
     /* ---- 图片代理 ---- */
@@ -2829,7 +2876,7 @@ function startServer() {
 /* ----------------------------- 优雅退出 ----------------------------- */
 
 let shuttingDown = false;
-function shutdown(signal) {
+async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`\n收到 ${signal}，正在保存状态…`);
@@ -2837,8 +2884,9 @@ function shutdown(signal) {
   try { chapterAi.stop(); chapterAi.flushSync(); } catch (_) {}
   try { sessions.flushAll(); } catch (_) {}
   try { settings.flushNow(); } catch (_) {}
-  server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000).unref();
+  try { await analytics.close(); } catch (_) {}
+  server.close(() => process.exit(0));
 }
 if (require.main === module) {
   process.on('SIGINT', () => shutdown('SIGINT'));
@@ -2850,6 +2898,7 @@ module.exports = {
   server,
   startServer,
   staticAssets,
+  analytics,
   API_METHODS,
   clientIp,
   requestIsSecure,

@@ -16,6 +16,14 @@ const envExample = read('.env.example');
 const server = read('server.js');
 const readme = read('README.md');
 const artifactValidator = path.join(root, 'scripts', 'validate-release-artifact.sh');
+const analyticsSource = read('lib/analytics.js');
+assert.match(analyticsSource, /const MAX_BYTES = 8 \* 1024 \* 1024;/);
+assert.match(analyticsSource, /const RETENTION_DAYS = 30;/);
+assert.match(readme, /data\/analytics\/state\.json/);
+assert.match(readme, /8 MiB/);
+assert.match(envExample, /analytics\/state\.json/);
+assert.match(compose, /analytics\/state\.json/);
+
 
 function mustMatch(text, pattern, message) {
   assert.match(text, pattern, message);

@@ -9,6 +9,7 @@ import {
 } from './ui.js';
 import { setting, getLocalHistory, getSearchHistory, addSearchHistory, clearSearchHistory } from './store.js';
 import { icon } from './icons.js';
+import { trackComic } from './analytics-client.js';
 import { replaceCurrentRouteHash, favoritesReturnTarget, returnToFavorites } from './navigation.js';
 import {
   buildSearchQuery, deserializeExcludedTags, filterComics, isComicBlocked,
@@ -69,7 +70,9 @@ export function homeView(root, ctx) {
   };
   const page = h('div', { class: 'page home-page' });
   const content = h('div', { class: 'home-content' });
-  page.append(content);
+  page.append(h('nav', { class: 'analytics-shortcuts', 'aria-label': '近期统计' },
+    h('a', { href: '#/analytics' }, icon('chart', 18), '最近用户数据'),
+    h('a', { href: '#/popular' }, icon('users', 18), '近期人气漫画')), content);
 
   const buildContinueStrip = () => {
     const strip = h('div', { class: 'hscroll continue-strip' });
@@ -814,12 +817,14 @@ export async function albumView(root, id, ctx) {
   }, '章节或详情有更新，点击刷新');
 
   let data;
+  let analyticsProof;
   try {
     const res = await api.cachedAlbum(id, ctx && ctx.signal, {
       onUpdate: () => { if (!isInactive(ctx)) refreshNotice.hidden = false; },
     });
     if (isInactive(ctx)) return;
     data = res && res.data;
+    analyticsProof = res?.analyticsProof;
   } catch (e) {
     if (isInactive(ctx)) return;
     if (isAbort(e)) { ctx?.refresh?.(); return; }
@@ -1075,6 +1080,7 @@ export async function albumView(root, id, ctx) {
   buildComposer(composerWrap, id, () => commentsCtl.reload(), ctx);
 
   page.append(hero, body);
+  trackComic(analyticsProof, ctx?.signal);
   page.querySelector('.spinner')?.closest('.empty')?.remove();
   const unsubscribe = navigationState.subscribe((reason) => {
     if (isInactive(ctx)) return;

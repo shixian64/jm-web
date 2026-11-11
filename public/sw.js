@@ -4,7 +4,7 @@
 
 'use strict';
 
-const CACHE_VERSION = 'jmw-shell-v18';
+const CACHE_VERSION = 'jmw-shell-v21';
 const SHELL = [
   '/',
   '/index.html',
@@ -13,9 +13,12 @@ const SHELL = [
   '/icons/icon-512.png',
   '/css/app.css',
   '/css/favorites.css',
+  '/css/analytics.css',
   '/css/offline.css',
   '/js/booterr.js',
   '/js/api.js',
+  '/js/analytics-client.js',
+  '/js/analytics-view.js',
   '/js/advanced.js',
   '/js/app.js',
   '/js/content-actions.js',

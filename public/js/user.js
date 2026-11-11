@@ -288,6 +288,9 @@ function rememberSourcePage(marker, seenPages) {
 
 export function userView(root, ctx) {
   const page = h('div', { class: 'page user-page' });
+  page.append(h('nav', { class: 'analytics-shortcuts', 'aria-label': '近期统计' },
+    h('a', { href: '#/analytics' }, icon('chart', 18), '最近用户数据'),
+    h('a', { href: '#/popular' }, icon('users', 18), '近期人气漫画')));
   const content = h('div');
   page.append(content);
   root.append(page);

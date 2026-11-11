@@ -1,7 +1,8 @@
 // 应用外壳与路由：顶栏（桌面导航）/ 底部 Tab（手机）/ 各页面挂载
 import { applyTheme, setting } from './store.js';
 import { api } from './api.js';
-import { h, toast, errorBox, routeErrorMessage } from './ui.js';
+import { startAnalytics, trackPage } from './analytics-client.js';
+import { h, toast, errorBox, routeErrorMessage, disposeImageRetries, observeImageRetries } from './ui.js';
 import { icon } from './icons.js';
 import { homeView, searchView, categoryView, categoryListView, promoteListView, weekView, albumView } from './views.js';
 import { registerOfflineWorker } from './offline.js';
@@ -27,6 +28,7 @@ function lazyModule(loader) {
 const loadReader = lazyModule(() => import('./reader.js'));
 const loadDownloadView = lazyModule(() => import('./download-view.js'));
 const loadUser = lazyModule(() => import('./user.js'));
+const loadAnalytics = lazyModule(() => import('./analytics-view.js'));
 
 // 模块加载期间路由可能已经离开；此时不得再向共享的 main 渲染旧页面。
 function lazyView(loader, mount) {
@@ -91,6 +93,7 @@ const topbar = h('div', { id: 'topbar' },
   h('div', { class: 'top-search' }, h('span', { class: 'search-leading', 'aria-hidden': 'true' }, icon('search', 17)), searchInput),
   h('div', { class: 'spacer' }),
   h('button', { class: 'icon-btn mobile-search', title: '搜索', 'aria-label': '打开搜索', onclick: () => { location.hash = '#/search'; } }, icon('search', 19)),
+  h('a', { class: 'icon-btn', href: '#/analytics', title: '用户数据与人气榜', 'aria-label': '打开用户数据仪表盘' }, icon('chart', 20)),
   h('button', { class: 'icon-btn', title: '设置', 'aria-label': '打开设置', onclick: () => { location.hash = '#/settings'; } }, icon('settings', 20)),
   avatarMini,
 );
@@ -106,6 +109,8 @@ const tabbar = h('nav', { id: 'tabbar', 'aria-label': '移动导航' },
 
 /* ---------- 路由 ---------- */
 const routes = [
+  { re: /^\/analytics\/?$/, view: lazyView(loadAnalytics, (mod, r, _m, q, ctx) => mod.analyticsView(r, q, ctx)) },
+  { re: /^\/popular\/?$/, view: lazyView(loadAnalytics, (mod, r, _m, q, ctx) => mod.analyticsView(r, q, ctx, true)) },
   { re: /^\/$/, view: (r, _m, _q, ctx) => homeView(r, ctx) },
   { re: /^\/search\/?$/, view: (r, _m, q, ctx) => searchView(r, q, ctx) },
   { re: /^\/category\/list\/?$/, view: (r, _m, q, ctx) => categoryListView(r, q, ctx) },
@@ -326,12 +331,14 @@ function render(navigation = {}) {
       currentRouteIsFullScreen = fullScreenView;
       document.body.classList.toggle('no-tab', fullScreenView);
       const controller = new AbortController();
+      observeImageRetries(main);
       let viewCleanup = null;
       let disposed = false;
       const dispose = () => {
         if (disposed) return;
         disposed = true;
         controller.abort();
+        disposeImageRetries(main);
         if (typeof viewCleanup === 'function') {
           try { viewCleanup(); } catch (e) { console.warn('[route] cleanup 失败:', e); }
           viewCleanup = null;
@@ -376,6 +383,7 @@ function render(navigation = {}) {
         // 使用同一套状态分级文案，避免把堆栈、路径或上游原文渲染给用户。
         main.replaceChildren(errorBox(routeErrorMessage(e)));
       }
+      if (!path.startsWith('/offline/')) trackPage();
       highlightNav(path);
       if (!fullScreenView) {
         const shouldRestore = navigation.historyTraversal === true || sameEntryRefresh;
@@ -430,6 +438,7 @@ let applicationStarted = false;
 function startApplication() {
   if (applicationStarted) return;
   applicationStarted = true;
+  startAnalytics({ canTrack: () => !isLocalAppLocked() && !accessGateOpen && !location.hash.startsWith('#/offline/') });
   window.addEventListener('hashchange', () => render(prepareHashNavigation()));
   render();
   refreshAvatar();

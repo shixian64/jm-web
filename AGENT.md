@@ -48,6 +48,7 @@ jm-web/
 │   ├── jm-api.js             JM 签名/AES 解密、响应上限、API Host 故障切换
 │   ├── https-fetch.js        DNS 校验后固定实际 TLS 地址、解压、取消和超时
 │   ├── photo.js              chapter_view_template HTML 解析
+│   ├── analytics.js          独立近期统计：HMAC 去重、30 日/8 MiB 有界状态、合并写盘
 │   ├── sessions.js           会话、按 Origin 隔离的 Cookie Jar、磁盘持久化
 │   ├── settings.js           API/图片 Host 与服务端设置
 │   ├── features.js           DoH、AI、搜索、更新检查和运行日志
@@ -62,6 +63,8 @@ jm-web/
 │   ├── css/                  全局、收藏与离线样式
 │   └── js/
 │       ├── app.js            应用外壳、路由、启动和路由清理
+│       ├── analytics-client.js 前台活动/成功展示埋点；后台、离线、本地锁不采集
+│       ├── analytics-view.js  用户仪表盘与按去重用户数排序的漫画榜（懒加载）
 │       ├── api.js            浏览器同源 API 封装和图片 URL
 │       ├── navigation.js     路由 entry marker、原地替换与收藏来源返回
 │       ├── navigation-cache.js 有界返回导航缓存、请求共享及认证世代保护
@@ -100,7 +103,7 @@ jm-web/
 
 ### 4.2 章节与图片
 
-1. `/api/chapter` 请求上游 `chapter_view_template`。
+1. `/api/chapter` 请求上游 `chapter_view_template`；HTTP 200 的章节 HTML 必须先通过 `parsePhotoHtml` 验证，再标记线路成功。异常页面在原有总时间预算内仅对 GET 换线，非幂等请求不重放。
 2. `lib/photo.js` 解析图片列表、图片 Host、解扰参数和章节元数据。
 3. `/api/img` 只代理受信 HTTPS Origin，逐跳校验重定向和 DNS。
 4. 后端只接受安全栅格 MIME，并执行大小、并发、背压和客户端取消控制。
@@ -114,10 +117,22 @@ jm-web/
 - 上游 Cookie 按精确 Origin 隔离，绝不能跨 Host 复制或发送到浏览器。
 - JM 登录响应 `data.s` 仅作为实际成功 Origin 的 `AVS` Cookie 写入；用户资料会脱敏，`s`/`jwttoken` 等认证字段不返回也不落盘。
 - 认证 GET 收到 401 时只在已有 AVS 的受信 Origin 间重试；全部失效后清除本地 JM 登录态，避免旧资料继续显示为已登录。
+- 公共 `/api/chapter` 的共享缓存回源使用 `rememberHost: false`：异常 HTML 换线成功也不能覆盖会话认证首选 Origin；登录及认证 GET 的成功线路提升保持不变，不复制 AVS、不扩大 POST 重放。
 - `/api/logout` 退出 JM 会话，不等于退出站点访问门禁。
 - 当前访问口令同时授予日志和全局 DoH 运维能力，因此只适合个人或完全互信用户，不是严格多租户 RBAC。
 
-### 4.4 离线能力
+### 4.4 近期统计
+
+- `#/analytics` / `#/popular` 进入应用即可查看，包括匿名访客；不新增管理口令，不公开个人标识/轨迹。
+- `GET /api/analytics` 只返回汇总，`POST /api/analytics/event` 复用门禁、JSON、方法白名单、同源保护和限流。
+- 账号必须同时有可信的 `jar.user` ID 和有效 AVS；随机 HttpOnly `jmw_visitor` 与 JM 会话分离，用 `.secret` 域分离派生 HMAC，禁止保存原始身份/IP/指纹。
+- 匿名记录在该浏览器登录时归并到账号；共享浏览器、退出账号、清 Cookie 及跨密钥轮换存在身份统计局限，不能称为真实人数。
+- 漫画访问仅成功可见详情/在线章节埋点；凭据由上游成功响应签发、绑定随机浏览器且 15 分钟过期。不得把后台下载、预取、图片请求或 chapter-ai 加权热度当作人数。
+- 固定北京时间自然日，范围 1/7/30 天，跨日集合去重，最近 30 日保留；固定 8 MiB 保守容量预算，满后拒绝新增条目并标注不完整，不静默淘汰近期 UV。
+- 10 秒合并异步原子保存，退出等待完成；保存失败保留旧文件重试，损坏/过大/未知版本状态停止采集且保留原文件。伪匿名作品关联仍属于敏感运行状态，沿用 `data/` 权限和备份要求，不进代码制品。
+- SW 缓存仅包括统计静态资源，绝不缓存统计接口或离线上传阅读轨迹；统计独立于 AI，不回填历史日志。
+
+### 4.5 离线能力
 
 - 静态资源 ETag 取自内容哈希（发布制品 mtime 统一为 0，不能再用 size/mtime）。`server.js` 为入口 HTML 注入 import map，把 `/js/*.js` 映射为 `?v=<内容哈希>`，CSS 链接同样版本化；只有 `?v=` 与当前内容一致时返回 `immutable` 长缓存，版本不匹配返回当前内容且为 `no-store`（`no-cache` 会被 Cloudflare 浏览器缓存 TTL 改写为 `max-age`，回滚后旧版本键下会残留新内容）。入口 `app.js` 保持无版本 URL，兼容旧 Service Worker 的入口校验。内联 import map 由 CSP 内容哈希放行。
 - Service Worker 只负责应用静态外壳，不缓存登录 API 或图片代理响应。版本化模块请求不附加 `no-cache`（交给 immutable HTTP 缓存），成功后写回同路径的无 query 外壳键，断网按路径回退；其他 query 变体一律不缓存。仅缓存 SHELL 清单的无查询静态键；预缓存与在线更新校验响应 MIME、最终 URL 和入口 HTML 标记，拒绝 HTTP 200 错误页。并发预缓存合并为一轮，响应校验失败不覆盖旧外壳。
@@ -140,7 +155,7 @@ jm-web/
 - API 和图片重定向不得自动跟随；每一跳重新验证。
 - 非幂等 API 请求经集中同源校验（`lib/origin-guard.js` 的 `checkSameOrigin`，server.js 在方法白名单后统一调用）：跨源、same-site 但不同 origin、`Origin: null`、`Sec-Fetch-Site: cross-site/same-site` 一律 403；无任何来源证据的请求（curl/脚本/老浏览器）放行但认证要求不变，SameSite=Lax 与 JSON Content-Type 仍是该场景防线。`JMW_TRUST_PROXY` 只接受精确 IP/CIDR，不默认信任私网段；不可信对端的 `X-Forwarded-For`/`X-Forwarded-Proto` 不改变 clientIp 与 Secure 判定。
 - 上游 Cookie 只发送给服务端明确受信的精确 Origin。
-- GET 和非幂等 POST 的重试语义不同：POST 只有确定未送达时才允许换 Host 重发。
+- GET 和非幂等 POST 的重试语义不同：POST 只有确定未送达时才允许换 Host 重发。`/comment_vote` 对齐参考客户端的 URL 编码表单，显式投票类型只接受 `up` / `down`；其它 multipart 端点保持原编码。
 - 5xx、DNS、TLS、内部路径和上游原文默认不得回显给浏览器。
 - API 日志不记录 Query，避免泄露搜索词、用户 ID 或临时参数。
 - 开启访问门禁时，图片响应保持 `private` 缓存语义，不能直接改成 CDN `public`。
@@ -185,7 +200,7 @@ chapter-ai 每个已接受任务预留 4 KiB 队列/运行/重试记录空间，
 - 手机端访问门禁、应用锁和空搜索页不得自动聚焦可编辑字段，避免 iOS Edge/Safari 长期显示“粘贴”或弹出键盘。
 - 页面根节点不得产生非设计性的横向滚动；横向漫画条、工具条和阅读器抽屉只能局部滚动。
 - 手机布局使用 `100dvh`、safe-area 和可滚动模态；至少回归竖屏、横屏和 PWA 模式。
-- 图片加载要控制并发和生命周期；离开首页后不能继续用大量封面占用阅读器图片通道。
+- 图片加载要控制并发和生命周期；渲染路由前调用 `observeImageRetries(main)`，用仅监听该根节点的 MutationObserver 清理刷新移除的子树（同根移动/重插不取消）；路由销毁调用 `disposeImageRetries(main)`，同步排空未交付的移除记录并断开 Observer，撤销在途封面 `src`、重试计时器和待触发观察项。过期 cleanup 不能注销新 lazy 加载器，避免离开首页后继续占用阅读器图片通道。阅读器只对带有效 `Retry-After` 的 429/503 准入拒绝最多额外重试两次，遵守服务端等待时间并退避/抖动；取消立即生效，不为 502/504 或网络错误再跑一轮上游换线。
 - 阅读器首图属于关键路径，标题、封面和章节抽屉等非关键元数据不得无条件阻塞首图。
 - Service Worker 对无版本 URL 仍在线优先协商；只有 import map 生成的内容哈希 URL 才可依赖长缓存。不要对无版本 URL 改成 cache-first，也不要绕过 `lib/static-assets.js` 手写版本号。
 - `app.js` 只静态导入首屏与应用锁所需模块（`advanced.js` 承载本地锁，必须静态导入）；阅读器、下载管理、用户页经 `lazyView` 按路由懒加载，加载完成时路由已离开则不得渲染。新增懒加载模块必须保持无顶层副作用，并仍列入 SW `SHELL`。
@@ -199,6 +214,7 @@ chapter-ai 每个已接受任务预留 4 KiB 队列/运行/重试记录空间，
 ```text
 /app/data
 ├── .secret
+├── analytics/state.json              最近统计（伪匿名去重关联，30 日/8 MiB）
 ├── settings.json
 ├── features.json
 ├── chapter-ai/

@@ -1,6 +1,7 @@
 // 阅读器：滚动 / 左右翻页 / 纯点击，Canvas 解扰，预加载，章节抽屉与阅读中设置
 // 协议与还原算法对齐 jm-mobile 的 ComicReadViewModel + ComicPicImageState
 import { apiRequest, chapterImgSrc, imgSrc, selectedDataSource } from './api.js';
+import { trackComic } from './analytics-client.js';
 import { setting, updateSetting, recordAlbumHistory } from './store.js';
 import { needsScramble, decodeFromBlob } from './descramble.js';
 import { h } from './ui.js';
@@ -17,6 +18,42 @@ const RAW_CACHE_DEFAULT_BYTES = 64 * MIB;
 const RAW_CACHE_MEMORY_OPT_BYTES = 32 * MIB;
 const READER_TUTORIAL_KEY = 'jmw_reader_tutorial_dismissed_v1';
 const SAFE_IMAGE_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']);
+
+/**
+ * 只重试代理明确要求稍后再试的准入拒绝，不重复整轮上游换线。
+ * 最多额外两次，遵守 Retry-After 并加退避/抖动；路由取消立即停止。
+ */
+export async function fetchReaderImageResponse(url, options = {}) {
+  const signal = options.signal;
+  const throwIfCancelled = () => {
+    if (signal?.aborted) throw signal.reason || new DOMException('阅读器已关闭', 'AbortError');
+  };
+  for (let attempt = 0; ; attempt++) {
+    throwIfCancelled();
+    const response = await fetch(url, { ...options, method: 'GET' });
+    if (attempt >= 2 || (response.status !== 503 && response.status !== 429)) return response;
+    const value = String(response.headers.get('Retry-After') || '').trim();
+    const delay = /^\d+$/.test(value) ? Number(value) * 1000
+      : /^[A-Za-z]{3}, .* GMT$/.test(value) ? Math.max(0, Date.parse(value) - Date.now()) : NaN;
+    // 过长的等待交给显式重试，不能截短服务端要求后提前回源。
+    if (!Number.isFinite(delay) || delay > 10000) return response;
+    try { await response.body?.cancel(); } catch (_) {}
+    throwIfCancelled();
+    await new Promise((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        reject(signal.reason || new DOMException('阅读器已关闭', 'AbortError'));
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, Math.max(delay, 1000 * (2 ** attempt)) + Math.floor(Math.random() * 250));
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+    });
+  }
+}
 
 /**
  * 计算原图 Blob 缓存预算。按设备内存自适应，且在“内存优化”开启时
@@ -932,6 +969,7 @@ export function mountReader(root, photoId, query, options = {}) {
     container.querySelector('.r-loading')?.remove();
     titleEl.textContent = `章节 ${state.photoId}`;
     render();
+    trackComic(data.analyticsProof, signal);
 
     const album = await albumPromise;
     if (state.destroyed) return;
@@ -1133,10 +1171,9 @@ export function mountReader(root, photoId, query, options = {}) {
       blob = stored?.blob;
       if (!(blob instanceof Blob) || !blob.size) throw new Error(`离线图片 ${idx + 1} 缺失或损坏`);
     } else {
-      // 服务端图片代理已经负责线路熔断和故障切换；浏览器不再重复触发
-      // 整个多域名遍历，避免一次坏线路把等待时间放大到几十秒。
+      // 上游故障仍由代理换线；仅带 Retry-After 的临时准入拒绝有限重试。
       assertImageActive(generation, imageSignal);
-      const res = await fetch(srcOf(idx), {
+      const res = await fetchReaderImageResponse(srcOf(idx), {
         headers: { 'X-JMW-Data-Source': selectedDataSource() },
         credentials: 'same-origin',
         priority: idx === state.cur ? 'high' : 'low',
