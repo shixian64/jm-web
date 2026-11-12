@@ -70,9 +70,7 @@ export function homeView(root, ctx) {
   };
   const page = h('div', { class: 'page home-page' });
   const content = h('div', { class: 'home-content' });
-  page.append(h('nav', { class: 'analytics-shortcuts', 'aria-label': '近期统计' },
-    h('a', { href: '#/analytics' }, icon('chart', 18), '最近用户数据'),
-    h('a', { href: '#/popular' }, icon('users', 18), '近期人气漫画')), content);
+  page.append(content);
 
   const buildContinueStrip = () => {
     const strip = h('div', { class: 'hscroll continue-strip' });

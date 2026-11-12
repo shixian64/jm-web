@@ -93,7 +93,7 @@ const topbar = h('div', { id: 'topbar' },
   h('div', { class: 'top-search' }, h('span', { class: 'search-leading', 'aria-hidden': 'true' }, icon('search', 17)), searchInput),
   h('div', { class: 'spacer' }),
   h('button', { class: 'icon-btn mobile-search', title: '搜索', 'aria-label': '打开搜索', onclick: () => { location.hash = '#/search'; } }, icon('search', 19)),
-  h('a', { class: 'icon-btn', href: '#/analytics', title: '用户数据与人气榜', 'aria-label': '打开用户数据仪表盘' }, icon('chart', 20)),
+  h('a', { class: 'icon-btn', href: '#/analytics', title: '数据统计', 'aria-label': '打开数据统计' }, icon('chart', 20)),
   h('button', { class: 'icon-btn', title: '设置', 'aria-label': '打开设置', onclick: () => { location.hash = '#/settings'; } }, icon('settings', 20)),
   avatarMini,
 );
