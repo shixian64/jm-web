@@ -17,7 +17,12 @@ class Element {
   replaceChildren(...children) { this.children = []; this.append(...children); }
   setAttribute(k, v) { this.attrs[k] = v; }
   set textContent(value) { this.children = [String(value)]; }
-  focus() { this.focused = true; this.attrs.onfocus?.(); }
+  focus() {
+    if (Element.activeElement) Element.activeElement.focused = false;
+    Element.activeElement = this;
+    this.focused = true;
+    this.attrs.onfocus?.();
+  }
   get textContent() { return this.children.map((v) => v instanceof Element ? v.textContent : String(v)).join(''); }
 }
 const h = (tag, attrs, ...children) => new Element(tag, attrs, children);
@@ -140,10 +145,17 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
   assert.strictEqual(stacks[1].children[1].attrs.style.height, '60%');
   const reference = find(root, (el) => hasClass(el, 'analytics-average-line'));
   assert.strictEqual(reference.attrs.style.bottom, '25%', '日均只用已启用日期，不能加上启用前的零');
+  const heading = find(root, (el) => hasClass(el, 'analytics-chart-heading'));
+  const description = find(heading, (el) => el.tag === 'p');
+  assert.strictEqual(description.textContent, '北京时间 · 活跃用户每天去重');
   const switchButton = find(root, (el) => el.tag === 'button' && el.textContent === '页面访问');
   switchButton.attrs.onclick();
   assert.strictEqual(switchButton.attrs['aria-pressed'], 'true');
   assert(root.textContent.includes('日均页面访问15次'));
+  assert.strictEqual(description.textContent, '北京时间 · 页面打开次数，非去重用户数', '页面访问模式必须展示次数口径');
+  find(root, (el) => el.tag === 'button' && el.textContent === '活跃用户').attrs.onclick();
+  assert.strictEqual(description.textContent, '北京时间 · 活跃用户每天去重', '切回用户数时恢复去重说明');
+  switchButton.attrs.onclick();
   columns = findAll(root, (el) => hasClass(el, 'analytics-column'));
   assert.strictEqual(findAll(root, (el) => hasClass(el, 'analytics-chart-columns')).length, 1, '切换不可堆叠图表节点');
   let prevented = false;
@@ -155,13 +167,55 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
   assert(inspector.textContent.includes('2026-11-10'), '键盘跳过未启用日期');
   find(root, (el) => el.attrs['aria-label'] === '查看后一天').attrs.onclick();
   assert(inspector.textContent.includes('2026-11-11'), '手机端可用相邻日期按钮查看密集数据');
+  const startedAtBeforeMixed = response.startedAt;
+  response = { ...response, startedAt: Date.parse('2026-11-09T00:00:00Z') };
+  const mixedRoot = h('div');
+  await viewContext.analyticsView(mixedRoot, new URLSearchParams(), ctx);
+  const mixedColumns = findAll(mixedRoot, (el) => hasClass(el, 'analytics-column'));
+  const mixedInspector = find(mixedRoot, (el) => hasClass(el, 'analytics-inspector'));
+  const mixedNext = find(mixedRoot, (el) => el.attrs['aria-label'] === '查看后一天');
+  mixedColumns[0].focus();
+  mixedColumns[1].attrs.onpointerenter({ pointerType: 'mouse' });
+  assert(mixedInspector.textContent.includes('2026-11-10'), '鼠标悬停仍可预览其他日期');
+  assert.strictEqual(Element.activeElement, mixedColumns[0], '悬停不可抢走键盘焦点');
+  mixedColumns[0].attrs.onkeydown({ key: 'ArrowRight', preventDefault() {} });
+  assert(mixedInspector.textContent.includes('2026-11-10'), '方向键须以实际焦点为起点，而非悬停日期');
+  assert.strictEqual(mixedColumns[1].attrs.tabindex, '0');
+  mixedColumns[2].attrs.onpointerenter({ pointerType: 'mouse' });
+  assert.strictEqual(mixedColumns[1].attrs.tabindex, '0', '悬停须保留原键盘入口');
+  assert.strictEqual(mixedColumns[2].attrs.tabindex, '-1');
+  assert.strictEqual(mixedColumns[1].attrs['aria-pressed'], 'true', '悬停预览不改变已选日期');
+  assert.strictEqual(mixedNext.disabled, false, '悬停预览不应禁用已选日期的后一天按钮');
+  mixedColumns[2].attrs.onpointerleave({ pointerType: 'mouse' });
+  assert(mixedInspector.textContent.includes('2026-11-10'), '鼠标离开后恢复已选日期');
+  mixedColumns[2].attrs.onpointerenter({ pointerType: 'mouse' });
+  mixedColumns[1].attrs.onkeydown({ key: 'ArrowRight', preventDefault() {} });
+  assert.strictEqual(Element.activeElement, mixedColumns[2], '方向键移动至相邻有效日期');
+  mixedColumns[1].attrs.onpointerenter({ pointerType: 'touch' });
+  assert(mixedInspector.textContent.includes('2026-11-11'), '触屏 pointerenter 不预览日期');
+  mixedColumns[0].attrs.onpointerenter({ pointerType: 'mouse' });
+  mixedColumns[2].attrs.onkeydown({ key: 'ArrowLeft', preventDefault() {} });
+  assert.strictEqual(Element.activeElement, mixedColumns[1], '左方向键同样以实际焦点为起点');
+  mixedColumns[0].attrs.onpointerenter({ pointerType: 'mouse' });
+  find(mixedRoot, (el) => el.tag === 'button' && el.textContent === '页面访问').attrs.onclick();
+  assert(mixedInspector.textContent.includes('2026-11-10'), '指标切换清除悬停预览并保留选中日期');
+  assert.strictEqual(findAll(mixedRoot, (el) => hasClass(el, 'analytics-column'))[1].attrs.tabindex, '0');
+  // redraw 后获取新节点，不能用旧图表引用模拟后续交互。
+  const redrawnColumns = findAll(mixedRoot, (el) => hasClass(el, 'analytics-column'));
+  redrawnColumns[1].attrs.onclick();
+  redrawnColumns[1].attrs.onpointerleave({ pointerType: 'mouse' });
+  assert(mixedInspector.textContent.includes('2026-11-10'), '点击日期后，离开仍保留所选日期');
+  response = { ...response, startedAt: startedAtBeforeMixed };
   const was = inspector.textContent;
   const chartAbort = new AbortController();
   let staleRoot = h('div');
   await viewContext.analyticsView(staleRoot, new URLSearchParams(), { ...ctx, signal: chartAbort.signal });
   const staleInspector = find(staleRoot, (el) => hasClass(el, 'analytics-inspector'));
   chartAbort.abort();
-  findAll(staleRoot, (el) => hasClass(el, 'analytics-column'))[1].attrs.onclick();
+  const staleColumn = findAll(staleRoot, (el) => hasClass(el, 'analytics-column'))[1];
+  staleColumn.attrs.onclick();
+  staleColumn.attrs.onpointerenter({ pointerType: 'mouse' });
+  staleColumn.attrs.onpointerleave({ pointerType: 'mouse' });
   assert.strictEqual(staleInspector.textContent, was, '路由退出后停止交互更新');
   response = { ...response, trend: [{ date: '2026-11-11', users: 1, accounts: 1, pageViews: 1 }] };
   root = h('div'); await viewContext.analyticsView(root, new URLSearchParams('days=1'), ctx);

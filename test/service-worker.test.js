@@ -160,7 +160,7 @@ function collectModuleDependencies(entry) {
 }
 
 function verifyShellInventory(shell) {
-  assert.match(workerSource, /const CACHE_VERSION = 'jmw-shell-v21'/, '外壳/版本化模块策略变更必须升级缓存版本');
+  assert.match(workerSource, /const CACHE_VERSION = 'jmw-shell-v22'/, '外壳/版本化模块策略变更必须升级缓存版本');
   const shellSet = new Set(shell);
   assert.strictEqual(shellSet.size, shell.length, 'SHELL 不得包含重复缓存键');
   assert(shellSet.has('/js/navigation.js'), 'SHELL 必须包含 app.js 的 navigation.js 依赖');

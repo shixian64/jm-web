@@ -125,6 +125,7 @@ function trendChart(source, ctx, startedAt, generatedAt) {
       field = key;
       draw();
     } }, label));
+  const description = h('p', { class: 'analytics-muted' });
   const caption = h('p', { class: 'analytics-muted analytics-chart-caption' });
   const summary = h('div', { class: 'analytics-chart-summary' });
   const legend = h('div', { class: 'analytics-chart-legend', 'aria-label': '图例' });
@@ -142,9 +143,19 @@ function trendChart(source, ctx, startedAt, generatedAt) {
     if (!active() || !rows[index]?.available) return;
     selected = index;
     columns.forEach((column, i) => {
-      column.setAttribute('class', `analytics-column${i === index ? ' is-selected' : ''}${!rows[i].available ? ' is-unavailable' : ''}`);
       column.setAttribute('aria-pressed', i === index ? 'true' : 'false');
       column.setAttribute('tabindex', i === index ? '0' : '-1');
+    });
+    preview(index);
+    previous.disabled = index === available[0];
+    next.disabled = index === available.at(-1);
+    if (focus) columns[index]?.focus?.({ preventScroll: true });
+  }
+  // 悬停只预览内容，不修改选中日期、键盘入口或实际焦点。
+  function preview(index) {
+    if (!active() || !rows[index]?.available) return;
+    columns.forEach((column, i) => {
+      column.setAttribute('class', `analytics-column${i === index ? ' is-selected' : ''}${!rows[i].available ? ' is-unavailable' : ''}`);
     });
     const row = rows[index];
     selectedDate.textContent = row.date;
@@ -154,9 +165,6 @@ function trendChart(source, ctx, startedAt, generatedAt) {
       ['匿名访客', row.users - row.accounts, '位'], ['页面访问', row.pageViews, '次'],
     ].map(([label, value, unit]) => h('div', { class: `analytics-inspector-value${(field === 'users' ? label === '活跃用户' : label === '页面访问') ? ' is-emphasis' : ''}` },
       h('span', null, label), h('strong', null, number(value), h('small', null, unit)))));
-    previous.disabled = index === available[0];
-    next.disabled = index === available.at(-1);
-    if (focus) columns[index]?.focus?.({ preventScroll: true });
   }
   function draw() {
     if (!active()) return;
@@ -166,6 +174,7 @@ function trendChart(source, ctx, startedAt, generatedAt) {
     const scale = analyticsChartScale(peak);
     const unit = field === 'users' ? '人' : '次';
     const label = field === 'users' ? '活跃用户' : '页面访问';
+    description.textContent = field === 'users' ? '北京时间 · 活跃用户每天去重' : '北京时间 · 页面打开次数，非去重用户数';
     switchers.forEach((button, index) => button.setAttribute('aria-pressed', modes[index][0] === field ? 'true' : 'false'));
     summary.replaceChildren(h('div', null, h('span', null, '日均' + label), h('strong', null,
       values.length ? average.toLocaleString('zh-CN', { maximumFractionDigits: 1 }) : '—', h('small', null, unit))),
@@ -184,12 +193,13 @@ function trendChart(source, ctx, startedAt, generatedAt) {
       const details = row.available ? `${row.date}：活跃用户 ${number(row.users)} 人，账号用户 ${number(row.accounts)} 人，匿名访客 ${number(row.users - row.accounts)} 位，页面访问 ${number(row.pageViews)} 次` : `${row.date}：统计尚未启用`;
       return h('button', { type: 'button', class: 'analytics-column', disabled: !row.available,
         'aria-label': details, title: details, onclick: () => select(index), onfocus: () => select(index),
-        onpointerenter: (event) => { if (event.pointerType === 'mouse') select(index); },
+        onpointerenter: (event) => { if (event.pointerType === 'mouse') preview(index); },
+        onpointerleave: (event) => { if (event.pointerType === 'mouse') preview(selected); },
         onkeydown: (event) => {
           const direction = ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key);
           if (!direction || !active()) return;
           event.preventDefault();
-          const position = available.indexOf(selected);
+          const position = available.indexOf(index);
           const target = event.key === 'Home' ? available[0] : event.key === 'End' ? available.at(-1)
             : available[Math.max(0, Math.min(available.length - 1, position + (event.key === 'ArrowLeft' ? -1 : 1)))];
           select(target, true);
@@ -214,7 +224,7 @@ function trendChart(source, ctx, startedAt, generatedAt) {
   }
   const chart = h('section', { class: 'analytics-trend' },
     h('div', { class: 'analytics-chart-heading' }, h('div', null, h('h2', null, '访问趋势'),
-      h('p', { class: 'analytics-muted' }, '北京时间 · 活跃用户每天去重')), h('div', { class: 'analytics-chart-switches', role: 'group', 'aria-label': '趋势指标' }, switchers)),
+      description), h('div', { class: 'analytics-chart-switches', role: 'group', 'aria-label': '趋势指标' }, switchers)),
     summary, legend, plot,
     h('div', { class: 'analytics-inspector', 'aria-live': 'polite', 'aria-atomic': 'true' },
       h('div', { class: 'analytics-inspector-heading' }, h('div', null, selectedDate, selectedHint), h('div', { class: 'analytics-day-controls' }, previous, next)), selectedValues),
