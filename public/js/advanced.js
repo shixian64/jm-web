@@ -2,6 +2,7 @@
 import { api } from './api.js';
 import {
   h, toast, errorBox, loadingBox, shouldAutoFocusEditable, confirmDialog, promptDialog, subpageBackLink,
+  closeAllModals,
 } from './ui.js';
 import { icon } from './icons.js';
 import {
@@ -33,6 +34,8 @@ function isolateLockBackground(on) {
     lockBackgroundState.clear();
     return;
   }
+  // 上锁前关闭锁屏之前打开的弹窗：弹窗层级高于锁屏且不参与隔离，否则可越过锁屏操作。
+  closeAllModals();
   for (const node of document.body.children) {
     if (node === lockOverlay || node.id === 'toast-root'
         || node.classList?.contains?.('jmw-modal-backdrop')

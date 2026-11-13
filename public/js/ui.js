@@ -554,6 +554,12 @@ export function subpageBackLink(href = '#/user', label = '返回上一级') {
 }
 
 let modalSeq = 0;
+const openModals = new Set();
+
+/** 关闭当前全部模态框（如应用锁上锁前，避免锁屏下方旧弹窗浮在锁屏之上仍可操作） */
+export function closeAllModals(reason = 'dismiss') {
+  [...openModals].forEach((close) => close(reason));
+}
 
 /**
  * 轻量无障碍模态框（替代原生 alert / confirm / prompt）。
@@ -645,6 +651,7 @@ export function openModal(options = {}) {
   function close(reason = 'dismiss') {
     if (closed) return;
     closed = true;
+    openModals.delete(close);
     if (typeof document !== 'undefined') document.removeEventListener('keydown', onKeyDown, true);
     if (typeof window !== 'undefined') window.removeEventListener('hashchange', onHashChange);
     backdrop.remove();
@@ -658,6 +665,7 @@ export function openModal(options = {}) {
     if (typeof onClose === 'function') onClose(reason);
   }
 
+  openModals.add(close);
   if (typeof document !== 'undefined') {
     document.addEventListener('keydown', onKeyDown, true);
     document.body.appendChild(backdrop);
