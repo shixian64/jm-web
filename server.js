@@ -183,8 +183,8 @@ const chapterAi = new ChapterAiScheduler({
   maxModelResponseBytes: process.env.CHAPTER_AI_MAX_MODEL_RESPONSE_BYTES || 4 * 1024 * 1024,
   modelFetch: features.outboundFetch,
   discover: async (scheduler) => {
-    const jar = { cookiesByOrigin: {}, user: null, apiHost: '' };
-    const callPublic = (pathName, query = {}) => upstreamRequest({ path: pathName, query, hosts: settings.apiHostsForSource('mixed', ''), cookieHosts: settings.allDataSourceHosts(), jar, dnsLookup: features.dohLookup, fetchImpl: features.outboundFetch });
+    const jar = anonymousJar();
+    const callPublic = (pathName, query = {}) => callPublicUpstream(pathName, query, { jar });
     const feeds = await Promise.all([callPublic('/promote'), callPublic('/week')]);
     const aids = new Set();
     const rankWeights = new Map();
@@ -203,18 +203,15 @@ const chapterAi = new ChapterAiScheduler({
     }
   },
   fetchChapter: async (aid, photoId, signal) => {
-    const jar = { cookiesByOrigin: {}, user: null, apiHost: '' };
-    const html = await upstreamRequest({
-      path: '/chapter_view_template',
-      query: { id: photoId, app_img_shunt: '1', mode: 'vertical', page: '0', express: 'off', v: String(Math.floor(Date.now() / 1000)) },
-      hosts: settings.apiHostsForSource('mixed', ''), cookieHosts: settings.allDataSourceHosts(), jar,
-      dnsLookup: features.dohLookup, fetchImpl: features.outboundFetch, signal,
-    });
+    const jar = anonymousJar();
+    const html = await callPublicUpstream('/chapter_view_template',
+      { id: photoId, app_img_shunt: '1', mode: 'vertical', page: '0', express: 'off', v: String(Math.floor(Date.now() / 1000)) },
+      { jar, signal });
     const parsed = parsePhotoHtml(String(html));
     if (parsed.imghost) settings.addImageHost(parsed.imghost);
     let name = '';
     try {
-      const album = await upstreamRequest({ path: '/album', query: { id: aid }, hosts: settings.apiHostsForSource('mixed', ''), cookieHosts: settings.allDataSourceHosts(), jar, dnsLookup: features.dohLookup, fetchImpl: features.outboundFetch, signal });
+      const album = await callPublicUpstream('/album', { id: aid }, { jar, signal });
       const value = album?.data || album;
       const rows = Array.isArray(value?.series) ? value.series : (Array.isArray(value?.chapters) ? value.chapters : []);
       const row = rows.find((item) => String(item?.id || item?.photoId || '') === String(photoId));
@@ -356,34 +353,142 @@ function sendJson(res, status, obj, extraHeaders = {}) {
 
 // 公共漫画数据在短时间内对所有访客一致。进程内 TTL + single-flight 可避免
 // 首页刷新、多个标签页同时打开时重复打满上游线路；用户态接口不使用此缓存。
-const publicApiCache = new Map();
-const publicApiFlights = new Map();
-const PUBLIC_API_CACHE_LIMIT = 256;
+//
+// 上游单次请求常需 1.5–9 秒，而 TTL 只有 30 秒：过期后的第一个访客总要等满一次
+// 上游。因此支持 stale-while-revalidate：过了新鲜期但仍在 staleMs 窗口内时立即
+// 返回旧值，并在后台单飞刷新；刷新失败保留旧值，不缓存错误。
 const CHAPTER_CACHE_TTL_MS = 10 * 60 * 1000;
+const CHAPTER_CACHE_STALE_MS = 20 * 60 * 1000;
+// 首页/列表/每周/分类：内容变化慢，旧数据最多保留 6 小时（期间后台刷新）。
+const FEED_CACHE_STALE_MS = 6 * 60 * 60 * 1000;
+const SEARCH_CACHE_STALE_MS = 30 * 60 * 1000;
+// 漫画详情含 liked/is_favorite 等用户态字段，只按“会话 + 用户”缓存。
+const ALBUM_CACHE_TTL_MS = 3 * 60 * 1000;
+const ALBUM_CACHE_STALE_MS = 15 * 60 * 1000;
 
-async function cachedPublicApi(key, ttlMs, loader) {
-  const cacheKey = String(key || '');
-  const now = Date.now();
-  const hit = publicApiCache.get(cacheKey);
-  if (hit && hit.expiresAt > now) {
-    publicApiCache.delete(cacheKey);
-    publicApiCache.set(cacheKey, hit);
-    return hit.value;
-  }
-  if (hit) publicApiCache.delete(cacheKey);
-  const running = publicApiFlights.get(cacheKey);
-  if (running) return running;
-  const flight = Promise.resolve().then(loader).then((value) => {
-    publicApiCache.set(cacheKey, { value, expiresAt: Date.now() + Math.max(1000, ttlMs) });
-    while (publicApiCache.size > PUBLIC_API_CACHE_LIMIT) {
-      publicApiCache.delete(publicApiCache.keys().next().value);
-    }
-    return value;
-  }).finally(() => {
-    if (publicApiFlights.get(cacheKey) === flight) publicApiFlights.delete(cacheKey);
+/** 无会话匿名 jar：后台任务（预热、章节 AI）只读取公共数据，不携带任何用户 Cookie。 */
+function anonymousJar() {
+  return { cookiesByOrigin: {}, user: null, apiHost: '' };
+}
+
+/** 后台公共上游调用（默认 mixed 线路）；预热、章节 AI 发现/取章共用同一套出站参数。 */
+function callPublicUpstream(pathName, query = {}, { jar = anonymousJar(), signal } = {}) {
+  return upstreamRequest({
+    path: pathName,
+    query,
+    hosts: settings.apiHostsForSource('mixed', ''),
+    cookieHosts: settings.allDataSourceHosts(),
+    jar,
+    dnsLookup: features.dohLookup,
+    fetchImpl: features.outboundFetch,
+    signal,
   });
-  publicApiFlights.set(cacheKey, flight);
-  return flight;
+}
+
+function createApiCache(limit) {
+  const entries = new Map();
+  const flights = new Map();
+
+  function load(cacheKey, ttlMs, staleMs, loader) {
+    const running = flights.get(cacheKey);
+    if (running) return running;
+    const flight = Promise.resolve().then(loader).then((value) => {
+      // 进行中被 deleteWhere 作废的请求仍把结果交给等待者，但不再写回缓存。
+      if (flights.get(cacheKey) !== flight) return value;
+      const expiresAt = Date.now() + Math.max(1000, ttlMs);
+      entries.delete(cacheKey);
+      entries.set(cacheKey, { value, expiresAt, staleUntil: expiresAt + Math.max(0, staleMs) });
+      while (entries.size > limit) entries.delete(entries.keys().next().value);
+      return value;
+    }).finally(() => {
+      if (flights.get(cacheKey) === flight) flights.delete(cacheKey);
+    });
+    flights.set(cacheKey, flight);
+    return flight;
+  }
+
+  async function get(key, ttlMs, loader, { staleMs = 0 } = {}) {
+    const cacheKey = String(key || '');
+    const now = Date.now();
+    const hit = entries.get(cacheKey);
+    if (hit && hit.expiresAt > now) {
+      entries.delete(cacheKey);
+      entries.set(cacheKey, hit);
+      return hit.value;
+    }
+    if (hit && hit.staleUntil > now) {
+      entries.delete(cacheKey);
+      entries.set(cacheKey, hit);
+      load(cacheKey, ttlMs, staleMs, loader).catch(() => {});
+      return hit.value;
+    }
+    if (hit) entries.delete(cacheKey);
+    return load(cacheKey, ttlMs, staleMs, loader);
+  }
+
+  /** 新鲜期内返回 true；供后台预热判断是否需要刷新。 */
+  function isFresh(key, now = Date.now()) {
+    const hit = entries.get(String(key || ''));
+    return !!hit && hit.expiresAt > now;
+  }
+
+  function deleteWhere(predicate) {
+    for (const key of [...entries.keys()]) if (predicate(key)) entries.delete(key);
+    for (const key of [...flights.keys()]) if (predicate(key)) flights.delete(key);
+  }
+
+  return { get, load, isFresh, deleteWhere, entries };
+}
+
+const publicApiStore = createApiCache(256);
+const albumApiStore = createApiCache(512);
+
+function cachedPublicApi(key, ttlMs, loader, options) {
+  return publicApiStore.get(key, ttlMs, loader, options);
+}
+
+function albumCacheKey(jar, dataSource, id) {
+  const user = jar && jar.user
+    ? String(jar.user.uid || jar.user.id || jar.user.username || 'user') : '';
+  return `album:${jar && jar.sid || ''}:${JSON.stringify([user, dataSource, String(id || '')])}`;
+}
+
+// 后台预热：有人使用时（最近 2 小时内有 API 请求）每 5 分钟刷新首页/每周/分类，
+// 让首屏常驻热缓存，同时保持上游 keep-alive 连接。闲置时不产生上游流量。
+const FEED_WARM_INTERVAL_MS = 5 * 60 * 1000;
+const FEED_WARM_ACTIVE_WINDOW_MS = 2 * 60 * 60 * 1000;
+const WARM_FEEDS = [
+  { route: '/home', path: '/promote', ttlMs: 30_000 },
+  { route: '/week', path: '/week', ttlMs: 60_000 },
+  { route: '/categories', path: '/categories', ttlMs: 300_000 },
+];
+const CONTENT_ACTIVITY_ROUTES = new Set([
+  '/home', '/promote_list', '/album', '/chapter', '/search', '/categories', '/categories_filter', '/week', '/week_filter',
+]);
+let lastApiActivityAt = 0;
+let feedWarmTimer = null;
+
+function warmPublicFeeds(now = Date.now()) {
+  if (!lastApiActivityAt || now - lastApiActivityAt > FEED_WARM_ACTIVE_WINDOW_MS) return [];
+  const jar = anonymousJar();
+  const started = [];
+  for (const feed of WARM_FEEDS) {
+    // 与路由使用相同的缓存键（默认数据源 mixed），前台请求直接命中。
+    const key = publicApiKey(feed.route, 'mixed');
+    if (publicApiStore.isFresh(key, now)) continue;
+    started.push(publicApiStore.load(key, feed.ttlMs, FEED_CACHE_STALE_MS,
+      () => callPublicUpstream(feed.path, {}, { jar })).catch((error) => {
+      console.warn(`[warm] ${feed.route} 预热失败: ${error && error.message}`);
+    }));
+  }
+  return started;
+}
+
+/** 点赞/收藏/登录态变化后清除该会话的详情缓存；aid 为空时清除该会话全部详情。 */
+function invalidateAlbumCache(jar, aid = '') {
+  const prefix = `album:${jar && jar.sid || ''}:`;
+  const suffix = aid ? `,${JSON.stringify(String(aid))}]` : '';
+  albumApiStore.deleteWhere((key) => key.startsWith(prefix) && (!suffix || key.endsWith(suffix)));
 }
 
 function publicApiKey(route, dataSource, query = {}) {
@@ -1809,6 +1914,8 @@ async function api(req, res, u, requestSignal) {
 
   // 数据源由浏览器设置选择，但只能是固定枚举；实际 origin 始终来自服务端白名单。
   const dataSource = settings.normalizeDataSource(String(req.headers['x-jmw-data-source'] || 'mixed'));
+  // 只有真实的内容浏览请求才算“有人在用”；/me 轮询、analytics 上报等后台流量不触发预热。
+  if (CONTENT_ACTIVITY_ROUTES.has(route)) lastApiActivityAt = Date.now();
   if (route !== '/img' && route !== '/auth') {
     req.jmwApiTrace = {
       request_id: crypto.randomBytes(8).toString('hex'),
@@ -1998,6 +2105,7 @@ async function api(req, res, u, requestSignal) {
         throw new ApiError('上游返回的用户资料格式异常或过大', 502);
       }
       jar.user = safeUser;
+      invalidateAlbumCache(jar);
       jar.apiHost = settings.normalizeHost(loginOrigin) || jar.apiHost;
       sessions.scheduleSave(jar);
       // 不把 s/jwttoken 等认证字段回传给浏览器；前端只需要展示资料。
@@ -2005,6 +2113,7 @@ async function api(req, res, u, requestSignal) {
     }
 
     case '/logout':
+      invalidateAlbumCache(jar);
       sessions.destroyJar(jar.sid);
       res.setHeader('Set-Cookie', `jmw_sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${cookieSecurity(req)}`);
       return sendJson(res, 200, { ok: true });
@@ -2025,6 +2134,7 @@ async function api(req, res, u, requestSignal) {
       return sendJson(res, 200, await cachedPublicApi(
         publicApiKey('/home', dataSource), 30_000,
         () => call({ path: '/promote', signal: null }),
+        { staleMs: FEED_CACHE_STALE_MS },
       ));
 
     case '/promote_list':
@@ -2033,11 +2143,19 @@ async function api(req, res, u, requestSignal) {
         return sendJson(res, 200, await cachedPublicApi(
           publicApiKey('/promote_list', dataSource, query), 30_000,
           () => call({ path: '/promote_list', query, signal: null }),
+          { staleMs: FEED_CACHE_STALE_MS },
         ));
       }
 
     case '/album': {
-      const out = await call({ path: '/album', query: { id: q.get('id') } });
+      const albumId = q.get('id');
+      // 详情页与阅读器会先后请求同一部漫画；按“会话 + 用户”短期缓存，克隆后再加工，
+      // 不能把章节标题替换写回缓存对象。
+      const out = structuredClone(await albumApiStore.get(
+        albumCacheKey(jar, dataSource, albumId), ALBUM_CACHE_TTL_MS,
+        () => call({ path: '/album', query: { id: albumId }, signal: null }),
+        { staleMs: ALBUM_CACHE_STALE_MS },
+      ));
       const value = out?.data || out; const aid = String(q.get('id') || '');
       const hotPriority = chapterAi.touchPopularity(aid, { weight: 1 });
       const rows = Array.isArray(value?.series) ? value.series : [];
@@ -2074,6 +2192,7 @@ async function api(req, res, u, requestSignal) {
         return sendJson(res, 200, await cachedPublicApi(
           publicApiKey('/search', dataSource, query), 30_000,
           () => call({ path: '/search', query, signal: null }),
+          { staleMs: SEARCH_CACHE_STALE_MS },
         ));
       }
 
@@ -2081,6 +2200,7 @@ async function api(req, res, u, requestSignal) {
       return sendJson(res, 200, await cachedPublicApi(
         publicApiKey('/categories', dataSource), 300_000,
         () => call({ path: '/categories', signal: null }),
+        { staleMs: FEED_CACHE_STALE_MS },
       ));
 
     case '/categories_filter':
@@ -2093,6 +2213,7 @@ async function api(req, res, u, requestSignal) {
         return sendJson(res, 200, await cachedPublicApi(
           publicApiKey('/categories_filter', dataSource, query), 30_000,
           () => call({ path: '/categories/filter', query, signal: null }),
+          { staleMs: FEED_CACHE_STALE_MS },
         ));
       }
 
@@ -2100,6 +2221,7 @@ async function api(req, res, u, requestSignal) {
       return sendJson(res, 200, await cachedPublicApi(
         publicApiKey('/week', dataSource), 60_000,
         () => call({ path: '/week', signal: null }),
+        { staleMs: FEED_CACHE_STALE_MS },
       ));
 
     case '/week_filter':
@@ -2112,6 +2234,7 @@ async function api(req, res, u, requestSignal) {
         return sendJson(res, 200, await cachedPublicApi(
           publicApiKey('/week_filter', dataSource, query), 60_000,
           () => call({ path: '/week/filter', query, signal: null }),
+          { staleMs: FEED_CACHE_STALE_MS },
         ));
       }
 
@@ -2154,15 +2277,28 @@ async function api(req, res, u, requestSignal) {
       ] }));
     }
 
-    case '/like':
-      return sendJson(res, 200, await call({ method: 'POST', path: '/like', form: [
-        { name: 'id', value: String(q.get('id') || '') },
-      ] }));
+    case '/like': {
+      // 变更前后都清除：避免变更期间仍在进行的详情请求把旧的 liked 写回缓存。
+      invalidateAlbumCache(jar, q.get('id'));
+      try {
+        return sendJson(res, 200, await call({ method: 'POST', path: '/like', form: [
+          { name: 'id', value: String(q.get('id') || '') },
+        ] }));
+      } finally {
+        invalidateAlbumCache(jar, q.get('id'));
+      }
+    }
 
-    case '/favorite':
-      return sendJson(res, 200, await callWithAuthRecovery({ method: 'POST', path: '/favorite', form: [
-        { name: 'aid', value: String(q.get('aid') || '') },
-      ] }));
+    case '/favorite': {
+      invalidateAlbumCache(jar, q.get('aid'));
+      try {
+        return sendJson(res, 200, await callWithAuthRecovery({ method: 'POST', path: '/favorite', form: [
+          { name: 'aid', value: String(q.get('aid') || '') },
+        ] }));
+      } finally {
+        invalidateAlbumCache(jar, q.get('aid'));
+      }
+    }
 
     case '/favorite_folder': {
       const body = await readJsonBody(req);
@@ -2356,7 +2492,11 @@ async function api(req, res, u, requestSignal) {
           if (result.imghost) settings.addImageHost(result.imghost);
           return result;
         },
+        { staleMs: CHAPTER_CACHE_STALE_MS },
       );
+      // 详情页的后台预取（prefetch=1）只预热缓存：不计入热度/AI 队列，也不签发阅读凭证，
+      // 否则浏览详情页就会被当作阅读，抬高未读章节的 AI 优先级。
+      if (q.get('prefetch') === '1') return sendJson(res, 200, { code: 200, data: parsed });
       // 用户访问章节即记录为后台候选；不绑定用户身份，按访问自然提升优先级。
       try { const aid = parsed.aid || id; const hotPriority = chapterAi.touchPopularity(aid, { photoId: id, weight: 2 }); chapterAi.enqueue(aid, id, hotPriority + 100); } catch (_) {}
       return sendJson(res, 200, { code: 200, data: parsed, analyticsProof: analyticsProof(req, res, parsed.aid, '') });
@@ -2865,6 +3005,10 @@ function startServer() {
     imageStatsTimer = setInterval(() => flushImageStats(), IMAGE_STATS_INTERVAL_MS);
     imageStatsTimer.unref();
   }
+  if (!feedWarmTimer) {
+    feedWarmTimer = setInterval(() => warmPublicFeeds(), FEED_WARM_INTERVAL_MS);
+    feedWarmTimer.unref();
+  }
   return server.listen(PORT, HOST, () => {
     console.log(`JM Web 已启动: http://localhost:${PORT}  (Node ${process.version})`);
     if (ACCESS_PASSWORD) console.log('访问口令保护已开启');
@@ -2896,6 +3040,9 @@ if (require.main === module) {
 
 module.exports = {
   server,
+  createApiCache,
+  albumCacheKey,
+  warmPublicFeeds,
   startServer,
   staticAssets,
   analytics,

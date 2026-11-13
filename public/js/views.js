@@ -826,6 +826,26 @@ function weekLabel(c, index) {
 
 /* ============================== 漫画详情 ============================== */
 
+/**
+ * 详情页渲染后，在空闲时预取最可能阅读的章节（本地历史的续读章节，否则第一章）。
+ * 服务端会把章节清单缓存 10 分钟，点击“开始/继续阅读”时即可命中，省去一次
+ * 数秒的上游请求。离线续读、省流量模式或页面已离开时不预取；失败静默忽略。
+ */
+function prefetchLikelyChapter(id, series, localRec, ctx) {
+  if (localRec?.offline) return;
+  if (typeof navigator !== 'undefined' && navigator.connection?.saveData) return;
+  const localPhotoId = String(localRec?.photoId || '');
+  const firstId = String(series[0]?.id || '');
+  const target = /^\d+$/.test(localPhotoId) ? localPhotoId : (/^\d+$/.test(firstId) ? firstId : String(id));
+  if (!/^\d+$/.test(target)) return;
+  const shunt = ['1', '2', '3', '4'].includes(String(setting.shunt)) ? String(setting.shunt) : '1';
+  setTimeout(() => {
+    if (ctx && typeof ctx.isActive === 'function' && !ctx.isActive()) return;
+    // 不绑定路由 signal：离开详情页时让服务端照常完成并缓存，进入阅读器即可命中。
+    try { Promise.resolve(api.prefetchChapter(target, shunt)).catch(() => {}); } catch (_) {}
+  }, 600);
+}
+
 export async function albumView(root, id, ctx) {
   const page = h('div', { class: 'page-wide' });
   page.append(loadingBox());
@@ -970,6 +990,7 @@ export async function albumView(root, id, ctx) {
       onclick: () => { location.hash = localContinueHref; },
     }, icon('history', 16), `继续阅读：${localRec.name || ''} 第 ${Number(localRec.page || 0) + 1} 页`));
   }
+  prefetchLikelyChapter(id, series, localRec, ctx);
 
   const refreshBtn = h('button', {
     class: 'btn', type: 'button',

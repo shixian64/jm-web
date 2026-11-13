@@ -1,6 +1,6 @@
 // 应用外壳与路由：顶栏（桌面导航）/ 底部 Tab（手机）/ 各页面挂载
 import { applyTheme, setting } from './store.js';
-import { api } from './api.js';
+import { api, prefetchBootHome, markBootSeen } from './api.js';
 import { startAnalytics, trackPage } from './analytics-client.js';
 import { h, toast, errorBox, routeErrorMessage, disposeImageRetries, observeImageRetries } from './ui.js';
 import { icon } from './icons.js';
@@ -439,6 +439,7 @@ let applicationStarted = false;
 function startApplication() {
   if (applicationStarted) return;
   applicationStarted = true;
+  markBootSeen();
   startAnalytics({ canTrack: () => !isLocalAppLocked() && !accessGateOpen && !location.hash.startsWith('#/offline/') });
   window.addEventListener('hashchange', () => render(prepareHashNavigation()));
   render();
@@ -455,6 +456,10 @@ async function boot() {
   if (isLocalAppLocked()) {
     await new Promise((resolve) => window.addEventListener('jmw-local-unlocked', resolve, { once: true }));
   }
+
+  // 首页与门禁检查并行请求，省去一次串行往返；门禁拦截时预取结果被丢弃。
+  const bootPath = location.hash.replace(/^#/, '').split('?')[0] || '/';
+  if (bootPath === '/') prefetchBootHome();
 
   // 访问口令保护：/api/me 返回 401 说明服务器开启了口令且本机未验证
   const accessProbe = new AbortController();

@@ -160,7 +160,7 @@ function collectModuleDependencies(entry) {
 }
 
 function verifyShellInventory(shell) {
-  assert.match(workerSource, /const CACHE_VERSION = 'jmw-shell-v25'/, '外壳/版本化模块策略变更必须升级缓存版本');
+  assert.match(workerSource, /const CACHE_VERSION = 'jmw-shell-v26'/, '外壳/版本化模块策略变更必须升级缓存版本');
   const shellSet = new Set(shell);
   assert.strictEqual(shellSet.size, shell.length, 'SHELL 不得包含重复缓存键');
   assert(shellSet.has('/js/navigation.js'), 'SHELL 必须包含 app.js 的 navigation.js 依赖');
@@ -239,6 +239,23 @@ function verifyShellInventory(shell) {
   await harness.navigate('/index.html?deploy=next');
   assert.strictEqual(await (await cache.match('/index.html')).text(), refreshed,
     '合法入口 HTML 应更新离线首页');
+
+  // 服务端把入口改写为内联 `import "/js/app.js"`（经 import map 走版本化 URL）后，
+  // 该 HTML 同样是合法入口；内联脚本若导入其他模块则不算。
+  const rewritten = realIndex.replace(
+    /<script\s+type="module"\s+src="\/js\/app\.js"\s*><\/script>/,
+    '<script type="module">import "/js/app.js";</script>',
+  );
+  assert.notStrictEqual(rewritten, realIndex, '测试前提：源 index.html 含模块入口脚本');
+  harness.setFetch(async () => networkResponse(rewritten, 'text/html'));
+  await harness.navigate('/');
+  assert.strictEqual(await (await cache.match('/index.html')).text(), rewritten,
+    '服务端改写后的内联入口 HTML 应更新离线首页');
+  const foreignImport = rewritten.replace('import "/js/app.js";', 'import "/js/evil.js";');
+  harness.setFetch(async () => networkResponse(foreignImport, 'text/html'));
+  await harness.navigate('/');
+  assert.strictEqual(await (await cache.match('/index.html')).text(), rewritten,
+    '内联脚本导入的不是 /js/app.js 时不得视为应用入口');
 
   // 旧版本缓存先插入一个污染项；断网时必须只读取当前 CACHE_VERSION。
   const offlineHarness = createWorkerHarness(async () => {

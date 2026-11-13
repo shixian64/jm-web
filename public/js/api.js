@@ -131,6 +131,59 @@ async function request(path, opts = {}) {
 // 阅读器/下载同样必须经过统一的超时、认证世代与 401 分流，不再各自直连 JSON API。
 export { request as apiRequest };
 
+// 启动预取首页：boot 需先等 /api/me 判断站点门禁，首页数据再串行请求会多一次
+// 往返。门禁检查同时发起 /api/home，首个 api.home() 复用该结果。使用原生 fetch
+// 而非 request()：门禁 401 只能由 boot 单实例处理。
+// 仅对此前已成功启动过的浏览器预取：首次访问尚无 jmw_sid，并发的 /me 与 /home
+// 会各自创建并持久化一个会话，留下孤儿会话文件。
+const BOOT_SEEN_KEY = 'jmw_boot_seen';
+let bootHomePrefetch = null;
+export function markBootSeen() {
+  try { localStorage.setItem(BOOT_SEEN_KEY, '1'); } catch (_) {}
+}
+export function prefetchBootHome() {
+  if (bootHomePrefetch || typeof fetch !== 'function') return;
+  try { if (localStorage.getItem(BOOT_SEEN_KEY) !== '1') return; } catch (_) { return; }
+  const source = selectedDataSource();
+  const epoch = identityEpoch;
+  const timeoutSignal = typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+    ? AbortSignal.timeout(60000) : undefined;
+  // 结果：{ json } 成功；{ error } 服务端已给出确定错误（直接抛出，避免再串行等一轮上游）；
+  // null 表示门禁 401 或网络失败，回退正常请求。
+  const pending = fetch('/api/home', {
+    headers: { 'Content-Type': 'application/json', 'X-JMW-Data-Source': source },
+    signal: timeoutSignal,
+  }).then(async (res) => {
+    let json = null;
+    try { json = await res.json(); } catch (_) {}
+    if (res.ok && json && typeof json === 'object') return { json };
+    if (res.status === 401 || res.status === 403) return null;
+    const error = new Error((json && json.error) || `请求失败（${res.status}）`);
+    error.status = res.status;
+    return { error };
+  }).catch(() => null);
+  bootHomePrefetch = { pending, source, epoch, at: Date.now() };
+}
+
+function abortable(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason || new DOMException('Aborted', 'AbortError'));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(signal.reason || new DOMException('Aborted', 'AbortError'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
+function takeBootHome() {
+  const prefetched = bootHomePrefetch;
+  bootHomePrefetch = null;
+  // 数据源/身份已变化或预取过旧时不复用。
+  if (!prefetched || prefetched.source !== selectedDataSource() || prefetched.epoch !== identityEpoch
+      || Date.now() - prefetched.at > 30_000) return null;
+  return prefetched.pending;
+}
+
 export const api = {
   config: (signal) => request('/config', { signal }),
   setApiHost: (apiHost, signal) => mutation('/config/api-host', { method: 'POST', body: JSON.stringify({ apiHost }), signal }, 'host'),
@@ -158,7 +211,15 @@ export const api = {
   daily: (userId, signal) => request(`/daily?user_id=${userId}`, { signal }),
   dailyCheck: (userId, dailyId) => request('/daily_chk', { method: 'POST', body: JSON.stringify({ user_id: userId, daily_id: dailyId }) }),
 
-  home: (signal) => request('/home', { signal }),
+  home: async (signal) => {
+    const prefetched = takeBootHome();
+    if (prefetched) {
+      const result = await abortable(prefetched, signal);
+      if (result?.json) return result.json;
+      if (result?.error) throw result.error;
+    }
+    return request('/home', { signal });
+  },
   promoteList: (id, page, signal) => request(`/promote_list?id=${encodeURIComponent(id)}&page=${page}`, { signal }),
   album: (id, signal) => request(`/album?id=${id}`, { signal }),
   cachedAlbum: (id, signal, options = {}) => navigationCache.read(
@@ -166,6 +227,8 @@ export const api = {
     { ...options, signal, validate: (value) => value?.data && typeof value.data === 'object' && !Array.isArray(value.data) },
   ),
   chapter: (id, shunt, signal) => request(`/chapter?id=${id}&shunt=${shunt || 1}`, { signal }),
+  // 仅预热服务端章节缓存；服务端不计热度、不签发阅读凭证。
+  prefetchChapter: (id, shunt) => request(`/chapter?id=${id}&shunt=${shunt || 1}&prefetch=1`),
   chapterAi: (aid, photoId, signal) => request(`/chapter-ai?aid=${encodeURIComponent(aid)}${photoId ? `&photoId=${encodeURIComponent(photoId)}` : ''}`, { signal }),
   search: (q, o, page, signal) => request(`/search?q=${encodeURIComponent(q)}&o=${o}&page=${page}`, { signal }),
   categories: (signal) => request('/categories', { signal }),

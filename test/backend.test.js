@@ -481,15 +481,30 @@ class MockServerResponse extends EventEmitter {
     assert.ok(importMapText, '入口 HTML 必须注入 import map');
     assert.ok(indexHtml.indexOf('type="importmap"') < indexHtml.indexOf('type="module"'),
       'import map 必须先于模块脚本');
-    assert.match(indexHtml, /<script type="module" src="\/js\/app\.js"><\/script>/,
-      '入口脚本保持无版本 URL，兼容旧 Service Worker 的入口校验');
+    // 入口改写为内联 import：说明符经 import map 解析为版本化 URL，命中 immutable 缓存，
+    // 不再每次启动对无版本 /js/app.js 发起一次协商/全量请求。
+    assert.match(indexHtml, /<script type="module">import "\/js\/app\.js";<\/script>/,
+      '入口脚本必须改写为经 import map 解析的内联 import');
+    assert.doesNotMatch(indexHtml, /<script[^>]*src="\/js\/app\.js"/, '不得残留无版本入口 URL');
+    assert.match(indexHtml, /<script src="\/js\/booterr\.js\?v=[A-Za-z0-9_-]{16}"><\/script>/, '经典脚本也必须版本化');
     const importMap = JSON.parse(importMapText).imports;
     assert.strictEqual(importMap['/js/app.js'], `/js/app.js?v=${appJsHash}`);
     assert.ok(importMap['/js/reader.js'] && importMap['/js/user.js'], '懒加载模块也必须版本化');
     assert.match(indexHtml, /href="\/css\/app\.css\?v=[A-Za-z0-9_-]{16}"/, 'CSS 链接必须版本化');
+    // 启动依赖闭包以 modulepreload 并行下载，且必须位于 import map 之后、只含版本化 URL；
+    // 懒加载模块（阅读器）不得预加载。
+    const preloads = [...indexHtml.matchAll(/<link rel="modulepreload" href="([^"]+)" \/>/g)].map((m) => m[1]);
+    assert.ok(preloads.includes(importMap['/js/app.js']) && preloads.includes(importMap['/js/api.js'])
+      && preloads.includes(importMap['/js/navigation-cache.js']), '必须预加载入口及其传递依赖');
+    assert.ok(preloads.every((href) => Object.values(importMap).includes(href)), 'modulepreload 只能指向版本化 URL');
+    assert.ok(!preloads.includes(importMap['/js/reader.js']), '懒加载模块不得预加载');
+    assert.ok(indexHtml.indexOf('type="importmap"') < indexHtml.indexOf('rel="modulepreload"'),
+      'import map 必须先于 modulepreload');
     const importMapHash = crypto.createHash('sha256').update(importMapText).digest('base64');
-    assert.ok((response.headers.get('content-security-policy') || '').includes(`script-src 'self' 'sha256-${importMapHash}'`),
-      'CSP 必须以内容哈希放行 import map');
+    const entryHash = crypto.createHash('sha256').update('import "/js/app.js";').digest('base64');
+    const indexCsp = response.headers.get('content-security-policy') || '';
+    assert.ok(indexCsp.includes(`script-src 'self' 'sha256-${importMapHash}'`), 'CSP 必须以内容哈希放行 import map');
+    assert.ok(indexCsp.includes(`'sha256-${entryHash}'`), 'CSP 必须以内容哈希放行内联入口');
 
     // 与当前内容一致的版本化 URL 才是 immutable；过期版本按协商缓存返回当前内容。
     response = await originalFetch(`http://127.0.0.1:${port}${importMap['/js/app.js']}`, { headers: identity });
@@ -1207,6 +1222,18 @@ var aid = 5005; var scramble_id = 220980; var speed = '';</script>`, { status: 2
     response = await originalFetch(chapterUrl('7102'));
     assert.strictEqual(response.status, 200, '解析失败不得被缓存');
     assert.strictEqual((await response.json()).data.jmid, '7102');
+
+    // 详情页预取（prefetch=1）只预热缓存：不签发阅读凭证，随后正式打开同一章节命中缓存。
+    const callsBeforePrefetch = chapterCalls;
+    response = await originalFetch(chapterUrl('7104', '&prefetch=1'));
+    assert.strictEqual(response.status, 200);
+    const prefetchedChapter = await response.json();
+    assert.strictEqual(prefetchedChapter.data.jmid, '7104');
+    assert.ok(!('analyticsProof' in prefetchedChapter), '预取响应不得签发阅读凭证');
+    assert.strictEqual(chapterCalls, callsBeforePrefetch + 1);
+    response = await originalFetch(chapterUrl('7104'));
+    assert.strictEqual((await response.json()).data.jmid, '7104');
+    assert.strictEqual(chapterCalls, callsBeforePrefetch + 1, '预取后正式打开必须命中同一缓存');
 
     // 端到端：异常 HTTP-200 章节页面不能在解析前固定为成功线路。
     const validChapterFetch = global.fetch;

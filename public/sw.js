@@ -4,7 +4,7 @@
 
 'use strict';
 
-const CACHE_VERSION = 'jmw-shell-v25';
+const CACHE_VERSION = 'jmw-shell-v26';
 const SHELL = [
   '/',
   '/index.html',
@@ -144,8 +144,11 @@ async function isAppEntryHtml(request, response) {
   if (String(contentType || '').split(';', 1)[0].trim().toLowerCase() !== 'text/html') return false;
   try {
     const html = await response.clone().text();
+    // 入口既可能是旧版 `<script type="module" src="/js/app.js">`，也可能是服务端改写后的
+    // 内联 `import "/js/app.js"`（经 import map 解析为版本化 URL）。
     return /<div\b[^>]*\bid=['"]app['"][^>]*>/i.test(html)
-      && /<script\b[^>]*\bsrc=['"]\/js\/app\.js['"][^>]*>/i.test(html);
+      && (/<script\b[^>]*\bsrc=['"]\/js\/app\.js['"][^>]*>/i.test(html)
+        || /<script\b[^>]*\btype=['"]module['"][^>]*>\s*import\s+['"]\/js\/app\.js['"];?\s*<\/script>/i.test(html));
   } catch (_) {
     return false;
   }
