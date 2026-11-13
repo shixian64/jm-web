@@ -1,4 +1,5 @@
-import { h } from './ui.js';
+import { h, openModal } from './ui.js';
+import { icon } from './icons.js';
 
 export async function copyText(value) {
   const text = String(value || '');
@@ -41,29 +42,33 @@ export function folderEntries(value) {
 export function chooseFolder(folders, title = '选择收藏夹', excludedId = null) {
   const entries = folderEntries(folders).filter(([id]) => id !== String(excludedId));
   return new Promise((resolve) => {
-    const dialog = h('dialog', {
-      'aria-label': title,
-      style: 'width:min(420px,calc(100vw - 28px));max-height:75vh;border:1px solid var(--line);border-radius:16px;background:var(--card);color:var(--text);padding:0;box-shadow:0 18px 60px rgba(0,0,0,.3)',
-    });
+    let settled = false;
+    let modal = null;
     const finish = (value) => {
-      if (dialog.open) dialog.close();
-      dialog.remove();
+      if (settled) return;
+      settled = true;
+      modal?.close('action');
       resolve(value);
     };
-    const list = h('div', { style: 'display:grid;gap:8px;padding:4px 16px 16px;overflow:auto' });
+    const list = h('div', { class: 'folder-picker-list' });
     entries.forEach(([id, name]) => list.append(h('button', {
-      class: 'btn', type: 'button', style: 'justify-content:flex-start;min-height:42px',
+      class: 'btn folder-picker-item',
+      type: 'button',
       onclick: () => finish([id, name]),
-    }, id === '0' ? '★' : '▣', name)));
-    dialog.append(
-      h('div', { style: 'display:flex;align-items:center;padding:16px;gap:10px' },
-        h('strong', { style: 'flex:1' }, title),
-        h('button', { class: 'btn', type: 'button', onclick: () => finish(null) }, '取消')),
-      list,
-    );
-    dialog.addEventListener('cancel', (e) => { e.preventDefault(); finish(null); }, { once: true });
-    document.body.append(dialog);
-    if (typeof dialog.showModal === 'function') dialog.showModal();
-    else dialog.setAttribute('open', '');
+    },
+    h('span', { class: 'folder-picker-ic', 'aria-hidden': 'true' }, icon(id === '0' ? 'star' : 'folder', 17)),
+    h('span', { class: 'folder-picker-name' }, name),
+    h('span', { class: 'folder-picker-arr', 'aria-hidden': 'true' }, icon('chevron-right', 16)))));
+    const cancelBtn = h('button', {
+      class: 'btn',
+      type: 'button',
+      onclick: () => finish(null),
+    }, '取消');
+    modal = openModal({
+      title,
+      body: list,
+      actions: [cancelBtn],
+      onClose: () => finish(null),
+    });
   });
 }

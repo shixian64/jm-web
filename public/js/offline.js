@@ -749,8 +749,8 @@ export function mountOfflineReader(root, aid, photoId, options = {}) {
   const pages = el('main', { class: 'offline-reader-pages', tabindex: '0' });
   const closeBtn = el('button', { type: 'button', class: 'offline-reader-btn', 'aria-label': '退出离线阅读', onclick: close }, '←');
   const modeBtn = el('button', { type: 'button', class: 'offline-reader-btn', onclick: switchMode }, '翻页');
-  const prevBtn = el('button', { type: 'button', class: 'offline-page-nav offline-prev', onclick: () => setPage(state.page - 1) }, '‹');
-  const nextBtn = el('button', { type: 'button', class: 'offline-page-nav offline-next', onclick: () => setPage(state.page + 1) }, '›');
+  const prevBtn = el('button', { type: 'button', class: 'offline-page-nav offline-prev', 'aria-label': '上一页', onclick: () => setPage(state.page - 1) }, '‹');
+  const nextBtn = el('button', { type: 'button', class: 'offline-page-nav offline-next', 'aria-label': '下一页', onclick: () => setPage(state.page + 1) }, '›');
   const container = el('section', { class: 'offline-reader', 'aria-label': '离线阅读器' },
     el('header', { class: 'offline-reader-bar' }, closeBtn, title, counter, modeBtn),
     pages, prevBtn, nextBtn,

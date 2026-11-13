@@ -1,6 +1,8 @@
 // 高级功能：安全锁、备份、标签排除、主题调色、AI、DoH、日志与维护。
 import { api } from './api.js';
-import { h, toast, errorBox, loadingBox, shouldAutoFocusEditable } from './ui.js';
+import {
+  h, toast, errorBox, loadingBox, shouldAutoFocusEditable, confirmDialog, promptDialog, subpageBackLink,
+} from './ui.js';
 import { icon } from './icons.js';
 import {
   setting, updateSetting, getPersonas, savePersonas, getAiSessions, saveAiSessions,
@@ -32,7 +34,9 @@ function isolateLockBackground(on) {
     return;
   }
   for (const node of document.body.children) {
-    if (node === lockOverlay || lockBackgroundState.has(node)) continue;
+    if (node === lockOverlay || node.id === 'toast-root'
+        || node.classList?.contains?.('jmw-modal-backdrop')
+        || lockBackgroundState.has(node)) continue;
     lockBackgroundState.set(node, { inert: !!node.inert, ariaHidden: node.getAttribute('aria-hidden') });
     node.inert = true;
     node.setAttribute('aria-hidden', 'true');
@@ -116,8 +120,12 @@ function safeUpdateUrl(value) {
   }
 }
 
-function pageTitle(title, subtitle = '') {
-  return h('div', { class: 'list-head' }, h('h2', null, title), subtitle ? h('p', { class: 'hint' }, subtitle) : null);
+function pageTitle(title, subtitle = '', backHref = '#/advanced', backLabel = '完整功能中心') {
+  return h('div', { class: 'list-head' },
+    backHref ? subpageBackLink(backHref, backLabel) : null,
+    h('h2', null, title),
+    subtitle ? h('p', { class: 'hint' }, subtitle) : null,
+  );
 }
 
 function groupTitle(title) {
@@ -153,8 +161,8 @@ export function advancedHubView(root) {
     recommendSource.disabled = !recommendToggle.checked;
   };
   recommendSource.onchange = () => updateSetting({ recommendSource: recommendSource.value === 'network' ? 'network' : 'builtin' });
-  const page = h('div', { class: 'page settings-page advanced-hub-page', style: 'max-width:720px' },
-    pageTitle('完整功能中心', 'Web 等价实现集中在这里；设备专属能力会使用浏览器标准 API。'),
+  const page = h('div', { class: 'page settings-page advanced-hub-page' },
+    pageTitle('完整功能中心', 'Web 等价实现集中在这里；设备专属能力会使用浏览器标准 API。', '#/user', '个人中心'),
     h('div', { class: 'setting-group' },
       groupTitle('内容与智能'),
       menuLink('缓存与离线下载', '#/downloads', '后台任务、离线阅读、导出与缓存清理'),
@@ -201,7 +209,7 @@ function tagEditor(title, key, description) {
       class: 'chip', type: 'button', title: '点击删除', onclick: () => {
         updateSetting({ [key]: setting[key].filter((x) => x !== tag) }); render();
       },
-    }, tag, ' ×')));
+    }, tag, icon('x', 13))));
   };
   const add = () => {
     const value = input.value.trim();
@@ -211,13 +219,13 @@ function tagEditor(title, key, description) {
   };
   input.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); add(); } });
   wrap.append(h('div', { class: 'lab' }, title), h('div', { class: 'hint' }, description),
-    h('div', { class: 'setting-inline-form' }, input, h('button', { class: 'btn', onclick: add }, '添加')), chips);
+    h('div', { class: 'setting-inline-form' }, input, h('button', { class: 'btn', type: 'button', onclick: add }, '添加')), chips);
   render();
   return wrap;
 }
 
 export function blockedTagsView(root) {
-  const page = h('div', { class: 'page settings-page', style: 'max-width:720px' },
+  const page = h('div', { class: 'page settings-page' },
     pageTitle('标签排除'),
     h('div', { class: 'setting-group' }, tagEditor('全局排除标签', 'blockedTagList', '搜索和列表默认隐藏这些标签的漫画。')),
     h('div', { class: 'setting-group' }, tagEditor('首页排除标签', 'homeExcludedTags', '仅过滤首页推荐。')),
@@ -246,20 +254,30 @@ export function blockedTagsView(root) {
 /* ------------------------------ 调色板 ------------------------------ */
 
 export function paletteView(root) {
-  const page = h('div', { class: 'page settings-page', style: 'max-width:720px' }, pageTitle('调色板与布局'));
+  const page = h('div', { class: 'page settings-page' }, pageTitle('调色板与布局'));
   const presets = [['default', '默认'], ['ocean', '海洋'], ['sunset', '日落'], ['forest', '森林'], ['lavender', '薰衣草'], ['custom', '自定义']];
   const preset = h('select', { class: 'input' }, presets.map(([value, label]) => h('option', { value, selected: setting.palette === value }, label)));
-  preset.onchange = () => updateSetting({ palette: preset.value });
+  preset.onchange = () => {
+    updateSetting({ palette: preset.value });
+    renderColors();
+  };
   const colorWrap = h('div', { class: 'setting-item palette-colors' });
   const renderColors = () => {
     const current = setting.customColors || {};
-    colorWrap.replaceChildren(h('div', { class: 'lab' }, '自定义四色'), ...[
-      ['primary', '主色'], ['secondary', '辅助色'], ['tertiary', '第三色'], ['error', '错误色'],
-    ].map(([key, label]) => {
-      const input = h('input', { type: 'color', value: current[key] || '#e5588a' });
-      input.oninput = () => updateSetting({ palette: 'custom', customColors: { ...(setting.customColors || {}), [key]: input.value } });
-      return h('label', { class: 'setting-row' }, label, input);
-    }));
+    colorWrap.replaceChildren(
+      h('div', { class: 'lab' }, '自定义四色'),
+      h('div', { class: 'hint', style: 'margin-bottom:8px' }, '拖动或选取任一颜色将自动切换至“自定义”预设，并实时同步全站主色、强调色与氛围背景。'),
+      ...[
+        ['primary', '主色（按钮与激活态）'], ['secondary', '辅助色（强调与次级徽标）'], ['tertiary', '第三色（环境光晕）'], ['error', '错误与危险警示色'],
+      ].map(([key, label]) => {
+        const input = h('input', { type: 'color', value: current[key] || '#e5588a' });
+        input.oninput = () => {
+          preset.value = 'custom';
+          updateSetting({ palette: 'custom', customColors: { ...(setting.customColors || {}), [key]: input.value } });
+        };
+        return h('label', { class: 'setting-row' }, label, input);
+      }),
+    );
   };
   renderColors();
   page.append(h('div', { class: 'setting-group' }, h('div', { class: 'setting-item setting-row' }, h('div', { class: 'lab' }, '配色预设'), preset), colorWrap));
@@ -344,11 +362,15 @@ function setRecoveryStatus(button, message, isError = false) {
  */
 async function recoverLocalLock(event) {
   if (recoveryInProgress) return false;
-  const phrase = '清除本机全部数据';
-  const typed = prompt(
-    `这是灾难恢复操作：会退出 JM 账号，并永久删除当前浏览器的全部 JM Web 设置、历史、AI 会话、下载任务和离线正文。\n\n请输入“${phrase}”确认：`,
-  );
   const button = event?.currentTarget || null;
+  const phrase = '清除本机全部数据';
+  const typed = await promptDialog({
+    title: '灾难恢复确认',
+    message: `此操作将退出 JM 账号，并永久删除当前浏览器的全部设置、历史、AI 会话、下载任务与离线正文。请输入“${phrase}”确认：`,
+    placeholder: phrase,
+    confirmText: '永久清除并退出',
+    sensitive: true,
+  });
   if (typed == null) return false;
   if (typed.trim() !== phrase) {
     setRecoveryStatus(button, `确认短语不匹配；未清除任何数据，请完整输入“${phrase}”。`, true);
@@ -453,20 +475,118 @@ async function verifyBiometric() {
 
 function patternPad(onDone) {
   const selected = [];
-  const label = h('div', { class: 'hint' }, '依次点击至少 4 个点');
+  const ns = 'http://www.w3.org/2000/svg';
+  const createSvg = (tag, attrs = {}) => {
+    const el = typeof document.createElementNS === 'function' ? document.createElementNS(ns, tag) : h(tag);
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
+    return el;
+  };
+  const centerOf = (idx) => [(idx % 3) * 100 + 50, Math.floor(idx / 3) * 100 + 50];
+  const label = h('div', { class: 'hint pattern-status' }, '按住滑动或依次点选至少 4 个点');
+  const svg = createSvg('svg', { class: 'pattern-svg', viewBox: '0 0 300 300', 'aria-hidden': 'true' });
+  const polyline = createSvg('polyline', { class: 'pattern-polyline', points: '' });
+  const cursorLine = createSvg('line', { class: 'pattern-cursor', x1: '0', y1: '0', x2: '0', y2: '0', opacity: '0' });
+  svg.append(polyline, cursorLine);
+
+  const dots = [];
   const grid = h('div', { class: 'pattern-grid' });
-  const refresh = () => { label.textContent = selected.length ? `图案：${selected.map((x) => x + 1).join(' → ')}` : '依次点击至少 4 个点'; };
-  for (let i = 0; i < 9; i++) grid.append(h('button', { class: 'pattern-dot', type: 'button', onclick: (event) => {
-    if (selected.includes(i)) return;
-    selected.push(i); event.currentTarget.classList.add('on'); refresh();
-  } }, String(i + 1)));
-  return h('div', null, grid, label, h('div', { class: 'setting-actions' },
-    h('button', { class: 'btn', onclick: () => { selected.length = 0; grid.querySelectorAll('.on').forEach((x) => x.classList.remove('on')); refresh(); } }, '重置'),
-    h('button', { class: 'btn primary', onclick: () => selected.length >= 4 ? onDone(selected.join('')) : toast('至少连接 4 个点') }, '确认图案')));
+  const stage = h('div', { class: 'pattern-stage' }, svg, grid);
+
+  const updateVisuals = () => {
+    dots.forEach((dot, idx) => dot.classList.toggle('on', selected.includes(idx)));
+    polyline.setAttribute('points', selected.map((idx) => centerOf(idx).join(',')).join(' '));
+    label.textContent = selected.length
+      ? `已连接 ${selected.length} 个点（${selected.map((x) => x + 1).join(' → ')}）`
+      : '按住滑动或依次点选至少 4 个点';
+  };
+
+  const addNode = (idx) => {
+    if (idx < 0 || idx > 8 || selected.includes(idx)) return;
+    if (selected.length) {
+      const prev = selected[selected.length - 1];
+      const r1 = Math.floor(prev / 3); const c1 = prev % 3;
+      const r2 = Math.floor(idx / 3); const c2 = idx % 3;
+      if ((r1 + r2) % 2 === 0 && (c1 + c2) % 2 === 0) {
+        const mid = ((r1 + r2) / 2) * 3 + (c1 + c2) / 2;
+        if (!selected.includes(mid)) selected.push(mid);
+      }
+    }
+    selected.push(idx);
+    updateVisuals();
+  };
+
+  const reset = () => {
+    selected.length = 0;
+    cursorLine.setAttribute('opacity', '0');
+    updateVisuals();
+  };
+
+  for (let i = 0; i < 9; i++) {
+    const dot = h('button', {
+      class: 'pattern-dot',
+      type: 'button',
+      'aria-label': `图案点 ${i + 1}`,
+      onclick: () => { if (!dragging) addNode(i); },
+    }, h('span', { class: 'pattern-dot-core', 'aria-hidden': 'true' }));
+    dots.push(dot);
+    grid.append(dot);
+  }
+
+  let dragging = false;
+  let activePointer = null;
+  const hitTest = (clientX, clientY) => {
+    const rect = stage.getBoundingClientRect?.();
+    if (!rect || !rect.width || !rect.height) return null;
+    const vx = ((clientX - rect.left) / rect.width) * 300;
+    const vy = ((clientY - rect.top) / rect.height) * 300;
+    for (let i = 0; i < 9; i++) {
+      const [cx, cy] = centerOf(i);
+      if (Math.hypot(vx - cx, vy - cy) <= 34) return { hit: i, vx, vy };
+    }
+    return { hit: -1, vx, vy };
+  };
+
+  stage.addEventListener('pointerdown', (event) => {
+    const probe = hitTest(event.clientX, event.clientY);
+    if (!probe || probe.hit < 0) return;
+    event.preventDefault();
+    if (selected.length) reset();
+    dragging = true;
+    activePointer = event.pointerId;
+    try { stage.setPointerCapture?.(event.pointerId); } catch (_) {}
+    addNode(probe.hit);
+  });
+  stage.addEventListener('pointermove', (event) => {
+    if (!dragging || event.pointerId !== activePointer) return;
+    const probe = hitTest(event.clientX, event.clientY);
+    if (!probe) return;
+    if (probe.hit >= 0) addNode(probe.hit);
+    if (selected.length) {
+      const [x1, y1] = centerOf(selected[selected.length - 1]);
+      cursorLine.setAttribute('x1', String(x1));
+      cursorLine.setAttribute('y1', String(y1));
+      cursorLine.setAttribute('x2', String(Math.max(0, Math.min(300, probe.vx))));
+      cursorLine.setAttribute('y2', String(Math.max(0, Math.min(300, probe.vy))));
+      cursorLine.setAttribute('opacity', '1');
+    }
+  });
+  const endDrag = (event) => {
+    if (!dragging || (activePointer != null && event.pointerId !== activePointer)) return;
+    try { stage.releasePointerCapture?.(event.pointerId); } catch (_) {}
+    activePointer = null;
+    cursorLine.setAttribute('opacity', '0');
+    setTimeout(() => { dragging = false; }, 0);
+  };
+  stage.addEventListener('pointerup', endDrag);
+  stage.addEventListener('pointercancel', endDrag);
+
+  return h('div', { class: 'pattern-pad' }, stage, label, h('div', { class: 'setting-actions' },
+    h('button', { class: 'btn', type: 'button', onclick: reset }, '重置'),
+    h('button', { class: 'btn primary', type: 'button', onclick: () => selected.length >= 4 ? onDone(selected.join('')) : toast('至少连接 4 个点') }, '确认图案')));
 }
 
 export function securityView(root) {
-  const page = h('div', { class: 'page settings-page', style: 'max-width:680px' }, pageTitle('应用锁与隐私'));
+  const page = h('div', { class: 'page settings-page' }, pageTitle('应用锁与隐私'));
   const password = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', placeholder: '设置 4–128 位 PIN 或口令' });
   const methodStatus = h('div', { class: 'hint' });
   const requiredWrap = h('div', { class: 'setting-item' });
@@ -563,10 +683,17 @@ export function securityView(root) {
     requiredWrap,
     h('div', { class: 'setting-item' }, toggleRow('隐私伪装模式', 'privacyMode', '失焦时遮盖内容并使用中性页面标题。')),
     h('div', { class: 'setting-item' }, biometric),
-    h('button', { class: 'setting-item btn ghost', style: 'color:var(--danger);width:100%;text-align:left', onclick: () => {
+    h('button', { class: 'setting-item btn ghost', style: 'color:var(--danger);width:100%;text-align:left', onclick: async () => {
+      const ok = await confirmDialog({
+        title: '清除所有锁定凭据',
+        message: '将移除已保存的 PIN、图案与生物识别凭据，并关闭本地应用锁。是否继续？',
+        confirmText: '清除凭据',
+        danger: true,
+      });
+      if (!ok) return;
       clearLocalLockCredentials();
       enabledToggle.checked = false; biometricToggle.checked = false; rule.value = 'any'; refreshMethods(); toast('应用锁凭据已清除');
-    } }, '清除所有锁定凭据'));
+    } }, icon('trash-2', 16), '清除所有锁定凭据'));
   refreshMethods();
   const cryptoWarning = hasSecureCrypto() ? null : h('div', {
     class: 'error-box', role: 'status',
@@ -784,7 +911,7 @@ async function rebuildOfflineDownloads(requests) {
 }
 
 export function backupView(root) {
-  const page = h('div', { class: 'page settings-page', style: 'max-width:680px' }, pageTitle('备份与恢复'));
+  const page = h('div', { class: 'page settings-page' }, pageTitle('备份与恢复'));
   const password = h('input', { class: 'input', type: 'password', placeholder: '可选：备份加密口令', autocomplete: 'new-password' });
   const file = h('input', { class: 'input', type: 'file', accept: 'application/json,.json' });
   const rebuildQueue = h('input', { type: 'checkbox', checked: true });
@@ -816,7 +943,15 @@ export function backupView(root) {
           restoreStatus.textContent = '正在验证并恢复备份…';
           let payload = JSON.parse(await file.files[0].text());
           if (payload.encrypted) {
-            const pass = prompt('请输入备份加密口令');
+            const pass = await promptDialog({
+              title: '输入备份解密口令',
+              message: '该备份已使用 AES-GCM 加密，请输入导出备份时设置的口令。',
+              type: 'password',
+              autocomplete: 'current-password',
+              placeholder: '备份加密口令',
+              confirmText: '解密并恢复',
+              sensitive: true,
+            });
             if (pass == null) { restoreStatus.textContent = '已取消恢复'; return; }
             payload = await decryptBackup(payload, pass);
           }
@@ -828,7 +963,11 @@ export function backupView(root) {
           let queueResult = { queued: 0, failed: 0 };
           const requests = offlineResult.restoreRequests || [];
           if (rebuildQueue.checked && requests.length) {
-            const accepted = confirm(`备份记录了 ${requests.length} 部漫画。恢复后将重新加入下载队列并开始续传，是否继续？`);
+            const accepted = await confirmDialog({
+              title: '重建离线下载队列',
+              message: `备份记录了 ${requests.length} 部离线漫画。恢复后将重新加入下载队列并开始续传，是否继续？`,
+              confirmText: '重建下载队列',
+            });
             if (accepted) {
               restoreStatus.textContent = `正在重建 ${requests.length} 个下载任务…`;
               queueResult = await rebuildOfflineDownloads(requests);
@@ -851,7 +990,7 @@ export function backupView(root) {
 /* ------------------------------ 人格与 AI ------------------------------ */
 
 export function personasView(root) {
-  const page = h('div', { class: 'page settings-page', style: 'max-width:760px' }, pageTitle('人格面具'));
+  const page = h('div', { class: 'page settings-page' }, pageTitle('人格面具'));
   const listWrap = h('div', { class: 'setting-group' });
   const formWrap = h('div', { class: 'setting-group' });
   let editingId = '';
@@ -889,8 +1028,14 @@ export function personasView(root) {
         h('div', null, h('div', { class: 'lab' }, item.name), h('div', { class: 'hint' }, `${item.occupation || '未设置职业'} · ${item.personality || '默认性格'}`)),
         h('div', { class: 'persona-actions' },
           h('button', { class: 'btn ghost', onclick: () => editPersona(item) }, '编辑'),
-          h('button', { class: 'btn ghost', onclick: () => {
-            if (!confirm(`删除人格“${item.name}”？已绑定的对话会回退到默认人格。`)) return;
+          h('button', { class: 'btn ghost', onclick: async () => {
+            const ok = await confirmDialog({
+              title: `删除人格“${item.name}”`,
+              message: '删除后，已绑定该人格的对话将回退到默认人格。',
+              confirmText: '删除人格',
+              danger: true,
+            });
+            if (!ok) return;
             savePersonas(list.filter((x) => x.id !== item.id));
             if (editingId === item.id) resetForm();
             render();
@@ -1076,9 +1221,9 @@ function messageNode(message, actions = {}) {
   } else if (message.streaming) body.append(h('span', { class: 'ai-streaming-placeholder', 'aria-label': '正在生成' }, '…'));
   const tools = h('div', { class: 'ai-message-tools' });
   if (actions.branchCount > 1) tools.append(h('span', { class: 'ai-branch-tools' },
-    h('button', { class: 'btn ghost', disabled: !actions.previousBranch, onclick: actions.previousBranch, title: '上一个分支', 'aria-label': '上一个分支' }, '‹'),
+    h('button', { class: 'btn ghost', disabled: !actions.previousBranch, onclick: actions.previousBranch, title: '上一个分支', 'aria-label': '上一个分支' }, icon('chevron-left', 14)),
     h('span', null, `${actions.activeBranch + 1}/${actions.branchCount}`),
-    h('button', { class: 'btn ghost', disabled: !actions.nextBranch, onclick: actions.nextBranch, title: '下一个分支', 'aria-label': '下一个分支' }, '›')));
+    h('button', { class: 'btn ghost', disabled: !actions.nextBranch, onclick: actions.nextBranch, title: '下一个分支', 'aria-label': '下一个分支' }, icon('chevron-right', 14))));
   if (actions.edit) tools.append(h('button', { class: 'btn ghost', onclick: actions.edit }, '编辑'));
   if (actions.copy) tools.append(h('button', { class: 'btn ghost', onclick: actions.copy }, '复制'));
   if (actions.retry) tools.append(h('button', { class: 'btn ghost', onclick: actions.retry }, '重新生成'));
@@ -1208,13 +1353,31 @@ export async function aiView(root, _m, _q, ctx) {
   const page = h('div', { class: 'page ai-page' }); root.append(page);
   let cfg;
   try { cfg = await jsonRequest('/ai/config', { signal: ctx?.signal }); }
-  catch (error) { page.append(errorBox(error.message)); return; }
+  catch (error) {
+    if (!isViewInactive(ctx) && !isAbort(error)) page.append(errorBox(error.message));
+    return;
+  }
+  if (isViewInactive(ctx)) return;
   const sessions = getAiSessions().map(normalizeSession);
   let current = sessions[0] || newAiSession();
   if (!sessions.length) sessions.push(current);
   saveAiSessions(sessions);
   let controller = null;
-  const sidebar = h('aside', { class: 'ai-sidebar' }); const conversation = h('div', { class: 'ai-conversation' });
+  let sidebarOpen = false;
+  const sidebar = h('aside', { class: 'ai-sidebar', 'aria-label': '历史对话列表' });
+  const sidebarBackdrop = h('div', { class: 'ai-sidebar-backdrop', onclick: () => toggleSidebar(false) });
+  const toggleSidebar = (force) => {
+    sidebarOpen = typeof force === 'boolean' ? force : !sidebarOpen;
+    page.classList.toggle('sidebar-open', sidebarOpen);
+  };
+  const onDrawerKeyDown = (event) => {
+    if (event.key === 'Escape' && sidebarOpen) {
+      event.stopPropagation();
+      toggleSidebar(false);
+    }
+  };
+  if (typeof document !== 'undefined') document.addEventListener('keydown', onDrawerKeyDown);
+  const conversation = h('div', { class: 'ai-conversation' });
   const input = h('textarea', { class: 'input ai-input', rows: 3, placeholder: cfg.enabled ? '输入消息…' : '服务器未配置 AI_API_KEY' });
   const personaSel = h('select', { class: 'input' }, h('option', { value: '' }, '默认人格'), ...getPersonas().map((p) => h('option', { value: p.id }, p.name)));
   const think = h('input', { type: 'checkbox' }); const web = h('input', { type: 'checkbox', disabled: !cfg.searchEnabled });
@@ -1266,22 +1429,37 @@ export async function aiView(root, _m, _q, ctx) {
     const all = getAiSessions().map(normalizeSession).filter((item) => item.id !== current.id);
     saveAiSessions([current, ...all].slice(0, 50));
   };
-  const renderSidebar = () => sidebar.replaceChildren(
-    h('div', { class: 'ai-sidebar-head' },
-      h('div', { class: 'ai-sidebar-title' }, h('span', { class: 'ai-spark' }, '✦'), h('span', null, 'AI 对话')),
-      h('span', { class: 'ai-sidebar-count' }, `${sessions.length} 个对话`)),
-    h('button', { class: 'btn primary block ai-new-session', disabled: !!controller, onclick: () => {
-      if (controller) return; persist(); current = newAiSession(personaSel.value); persist(); renderAll(); input.focus();
-    } }, '新建对话'),
-    ...[current, ...getAiSessions().map(normalizeSession).filter((session) => session.id !== current.id)].map((session) => h('div', { class: `ai-session ${session.id === current.id ? 'on' : ''}` },
-      h('button', { disabled: !!controller, onclick: () => { if (controller || session.id === current.id) return; persist(); current = normalizeSession(session); renderAll(); } }, session.title || '对话'),
-      h('button', { title: '删除', 'aria-label': `删除${session.title || '对话'}`, disabled: !!controller, onclick: () => {
-        if (controller) return;
-        const remaining = getAiSessions().map(normalizeSession).filter((item) => item.id !== session.id);
-        saveAiSessions(remaining);
-        if (current.id === session.id) current = remaining[0] || newAiSession(personaSel.value);
-        persist(); renderAll();
-      } }, '×'))));
+  const startNewSession = () => {
+    if (controller) return;
+    persist();
+    current = newAiSession(personaSel.value);
+    persist();
+    toggleSidebar(false);
+    renderAll();
+    if (shouldAutoFocusEditable()) input.focus();
+  };
+  const renderSidebar = () => {
+    const allSessions = [current, ...getAiSessions().map(normalizeSession).filter((session) => session.id !== current.id)];
+    sidebar.replaceChildren(
+      h('div', { class: 'ai-sidebar-head' },
+        h('div', { class: 'ai-sidebar-title' }, h('span', { class: 'ai-spark' }, icon('sparkles', 16)), h('span', null, '对话列表')),
+        h('span', { class: 'ai-sidebar-count' }, `${allSessions.length} 个`),
+        h('button', { class: 'icon-btn ai-sidebar-close', type: 'button', 'aria-label': '关闭会话列表', onclick: () => toggleSidebar(false) }, icon('x', 17))),
+      h('button', { class: 'btn primary block ai-new-session', type: 'button', disabled: !!controller, onclick: startNewSession }, icon('plus', 15), '新建对话'),
+      ...allSessions.map((session) => h('div', { class: `ai-session ${session.id === current.id ? 'on' : ''}` },
+        h('button', { type: 'button', disabled: !!controller, onclick: () => {
+          if (controller) return;
+          if (session.id !== current.id) { persist(); current = normalizeSession(session); renderAll(); }
+          toggleSidebar(false);
+        } }, session.title || '对话'),
+        h('button', { class: 'ai-session-delete', type: 'button', title: '删除', 'aria-label': `删除${session.title || '对话'}`, disabled: !!controller, onclick: () => {
+          if (controller) return;
+          const remaining = getAiSessions().map(normalizeSession).filter((item) => item.id !== session.id);
+          saveAiSessions(remaining);
+          if (current.id === session.id) current = remaining[0] || newAiSession(personaSel.value);
+          persist(); renderAll();
+        } }, icon('x', 14)))));
+  };
   const regenerate = async (style = '') => {
     if (controller) return;
     if (current.messages.at(-1)?.role === 'assistant') current.messages.pop();
@@ -1303,7 +1481,14 @@ export async function aiView(root, _m, _q, ctx) {
     current.messages = syncActiveBranches(current.messages);
     const message = current.messages[messageIndex];
     if (!message || message.role !== 'user') return;
-    const value = prompt('编辑消息（将保留原回复为可切换分支）', message.content);
+    const value = await promptDialog({
+      title: '编辑消息',
+      message: '修改后将从此处重新生成，原回复将保留为可切换分支。',
+      initialValue: message.content,
+      multiline: true,
+      rows: 6,
+      confirmText: '保存并重新生成',
+    });
     if (value == null || !value.trim() || value.trim() === message.content) return;
     const following = cloneMessages(current.messages.slice(messageIndex + 1));
     const branches = message.branches.length ? cloneMessages(message.branches) : [{ content: message.content, followingMessages: following }];
@@ -1323,7 +1508,7 @@ export async function aiView(root, _m, _q, ctx) {
       nextBranch: message.role === 'user' && !controller && Number(message.activeBranchIndex) < (message.branches?.length || 0) - 1 ? () => switchBranch(index, Number(message.activeBranchIndex) + 1) : null,
     }));
     conversation.replaceChildren(...(messages.length ? messages : [h('div', { class: 'ai-empty-state' },
-      h('span', { class: 'ai-empty-kicker' }, cfg.enabled ? 'NEW CONVERSATION' : 'SETUP REQUIRED'),
+      h('span', { class: 'ai-empty-kicker' }, cfg.enabled ? '开始新对话' : '需要配置服务'),
       h('h2', null, cfg.enabled ? '从一个问题开始' : 'AI 服务尚未配置'),
       h('p', null, cfg.enabled
         ? '可以讨论漫画、整理阅读线索，或在开启联网搜索后查询最新资料。'
@@ -1375,19 +1560,31 @@ export async function aiView(root, _m, _q, ctx) {
   personaSel.onchange = () => { current.personaId = personaSel.value; persist(); renderSidebar(); };
   think.onchange = () => { current.deepThinkingEnabled = think.checked; persist(); };
   web.onchange = () => { current.webSearchEnabled = web.checked; persist(); };
+  const toolbarTitleEl = h('strong', null, '智能助手');
   const renderAll = () => {
+    const titleText = current.title && current.title !== '新对话' ? current.title : '智能助手';
+    toolbarTitleEl.textContent = titleText;
+    toolbarTitleEl.title = titleText;
     personaSel.value = getPersonas().some((item) => item.id === current.personaId) ? current.personaId : '';
     think.checked = !!current.deepThinkingEnabled; web.checked = !!current.webSearchEnabled;
     renderSidebar(); renderMessages();
   };
-  page.append(sidebar, h('section', { class: 'ai-main' },
+  page.append(sidebarBackdrop, sidebar, h('section', { class: 'ai-main' },
     h('div', { class: 'ai-toolbar' },
-      h('div', { class: 'ai-toolbar-title' }, h('span', { class: 'ai-toolbar-dot' }), h('div', null, h('strong', null, '智能助手'), h('small', null, cfg.enabled ? '在线 · 随时为你整理思路' : '等待配置 AI 服务'))),
+      h('div', { class: 'ai-toolbar-title' },
+        h('button', { class: 'icon-btn ai-mobile-menu', type: 'button', title: '历史对话', 'aria-label': '打开历史对话列表', onclick: () => toggleSidebar() }, icon('panel-left', 18)),
+        h('span', { class: 'ai-toolbar-dot' }),
+        h('div', { class: 'ai-toolbar-copy' },
+          toolbarTitleEl,
+          h('small', null, cfg.enabled ? '在线 · 随时为你整理思路' : '等待配置 AI 服务')),
+        h('button', { class: 'icon-btn ai-mobile-new', type: 'button', title: '新建对话', 'aria-label': '新建对话', onclick: startNewSession }, icon('plus', 18)),
+        h('a', { class: 'subpage-back ai-back-link', href: '#/advanced', title: '返回功能中心' }, icon('chevron-left', 15), h('span', null, '功能中心')),
+      ),
       h('div', { class: 'ai-toolbar-controls' }, personaSel,
       h('label', { class: 'ai-toolbar-toggle' }, think, h('span', null, '深度思考')),
       h('label', { class: 'ai-toolbar-toggle' }, web, h('span', null, '联网搜索')),
-      h('button', { class: 'btn ghost', onclick: () => regenerate('回答更详细，并给出分点依据。') }, '更详细'),
-      h('button', { class: 'btn ghost', onclick: () => regenerate('回答更精简，只保留结论。') }, '更精简'), searchSettingsPanel)),
+      h('button', { class: 'btn ghost', type: 'button', onclick: () => regenerate('回答更详细，并给出分点依据。') }, '更详细'),
+      h('button', { class: 'btn ghost', type: 'button', onclick: () => regenerate('回答更精简，只保留结论。') }, '更精简'), searchSettingsPanel)),
     conversation, h('div', { class: 'ai-composer' },
       h('div', { class: 'ai-composer-inner' },
         h('div', { class: 'ai-input-label' }, h('span', null, '消息'), h('span', null, 'Enter 发送 · Shift + Enter 换行')),
@@ -1395,13 +1592,16 @@ export async function aiView(root, _m, _q, ctx) {
         h('div', { class: 'ai-composer-actions' }, h('span', { class: 'ai-composer-hint' }, '内容会保存在本地对话记录中'), send, stop))
     )));
   renderAll();
-  return () => controller?.abort();
+  return () => {
+    if (typeof document !== 'undefined') document.removeEventListener('keydown', onDrawerKeyDown);
+    controller?.abort();
+  };
 }
 
 /* ------------------------------ 网络、日志、维护 ------------------------------ */
 
 export async function networkView(root, _m, _q, ctx) {
-  const page = h('div', { class: 'page settings-page', style: 'max-width:720px' }, pageTitle('网络与 DoH'), loadingBox()); root.append(page);
+  const page = h('div', { class: 'page settings-page' }, pageTitle('网络与 DoH'), loadingBox()); root.append(page);
   const [dohResult, configResult] = await Promise.allSettled([
     jsonRequest('/doh', { signal: ctx?.signal }),
     api.config(ctx?.signal),
@@ -1505,7 +1705,7 @@ export async function networkView(root, _m, _q, ctx) {
 }
 
 export async function logsView(root, _m, query, ctx) {
-  const page = h('div', { class: 'page', style: 'max-width:980px' }, pageTitle('运行日志'), loadingBox()); root.append(page);
+  const page = h('div', { class: 'page page-medium' }, pageTitle('运行日志'), loadingBox()); root.append(page);
   try {
     const data = await jsonRequest(`/logs?limit=${Math.max(20, Math.min(500, Number(query.get('limit')) || 200))}`, { signal: ctx?.signal });
     if (isViewInactive(ctx)) return;
@@ -1552,7 +1752,7 @@ export async function logsView(root, _m, query, ctx) {
 }
 
 export function extractCodeView(root) {
-  const page = h('div', { class: 'page settings-page', style: 'max-width:680px' }, pageTitle('提取漫画编码'));
+  const page = h('div', { class: 'page settings-page' }, pageTitle('提取漫画编码'));
   const input = h('textarea', { class: 'input', rows: 8, placeholder: '粘贴包含 JM123456、album/123456 或普通数字的文字' });
   const result = h('div', { class: 'setting-group' });
   const extract = () => {
@@ -1567,7 +1767,7 @@ export function extractCodeView(root) {
 }
 
 export async function cacheView(root) {
-  const page = h('div', { class: 'page settings-page', style: 'max-width:720px' }, pageTitle('缓存维护'), loadingBox()); root.append(page);
+  const page = h('div', { class: 'page settings-page' }, pageTitle('缓存维护'), loadingBox()); root.append(page);
   const render = async () => {
     let estimate = {}; try { estimate = await navigator.storage?.estimate?.() || {}; } catch (_) {}
     const fmt = (n) => `${((Number(n) || 0) / 1024 / 1024).toFixed(1)} MiB`;
@@ -1581,13 +1781,22 @@ export async function cacheView(root) {
       h('label', { class: 'setting-item setting-row' }, h('div', null, h('div', { class: 'lab' }, '进入下载中心时自动检查'), h('div', { class: 'hint' }, '部分检查较快；完全检查会逐页读取 IndexedDB Blob。')), integrityMode),
       h('button', { class: 'setting-item btn ghost', onclick: async () => { try { const mod = await import('./offline.js'); const result = await mod.checkOfflineIntegrity?.({ mode: 'full' }); toast(result?.message || '完整性检查完成'); } catch (error) { toast(error.message); } } }, '立即执行完全检查'),
       h('button', { class: 'setting-item btn ghost', onclick: async () => { const keys = await caches.keys(); await Promise.all(keys.map((x) => caches.delete(x))); toast('图片与静态缓存已清理'); render(); } }, '清理 Cache Storage'),
-      h('button', { class: 'setting-item btn ghost', style: 'color:var(--danger)', onclick: async () => { if (!confirm('删除全部离线漫画并停止所有下载任务？')) return; try { await (await import('./downloads.js')).downloads.clearAll(); toast('下载任务与离线漫画已删除'); render(); } catch (error) { toast(error.message); } } }, '删除全部离线漫画')));
+      h('button', { class: 'setting-item btn ghost', style: 'color:var(--danger)', onclick: async () => {
+        const ok = await confirmDialog({
+          title: '删除全部离线漫画',
+          message: '确定停止所有下载任务并删除全部本地离线漫画吗？此操作不可恢复。',
+          confirmText: '全部删除',
+          danger: true,
+        });
+        if (!ok) return;
+        try { await (await import('./downloads.js')).downloads.clearAll(); toast('下载任务与离线漫画已删除'); render(); } catch (error) { toast(error.message); }
+      } }, icon('trash-2', 16), '删除全部离线漫画')));
   };
   render();
 }
 
 export async function aboutView(root, _m, _q, ctx) {
-  const page = h('div', { class: 'page settings-page', style: 'max-width:720px' }, pageTitle('更新与关于'), loadingBox()); root.append(page);
+  const page = h('div', { class: 'page settings-page' }, pageTitle('更新与关于'), loadingBox()); root.append(page);
   try {
     const healthRequest = async () => {
       const response = await fetch('/healthz', { signal: ctx?.signal });
@@ -1664,15 +1873,15 @@ function handleClipboardPaste(event) {
   lastClipboardValue = value;
   const id = clipboardAlbumIdFromText(value); if (!id) return;
   const notice = h('div', { class: 'clipboard-notice' }, `检测到 JM${id}`,
-    h('button', { class: 'btn primary', onclick: () => { notice.remove(); location.hash = `#/album/${id}`; } }, '打开'),
-    h('button', { class: 'btn', onclick: () => notice.remove() }, '忽略'));
+    h('button', { class: 'btn sm primary', type: 'button', onclick: () => { notice.remove(); location.hash = `#/album/${id}`; } }, '打开'),
+    h('button', { class: 'btn sm', type: 'button', onclick: () => notice.remove() }, '忽略'));
   document.body.append(notice); setTimeout(() => notice.remove(), 12000);
 }
 
 function showOnboarding() {
   if (setting.onboardingCompleted) return;
   let step = 0;
-  const modal = h('div', { class: 'onboarding-overlay' });
+  const modal = h('div', { class: 'onboarding-overlay', role: 'dialog', 'aria-modal': 'true', 'aria-label': '新手引导' });
   const card = h('div', { class: 'card onboarding-card' });
   const pages = [
     ['欢迎使用 JM Web', '这是面向桌面与移动浏览器的完整阅读、收藏、离线与工具空间。'],
@@ -1681,11 +1890,17 @@ function showOnboarding() {
   ];
   const render = () => {
     const [title, text] = pages[step];
-    card.replaceChildren(...[h('h2', null, title), h('p', null, text),
-      step === 2 ? h('div', null, toggleRow('自动签到', 'autoSignInEnabled'), toggleRow('剪贴板编号检测', 'clipboardAutoDetectEnabled'), toggleRow('显示 AI 入口', 'showAiEntry')) : null,
-      h('div', { style: 'display:flex;justify-content:flex-end;gap:8px;margin-top:18px' },
-        step ? h('button', { class: 'btn', onclick: () => { step--; render(); } }, '上一步') : null,
-        h('button', { class: 'btn primary', onclick: () => { if (step < pages.length - 1) { step++; render(); } else { updateSetting({ onboardingCompleted: true, nsfwWarningDismissed: true }); modal.remove(); if (!unlockedTasksDeferred) runUnlockedTasks(); } } }, step === pages.length - 1 ? '开始使用' : '继续')),
+    card.replaceChildren(...[
+      h('div', { class: 'onboarding-step' }, `步骤 ${step + 1} / ${pages.length}`),
+      h('h2', { style: 'margin:0' }, title),
+      h('p', { style: 'margin:0;color:var(--text-2);line-height:1.65' }, text),
+      step === 2 ? h('div', { class: 'setting-group', style: 'margin:6px 0 0' },
+        h('div', { class: 'setting-item' }, toggleRow('自动签到', 'autoSignInEnabled')),
+        h('div', { class: 'setting-item' }, toggleRow('剪贴板编号检测', 'clipboardAutoDetectEnabled')),
+        h('div', { class: 'setting-item' }, toggleRow('显示 AI 入口', 'showAiEntry'))) : null,
+      h('div', { style: 'display:flex;justify-content:flex-end;gap:8px;margin-top:10px' },
+        step ? h('button', { class: 'btn', type: 'button', onclick: () => { step--; render(); } }, '上一步') : null,
+        h('button', { class: 'btn primary', type: 'button', onclick: () => { if (step < pages.length - 1) { step++; render(); } else { updateSetting({ onboardingCompleted: true, nsfwWarningDismissed: true }); modal.remove(); if (!unlockedTasksDeferred) runUnlockedTasks(); } } }, step === pages.length - 1 ? '开始使用' : '继续')),
     ].filter(Boolean));
   };
   modal.append(card); document.body.append(modal); render();

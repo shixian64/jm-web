@@ -62,9 +62,9 @@ function appendChildren(el, children) {
 let toastTimer = null;
 export function toast(msg, ms = 2200) {
   const root = document.getElementById('toast-root');
-  root.innerHTML = '';
-  const t = h('div', { class: 'toast' }, msg);
-  root.appendChild(t);
+  if (!root) return;
+  const t = h('div', { class: 'toast', role: 'status', 'aria-live': 'polite' }, msg);
+  root.replaceChildren(t);
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.remove(), ms);
 }
@@ -275,7 +275,6 @@ export function comicCard(item) {
   const cover = h('div', { class: 'cover' }, image);
   installImageRetry(image, imgSrcOf(item), { lazy: true });
   if (category) cover.append(h('span', { class: 'card-badge' }, category));
-  if (canOpen) cover.append(h('span', { class: 'cover-action', 'aria-hidden': 'true' }, icon('arrow-up-right', 15)));
   // 使用原生链接而不是仅绑定 click 的 div：这样浏览器的“在新标签页打开”、
   // Ctrl/⌘+Click、中键和长按菜单都能正常工作，同时单击仍由 hash 路由接管。
   const card = h('a', {
@@ -284,13 +283,12 @@ export function comicCard(item) {
     ...(category ? { 'data-kind': category } : {}),
     ...(canOpen ? { 'aria-label': `查看${name === '未知' ? '漫画' : name}详情` } : { 'aria-disabled': 'true', tabindex: '-1' }),
   });
+  const authorText = text(item.author) ? text(item.author).split(/[、,，\/]/)[0] || '' : '';
   card.append(
     cover,
     h('div', { class: 'card-copy' },
       h('div', { class: 'name' }, name),
-      h('div', { class: 'card-meta' },
-        text(item.author) ? text(item.author).split(/[、,，\/]/)[0] || '' : (category || 'JM Web'),
-      ),
+      h('div', { class: 'card-meta' }, authorText || category || '漫画'),
     ),
   );
   return card;
@@ -325,7 +323,7 @@ export function installPullToRefresh(container, refresh, options = {}) {
   const atTop = () => Math.max(0, Number(window.scrollY)
     || Number(document.scrollingElement?.scrollTop) || 0) <= 1;
   const blockedTarget = (target) => target instanceof Element
-    && !!target.closest('input,textarea,select,[contenteditable="true"],.hscroll,.chips,dialog');
+    && !!target.closest('input,textarea,select,[contenteditable="true"],.hscroll,.chips,dialog,.jmw-modal-backdrop');
   const setDistance = (value) => {
     distance = Math.max(0, Math.min(104, value));
     container.style.setProperty('--pull-distance', `${distance}px`);
@@ -545,4 +543,257 @@ export function errorBox(message, retry) {
 export function loadingBox(text = '加载中…') {
   return h('div', { class: 'empty loading-state', role: 'status', 'aria-live': 'polite', 'aria-label': text },
     h('div', { class: 'spinner', 'aria-hidden': 'true' }), h('div', null, text));
+}
+
+/** 二级/三级子页面统一返回导航条（适配 PWA 独立窗口与深层子页） */
+export function subpageBackLink(href = '#/user', label = '返回上一级') {
+  return h('a', { class: 'subpage-back', href },
+    icon('chevron-left', 16),
+    h('span', null, label),
+  );
+}
+
+let modalSeq = 0;
+
+/**
+ * 轻量无障碍模态框（替代原生 alert / confirm / prompt）。
+ * 触屏设备遵循 shouldAutoFocusEditable 策略，不被动抢占输入框焦点。
+ */
+export function openModal(options = {}) {
+  const {
+    title = '',
+    description = '',
+    body = null,
+    actions = [],
+    onClose = null,
+    initialFocus = null,
+    className = '',
+  } = options;
+  const titleId = `jmw-modal-title-${++modalSeq}`;
+  const priorActive = typeof document !== 'undefined' ? document.activeElement : null;
+  let closed = false;
+
+  const closeBtn = h('button', {
+    class: 'icon-btn jmw-modal-close',
+    type: 'button',
+    'aria-label': '关闭对话框',
+    onclick: () => close(),
+  }, icon('x', 18));
+
+  const panel = h('div', {
+    class: ['jmw-modal', className].filter(Boolean).join(' '),
+    role: 'dialog',
+    'aria-modal': 'true',
+    ...(title ? { 'aria-labelledby': titleId } : { 'aria-label': '对话框' }),
+    tabindex: '-1',
+  },
+  h('div', { class: 'jmw-modal-head' },
+    title ? h('h3', { id: titleId, class: 'jmw-modal-title' }, title) : h('span'),
+    closeBtn,
+  ),
+  description ? h('p', { class: 'jmw-modal-desc' }, description) : null,
+  body ? h('div', { class: 'jmw-modal-body' }, body) : null,
+  actions && actions.length ? h('div', { class: 'jmw-modal-actions' }, ...actions) : null);
+
+  const backdrop = h('div', {
+    class: 'jmw-modal-backdrop',
+    onclick: (event) => {
+      if (event.target === backdrop) close();
+    },
+  }, panel);
+
+  function focusableItems() {
+    if (typeof panel.querySelectorAll !== 'function') return [];
+    return [...panel.querySelectorAll(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    )].filter((node) => !node.hidden && node.getAttribute?.('aria-hidden') !== 'true');
+  }
+
+  function onKeyDown(event) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      close();
+      return;
+    }
+    if (event.key === 'Tab') {
+      const items = focusableItems();
+      if (!items.length) {
+        event.preventDefault();
+        try { panel.focus({ preventScroll: true }); } catch (_) {}
+        return;
+      }
+      const active = typeof document !== 'undefined' ? document.activeElement : null;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey) {
+        if (active === first || active === panel || !panel.contains?.(active)) {
+          event.preventDefault();
+          try { last.focus({ preventScroll: true }); } catch (_) {}
+        }
+      } else if (active === last || !panel.contains?.(active)) {
+        event.preventDefault();
+        try { first.focus({ preventScroll: true }); } catch (_) {}
+      }
+    }
+  }
+
+  function onHashChange() {
+    close();
+  }
+
+  function close(reason = 'dismiss') {
+    if (closed) return;
+    closed = true;
+    if (typeof document !== 'undefined') document.removeEventListener('keydown', onKeyDown, true);
+    if (typeof window !== 'undefined') window.removeEventListener('hashchange', onHashChange);
+    backdrop.remove();
+    if (priorActive && typeof priorActive.focus === 'function' && priorActive.isConnected !== false) {
+      const tag = String(priorActive.tagName || '').toUpperCase();
+      const isEditable = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || priorActive.isContentEditable;
+      if (!isEditable || shouldAutoFocusEditable()) {
+        try { priorActive.focus({ preventScroll: true }); } catch (_) {}
+      }
+    }
+    if (typeof onClose === 'function') onClose(reason);
+  }
+
+  if (typeof document !== 'undefined') {
+    document.addEventListener('keydown', onKeyDown, true);
+    document.body.appendChild(backdrop);
+  }
+  if (typeof window !== 'undefined') {
+    window.addEventListener('hashchange', onHashChange, { once: true });
+  }
+
+  const focusTarget = (() => {
+    if (!initialFocus) return panel;
+    const tag = String(initialFocus.tagName || '').toUpperCase();
+    const isEditable = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+    if (isEditable && !shouldAutoFocusEditable()) return panel;
+    return initialFocus;
+  })();
+  queueMicrotask(() => {
+    if (!closed && typeof focusTarget?.focus === 'function') {
+      try { focusTarget.focus({ preventScroll: true }); } catch (_) {}
+    }
+  });
+
+  return { close, backdrop, panel };
+}
+
+/** 确认弹窗：返回 Promise<boolean> */
+export function confirmDialog({
+  title = '确认操作',
+  message = '',
+  confirmText = '确认',
+  cancelText = '取消',
+  danger = false,
+} = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result, modal) => {
+      if (settled) return;
+      settled = true;
+      modal?.close('action');
+      resolve(result);
+    };
+    const cancelBtn = h('button', {
+      class: 'btn',
+      type: 'button',
+      onclick: () => finish(false, modal),
+    }, cancelText);
+    const confirmBtn = h('button', {
+      class: danger ? 'btn danger' : 'btn primary',
+      type: 'button',
+      onclick: () => finish(true, modal),
+    }, confirmText);
+    const modal = openModal({
+      title,
+      description: message,
+      actions: [cancelBtn, confirmBtn],
+      initialFocus: danger ? cancelBtn : confirmBtn,
+      onClose: () => finish(false, null),
+    });
+  });
+}
+
+/** 输入弹窗：返回 Promise<string | null>（取消时返回 null） */
+export function promptDialog({
+  title = '输入内容',
+  message = '',
+  placeholder = '',
+  initialValue = '',
+  type = 'text',
+  multiline = false,
+  rows = 5,
+  confirmText = '确定',
+  cancelText = '取消',
+  autocomplete = 'off',
+  sensitive = false,
+} = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const isSecret = type === 'password' || sensitive;
+    const field = multiline
+      ? h('textarea', {
+          class: 'input jmw-modal-textarea',
+          rows: String(rows),
+          placeholder,
+          ...(isSecret ? { dataset: { clipboardPrivate: 'true' } } : {}),
+        })
+      : h('input', {
+          class: 'input',
+          type,
+          placeholder,
+          autocomplete,
+          ...(isSecret ? { dataset: { clipboardPrivate: 'true' } } : {}),
+        });
+    field.value = String(initialValue ?? '');
+
+    let modal = null;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      modal?.close('action');
+      resolve(value);
+    };
+
+    const form = h('form', {
+      class: 'jmw-modal-form',
+      onsubmit: (event) => {
+        event.preventDefault();
+        finish(field.value);
+      },
+    }, field);
+
+    if (multiline) {
+      field.addEventListener('keydown', (event) => {
+        if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+          event.preventDefault();
+          finish(field.value);
+        }
+      });
+    }
+
+    const cancelBtn = h('button', {
+      class: 'btn',
+      type: 'button',
+      onclick: () => finish(null),
+    }, cancelText);
+    const confirmBtn = h('button', {
+      class: 'btn primary',
+      type: 'button',
+      onclick: () => finish(field.value),
+    }, confirmText);
+
+    modal = openModal({
+      title,
+      description: message,
+      body: form,
+      actions: [cancelBtn, confirmBtn],
+      initialFocus: field,
+      onClose: () => finish(null),
+    });
+  });
 }

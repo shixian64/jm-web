@@ -34,7 +34,7 @@ export function passwordGate(onSuccess) {
 
   const overlay = h('div', {
     role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': titleId, tabindex: '-1',
-    style: 'position:fixed;inset:0;z-index:300;background:var(--bg);display:flex;align-items:center;justify-content:center;padding:20px',
+    style: 'position:fixed;inset:0;z-index:300;overflow-y:auto;overscroll-behavior:contain;background:var(--bg);display:flex;justify-content:center;padding:max(20px,var(--safe-top)) max(16px,var(--safe-right)) max(20px,var(--safe-bottom)) max(16px,var(--safe-left))',
     onkeydown: (e) => {
       if (e.key !== 'Tab') return;
       const focusable = [input, btn].filter((el) => !el.disabled);
@@ -50,7 +50,7 @@ export function passwordGate(onSuccess) {
     },
   },
     h('form', {
-      class: 'card', style: 'max-width:340px;width:100%;padding:28px',
+      class: 'card', style: 'max-width:360px;width:100%;margin:auto;padding:28px',
       onsubmit: async (e) => {
         e.preventDefault();
         if (btn.disabled) return;

@@ -67,7 +67,9 @@ const skipLink = h('a', {
 }, '跳到主要内容');
 
 /* ---------- 顶栏 ---------- */
-const avatarMini = h('a', { id: 'avatar-mini', href: '#/user', title: '我的', 'aria-label': '打开我的页面' }, icon('user', 16));
+const avatarMini = h('a', {
+  id: 'avatar-mini', href: '#/user', dataset: { nav: '#/user' }, title: '个人中心', 'aria-label': '打开我的页面',
+}, icon('user', 16));
 const searchInput = h('input', {
   class: 'input', placeholder: '搜索漫画…',
   onkeydown: (e) => {
@@ -88,7 +90,6 @@ const topbar = h('div', { id: 'topbar' },
     navLink('#/category', '分类'),
     navLink('#/week', '每周必看'),
     navLink('#/favorites', '收藏'),
-    navLink('#/user', '我的'),
   ),
   h('div', { class: 'top-search' }, h('span', { class: 'search-leading', 'aria-hidden': 'true' }, icon('search', 17)), searchInput),
   h('div', { class: 'spacer' }),
@@ -423,7 +424,7 @@ function highlightNav(path) {
       || path.startsWith('/ai') || path.startsWith('/network') || path.startsWith('/logs')
       || path.startsWith('/extract') || path.startsWith('/cache') || path.startsWith('/about')) ? '#/user'
     : null;
-  document.querySelectorAll('#topbar .nav-links a, #tabbar a').forEach((a) => {
+  document.querySelectorAll('#topbar .nav-links a, #topbar #avatar-mini, #tabbar a').forEach((a) => {
     const active = desktopActive;
     const isActive = a.dataset.nav === active;
     a.classList.toggle('active', isActive);

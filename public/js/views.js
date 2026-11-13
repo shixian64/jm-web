@@ -4,8 +4,7 @@ import {
 } from './api.js';
 import {
   h, toast, comicCard, comicSkeletons, infiniteList, installPullToRefresh, errorBox, loadingBox,
-  installImageRetry,
-  shouldAutoFocusEditable,
+  installImageRetry, shouldAutoFocusEditable, promptDialog, subpageBackLink,
 } from './ui.js';
 import { setting, getLocalHistory, getSearchHistory, addSearchHistory, clearSearchHistory } from './store.js';
 import { icon } from './icons.js';
@@ -243,6 +242,7 @@ export function buildSwiper(items, cleanups = [], contextTitle = '') {
   const swiper = h('div', { class: 'swiper', 'aria-label': '精选内容轮播' });
   const featuredItems = items.slice(0, 6);
   const slideImages = featuredItems.map((item) => imgSrc(item));
+  const slidePosters = [];
   const slides = featuredItems.map((it, i) => {
     const id = String((it && (it.id ?? it.aid ?? it.AID)) || '');
     const canOpen = /^\d+$/.test(id);
@@ -250,6 +250,12 @@ export function buildSwiper(items, cleanups = [], contextTitle = '') {
     const category = String(it?.category_sub?.title || it?.category?.title || '').trim();
     const author = String(it?.author || '').trim();
     const title = String(it?.name || '精选漫画');
+    const posterImg = h('img', {
+      alt: '',
+      decoding: 'async',
+      onerror: () => { posterImg.hidden = true; },
+    });
+    slidePosters.push(posterImg);
     const s = h('div', {
       class: 'slide' + (i === 0 ? ' on' : ''),
       'aria-roledescription': 'slide',
@@ -267,16 +273,20 @@ export function buildSwiper(items, cleanups = [], contextTitle = '') {
         author ? h('p', null, '作者 · ', author) : null,
         h('span', { class: 'slide-cta' }, '查看详情', icon('arrow-right', 14)),
       ),
+      h('div', { class: 'slide-poster', 'aria-hidden': 'true' }, posterImg),
     );
     return s;
   });
   // 背景图不会受 <img loading="lazy"> 控制。只给实际需要显示的 slide
-  // 写入 background-image，避免首页初次渲染时 6 张大图同时回源。
+  // 写入 background-image 与前景海报 src，避免首页初次渲染时 6 张大图同时回源。
   const loadSlideBackground = (index) => {
     const slide = slides[index];
     if (!slide || slide.dataset.backgroundReady === 'true') return;
     const source = slideImages[index];
-    if (source) slide.style.backgroundImage = `url("${source}")`;
+    if (source) {
+      slide.style.backgroundImage = `url("${source}")`;
+      slidePosters[index]?.setAttribute('src', source);
+    }
     slide.dataset.backgroundReady = 'true';
   };
   loadSlideBackground(0);
@@ -449,18 +459,23 @@ function searchHref(q, order, excludedTags) {
 
 function buildSearchExclusionEditor(excludedTags, onChange) {
   const tags = normalizeTags(excludedTags);
-  const wrap = h('div', { class: 'card', style: 'padding:12px 14px;margin:8px 0 12px' });
-  const head = h('div', { style: 'display:flex;align-items:center;gap:8px;flex-wrap:wrap' },
-    h('strong', { style: 'font-size:13px;flex:1' }, '排除标签'),
+  const wrap = h('div', { class: 'card search-exclude-card' });
+  const head = h('div', { class: 'search-exclude-head' },
+    h('strong', { class: 'search-exclude-title' }, '排除标签'),
     h('button', {
-      class: 'btn', type: 'button', style: 'min-height:32px;padding:5px 10px',
-      onclick: () => {
-        const value = window.prompt('输入要排除的标签');
-        if (value != null && value.trim()) onChange(normalizeTags([...tags, value]));
+      class: 'btn sm', type: 'button',
+      onclick: async () => {
+        const value = await promptDialog({
+          title: '添加排除标签',
+          message: '支持一次输入多个标签（空格或逗号分隔）。',
+          placeholder: '例如：重口、NTR',
+          confirmText: '添加',
+        });
+        if (value != null && value.trim()) onChange(normalizeTags([...tags, ...value.split(/[\s,，、/|]+/)]));
       },
-    }, '＋ 添加'),
+    }, icon('plus', 14), '添加'),
     tags.length ? h('button', {
-      class: 'btn', type: 'button', style: 'min-height:32px;padding:5px 10px',
+      class: 'btn sm', type: 'button',
       onclick: () => onChange([]),
     }, '清空') : null,
   );
@@ -470,7 +485,7 @@ function buildSearchExclusionEditor(excludedTags, onChange) {
     tags.forEach((tag) => selected.append(h('button', {
       class: 'chip active', type: 'button', title: `移除 ${tag}`,
       onclick: () => onChange(tags.filter((item) => item.toLocaleLowerCase() !== tag.toLocaleLowerCase())),
-    }, `${tag} ×`)));
+    }, tag, icon('x', 13))));
     wrap.append(selected);
   }
   const templates = (setting.blockedTagTemplateList || [])
@@ -610,7 +625,10 @@ export function categoryListView(root, params) {
   const title = params.get('title') || '';
   const page = h('div', { class: 'page search-page' });
 
-  if (title) page.append(h('div', { class: 'list-head' }, h('h2', null, title)));
+  page.append(h('div', { class: 'list-head' },
+    subpageBackLink('#/category', '分类'),
+    h('h2', null, title || '分类浏览'),
+  ));
   const chips = h('div', { class: 'chips' },
     CATEGORY_ORDERS.map(([val, label]) =>
       h('a', { class: 'chip' + (val === o ? ' active' : ''), href: `#/category/list?c=${encodeURIComponent(c)}&o=${val}${title ? `&title=${encodeURIComponent(title)}` : ''}` }, label)));
@@ -636,7 +654,10 @@ export function promoteListView(root, params) {
   const id = params.get('id') || '';
   const fallback = promoteFallback.get(id);
   const title = params.get('title') || (fallback && fallback.title) || '首页推荐';
-  const page = h('div', { class: 'page' }, h('div', { class: 'list-head' }, h('h2', null, title)));
+  const page = h('div', { class: 'page' }, h('div', { class: 'list-head' },
+    subpageBackLink('#/', '首页'),
+    h('h2', null, title),
+  ));
   root.append(page);
 
   if (!id) {
@@ -721,8 +742,8 @@ export function weekView(root, params, ctx) {
 
       content.replaceChildren(
         h('div', { class: 'list-head' }, h('h2', null, '每周必看')),
-        h('div', { class: 'setting-row', style: 'margin-bottom:10px' },
-          h('label', { for: 'week-period', style: 'font-size:13px;color:var(--text-2)' }, '期数'),
+        h('div', { class: 'setting-row week-toolbar' },
+          h('label', { for: 'week-period', style: 'font-size:13px;color:var(--text-2);flex:none' }, '期数'),
           periodSelect),
         typeChips,
         listWrap,

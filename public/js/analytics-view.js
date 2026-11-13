@@ -12,7 +12,10 @@ export async function analyticsView(root, query, ctx, rankingOnly = false) {
   const path = rankingOnly ? '/popular' : '/analytics';
   const content = h('div', { class: 'analytics-content', 'aria-live': 'polite', 'aria-busy': 'true' }, loadingBox());
   const tab = (href, label, active) => h('a', { href, class: active ? 'active' : '', 'aria-current': active ? 'page' : null }, label);
-  const view = h('section', { class: 'page analytics-page' },
+  const view = h('section', { class: 'page page-medium analytics-page' },
+    h('div', { class: 'analytics-top-nav' },
+      h('a', { class: 'subpage-back', href: '#/' }, icon('chevron-left', 16), h('span', null, '返回首页')),
+    ),
     h('header', { class: 'analytics-head' },
       h('h1', null, '数据统计'),
       h('nav', { class: 'analytics-periods', 'aria-label': '时间范围' }, PERIODS.map(([d, label]) =>

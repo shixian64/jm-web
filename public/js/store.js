@@ -17,6 +17,7 @@ const defaultSetting = {
   shunt: '1',           // 图片分流 1-4
   readMode: 'scroll',   // scroll | page | pageReverse | tap
   pageFit: 'contain',   // 翻页适配：contain | width
+  scrollWidth: 'standard', // 滚动模式桌面栏宽：narrow | standard | wide | full
   prefetchCount: 3,     // 预加载数量
   brightnessFollowSystem: true,
   brightness: 1,

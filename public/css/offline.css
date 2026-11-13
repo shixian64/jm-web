@@ -4,12 +4,19 @@ body.offline-reading {
   overflow: hidden;
 }
 
+body.offline-reading #topbar,
+body.offline-reading #tabbar {
+  display: none !important;
+}
+
 .offline-reader {
   position: fixed;
   inset: 0;
   z-index: 1000;
+  height: 100vh;
+  height: 100dvh;
   display: grid;
-  grid-template-rows: 52px minmax(0, 1fr);
+  grid-template-rows: calc(52px + env(safe-area-inset-top)) minmax(0, 1fr);
   background: #0c0e13;
   color: #f3f4f7;
 }
@@ -20,7 +27,7 @@ body.offline-reading {
   grid-template-columns: 42px minmax(0, 1fr) auto 56px;
   align-items: center;
   gap: 8px;
-  padding: max(4px, env(safe-area-inset-top)) 8px 4px;
+  padding: env(safe-area-inset-top) max(8px, env(safe-area-inset-right)) 0 max(8px, env(safe-area-inset-left));
   background: rgba(17, 19, 25, .94);
   border-bottom: 1px solid rgba(255, 255, 255, .09);
   backdrop-filter: blur(16px);
@@ -137,12 +144,16 @@ body.offline-reading {
   top: 50%;
   width: 46px;
   height: 70px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
   transform: translateY(-50%);
   border: 1px solid rgba(255, 255, 255, .14);
   border-radius: 12px;
   background: rgba(17, 19, 25, .72);
   color: #fff;
-  font-size: 34px;
+  font-size: 32px;
   cursor: pointer;
   backdrop-filter: blur(10px);
 }
@@ -153,11 +164,11 @@ body.offline-reading {
 }
 
 .offline-prev {
-  left: 10px;
+  left: max(10px, env(safe-area-inset-left));
 }
 
 .offline-next {
-  right: 10px;
+  right: max(10px, env(safe-area-inset-right));
 }
 
 @media (max-width: 700px) {
@@ -191,22 +202,33 @@ body.offline-reading {
 /* 下载中心 */
 
 .download-center {
-  width: min(100% - 24px, 980px);
+  width: 100%;
+  max-width: var(--content-medium, 1040px);
   margin: 0 auto;
-  padding: 20px 0 90px;
+  padding: 26px clamp(16px, 3vw, 42px) calc(var(--tabbar-offset, 66px) + 34px);
   color: var(--text, #252831);
 }
 
 .download-center-head {
   display: flex;
-  align-items: center;
-  gap: 14px;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
   margin-bottom: 24px;
 }
 
+.download-head-copy,
 .download-center-head > div:first-child {
   min-width: 0;
   margin-right: auto;
+}
+
+.download-head-meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 .download-kicker {
@@ -395,18 +417,18 @@ body.offline-reading {
 
 .download-status.downloading,
 .download-status.fetching {
-  background: rgba(229, 88, 138, .14);
-  color: #c63d70;
+  background: var(--primary-weak, rgba(229, 88, 138, .14));
+  color: var(--primary, #c63d70);
 }
 
 .download-status.completed {
-  background: rgba(21, 139, 86, .13);
-  color: #147b50;
+  background: color-mix(in srgb, var(--ok, #147b50) 14%, transparent);
+  color: var(--ok, #147b50);
 }
 
 .download-status.failed {
-  background: rgba(204, 48, 74, .12);
-  color: #bc2943;
+  background: color-mix(in srgb, var(--danger, #bc2943) 14%, transparent);
+  color: var(--danger, #bc2943);
 }
 
 .download-message {
@@ -599,8 +621,9 @@ body.offline-reading {
     flex-wrap: wrap;
   }
 
-  .download-storage {
+  .download-head-meta {
     width: 100%;
+    justify-content: space-between;
   }
 
   .download-batch-toolbar {

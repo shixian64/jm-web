@@ -425,7 +425,7 @@ export function mountReader(root, photoId, query, options = {}) {
     class: 'r-fab', type: 'button', title: '显示工具栏', 'aria-label': '显示阅读工具栏',
     'aria-controls': toolbarId, 'aria-expanded': 'false',
     onclick: () => setToolbar(true, true),
-  }, icon('menu', 22));
+  }, icon('menu', 19));
   const prevBtn = h('button', {
     class: 'r-page-nav r-page-prev', type: 'button', title: '左侧翻页', 'aria-label': '左侧翻页',
     onclick: () => goFromSide('left'),
@@ -550,6 +550,7 @@ export function mountReader(root, photoId, query, options = {}) {
       sourceReady: state.images.length > 0,
       sourceRefreshPending,
       pageFit: setting.pageFit,
+      scrollWidth: ['narrow', 'standard', 'wide', 'full'].includes(setting.scrollWidth) ? setting.scrollWidth : 'standard',
       tapMode: setting.tapMode,
       brightnessFollowSystem: setting.brightnessFollowSystem,
       brightness: setting.brightness,
@@ -581,12 +582,15 @@ export function mountReader(root, photoId, query, options = {}) {
     container.classList.toggle('progress-pinned', setting.readerToolbarAutoHide === false);
     container.classList.toggle('rtl', isRtlMode());
     container.classList.toggle('tap-only', state.mode === 'tap');
+    container.dataset.scrollWidth = ['narrow', 'standard', 'wide', 'full'].includes(setting.scrollWidth)
+      ? setting.scrollWidth : 'standard';
     settingsUI.refresh();
   }
 
   function changeReaderSetting(key, value) {
     if (state.destroyed) return;
     if (key === 'theme' && !['auto', 'light', 'dark'].includes(value)) return;
+    if (key === 'scrollWidth' && !['narrow', 'standard', 'wide', 'full'].includes(value)) return;
     if (key === 'shunt') {
       value = String(value);
       if (!['1', '2', '3', '4'].includes(value)) return;
@@ -922,7 +926,7 @@ export function mountReader(root, photoId, query, options = {}) {
         }
         renderDrawer();
         container.querySelector('.r-loading')?.remove();
-        titleEl.textContent = state.albumName || currentChapterName() || `章节 ${state.photoId}`;
+        syncReaderTitle();
         render();
       } catch (e) {
         if (!state.destroyed) showFatal(e.message || '无法打开离线章节');
@@ -1002,16 +1006,37 @@ export function mountReader(root, photoId, query, options = {}) {
       renderDrawer();
     }
 
-    titleEl.textContent = state.albumName || currentChapterName() || `章节 ${state.photoId}`;
+    syncReaderTitle();
     render();
+  }
+
+  function syncReaderTitle() {
+    const albumTitle = String(state.albumName || '').trim();
+    const chapTitle = currentChapterName();
+    let full = albumTitle || chapTitle || `章节 ${state.photoId}`;
+    if (albumTitle && chapTitle && chapTitle !== albumTitle && chapTitle !== '全一话') {
+      full = `${albumTitle} · ${chapTitle}`;
+    }
+    titleEl.textContent = full;
+    titleEl.title = full;
+  }
+
+  function retryInit() {
+    if (state.destroyed) return;
+    pages.replaceChildren();
+    if (!container.querySelector('.r-loading')) {
+      container.append(h('div', { class: 'r-loading', role: 'status' },
+        h('div', { class: 'spinner-sm' }), h('p', null, '正在重新获取章节图片…')));
+    }
+    init();
   }
 
   function showFatal(msg) {
     if (state.destroyed) return;
-    pages.replaceChildren(h('div', { style: 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center' },
+    pages.replaceChildren(h('div', { style: 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:16px' },
       h('div', { class: 'error-box' },
         h('div', null, msg),
-        h('button', { class: 'btn', onclick: () => location.reload() }, '重试'),
+        h('button', { class: 'btn', type: 'button', onclick: retryInit }, '重试'),
       )));
     container.querySelector('.r-loading')?.remove();
   }

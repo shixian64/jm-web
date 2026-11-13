@@ -2,6 +2,7 @@
 import { api, imgSrc, commentContentText, commentPageHasMore, navigationState } from './api.js';
 import {
   h, toast, comicCard, infiniteList, installPullToRefresh, errorBox, loadingBox, installImageRetry,
+  confirmDialog, promptDialog, subpageBackLink,
 } from './ui.js';
 import {
   setting, updateSetting, getLocalHistory, clearLocalHistory, removeLocalHistory,
@@ -573,7 +574,7 @@ function signinStreak(records, todayKey, fallbackIndex) {
 }
 
 export function signinView(root, ctx) {
-  const page = h('div', { class: 'page signin-page', style: 'max-width:560px' });
+  const page = h('div', { class: 'page signin-page settings-page' });
   const content = h('div');
   page.append(content);
   root.append(page);
@@ -673,7 +674,7 @@ export function signinView(root, ctx) {
     }, isTodaySigned ? '今日已签到' : canCheckIn ? '立即签到' : '签到暂不可用');
 
     content.replaceChildren(
-      h('div', { class: 'list-head' }, h('h2', null, '每日签到')),
+      h('div', { class: 'list-head' }, subpageBackLink('#/user', '个人中心'), h('h2', null, '每日签到')),
       h('div', { class: 'card', style: 'padding:16px' },
         h('div', { class: 'signin-summary' },
           h('div', { class: `signin-status${isTodaySigned ? ' done' : canCheckIn ? ' ready' : ' unavailable'}` },
@@ -863,7 +864,11 @@ export function favoritesView(root, params, ctx) {
     const create = h('button', {
       class: 'favorite-folder-action primary', type: 'button', 'aria-label': '新建收藏夹', title: '新建收藏夹',
       onclick: async () => {
-        const name = window.prompt('新收藏夹名称');
+        const name = await promptDialog({
+          title: '新建收藏夹',
+          placeholder: '输入收藏夹名称',
+          confirmText: '创建',
+        });
         if (!name || !name.trim()) return;
         try {
           const result = await api.favoriteFolder('add', '0', name.trim(), '');
@@ -875,7 +880,12 @@ export function favoritesView(root, params, ctx) {
     const rename = h('button', {
       class: 'favorite-folder-action', type: 'button', disabled: folderId === '0', 'aria-label': '重命名收藏夹', title: '重命名收藏夹',
       onclick: async () => {
-        const name = window.prompt('重命名收藏夹', currentName);
+        const name = await promptDialog({
+          title: '重命名收藏夹',
+          initialValue: currentName,
+          placeholder: '输入新的收藏夹名称',
+          confirmText: '保存',
+        });
         if (!name || !name.trim() || name.trim() === currentName) return;
         try {
           const result = await api.favoriteFolder('edit', folderId, name.trim(), '');
@@ -887,7 +897,13 @@ export function favoritesView(root, params, ctx) {
     const remove = h('button', {
       class: 'favorite-folder-action danger', type: 'button', disabled: folderId === '0', 'aria-label': '删除收藏夹', title: '删除收藏夹',
       onclick: async () => {
-        if (!window.confirm(`删除“${currentName}”？其中漫画不会从总收藏中移除。`)) return;
+        const ok = await confirmDialog({
+          title: `删除“${currentName}”？`,
+          message: '收藏夹内的漫画不会从总收藏中移除。',
+          confirmText: '删除收藏夹',
+          danger: true,
+        });
+        if (!ok) return;
         try {
           const result = await api.favoriteFolder('del', folderId, '', '');
           toast(result?.scope === 'cloud' ? '云端收藏夹已删除' : '收藏夹已删除（仅本会话）');
@@ -944,7 +960,13 @@ export function favoritesView(root, params, ctx) {
     const unfavorite = h('button', {
       class: 'btn', type: 'button',
       onclick: async () => {
-        if (!window.confirm(`取消收藏选中的 ${selected.size} 项？`)) return;
+        const ok = await confirmDialog({
+          title: '批量取消收藏',
+          message: `确定取消收藏选中的 ${selected.size} 部作品吗？`,
+          confirmText: '取消收藏',
+          danger: true,
+        });
+        if (!ok) return;
         unfavorite.disabled = true;
         let success = 0;
         for (const id of [...selected]) {
@@ -1278,7 +1300,14 @@ export function watchHistoryView(root) {
   const clearLoaded = h('button', {
     class: 'btn', type: 'button', disabled: true,
     onclick: async () => {
-      if (bulkDeleting || !loaded.size || !window.confirm(`删除当前已加载的 ${loaded.size} 部作品历史？云端失败时将仅在本会话隐藏。`)) return;
+      if (bulkDeleting || !loaded.size) return;
+      const ok = await confirmDialog({
+        title: '清空已加载历史',
+        message: `删除当前已加载的 ${loaded.size} 部作品历史？云端失败时将仅在本会话隐藏。`,
+        confirmText: '删除历史',
+        danger: true,
+      });
+      if (!ok) return;
       bulkDeleting = true;
       clearLoaded.disabled = true;
       try {
@@ -1302,7 +1331,7 @@ export function watchHistoryView(root) {
     },
   }, '清空已加载');
   page.append(
-    h('div', { class: 'list-head' }, h('h2', null, '账号阅读历史')),
+    h('div', { class: 'list-head' }, subpageBackLink('#/user', '个人中心'), h('h2', null, '账号阅读历史')),
     scopeHint,
     h('div', { class: 'action-bar', style: 'margin:2px 0 10px' }, clearLoaded),
   );
@@ -1359,16 +1388,22 @@ export function watchHistoryView(root) {
       return null;
     }
     const card = comicCard(item);
-    card.style.position = 'relative';
+    card.classList.add('has-corner-action');
     const record = { key, item, card, deleting: false };
     const remove = h('button', {
-      class: 'chip', type: 'button', title: '删除这条历史',
+      class: 'card-corner-btn', type: 'button', title: '删除这条历史',
       'aria-label': `删除${item.name || ids[0] || '该作品'}的历史`,
-      style: 'position:absolute;z-index:3;right:7px;top:7px;padding:5px 7px;background:var(--card)',
       onclick: async (e) => {
+        e.preventDefault();
         e.stopPropagation();
         if (bulkDeleting || record.deleting) return;
-        if (!window.confirm(`删除“${item.name || '该作品'}”的账号阅读历史？云端失败时将仅在本会话隐藏。`)) return;
+        const ok = await confirmDialog({
+          title: '删除阅读历史',
+          message: `删除“${item.name || '该作品'}”的账号阅读历史？云端失败时将仅在本会话隐藏。`,
+          confirmText: '删除',
+          danger: true,
+        });
+        if (!ok) return;
         remove.disabled = true;
         try {
           const result = await deleteHistoryGroup(record);
@@ -1432,23 +1467,35 @@ export function watchHistoryView(root) {
 /* ============================== 本地阅读记录 ============================== */
 
 export function localHistoryView(root) {
-  const page = h('div', { class: 'page history-page' });
+  const page = h('div', { class: 'page page-medium history-page' });
   root.append(page);
 
   const render = () => {
     const hist = getLocalHistory();
     page.replaceChildren(h('div', { class: 'list-head' },
+      subpageBackLink('#/user', '个人中心'),
       h('h2', null, '本地阅读记录'),
-      h('div', { style: 'font-size:12.5px;color:var(--text-2);margin:2px' }, '仅保存在本设备浏览器中，无需登录'),
+      h('p', { class: 'hint' }, '仅保存在本设备浏览器中，无需登录'),
     ));
     if (!hist.length) {
       page.append(h('div', { class: 'empty' }, h('div', { class: 'big' }, icon('smartphone', 40)), '还没有阅读记录'));
       return;
     }
     page.append(h('button', {
-      class: 'btn', type: 'button', style: 'margin:4px 2px 10px',
-      onclick: () => { clearLocalHistory(); render(); },
-    }, '清空记录'));
+      class: 'btn', type: 'button', style: 'margin:4px 2px 12px',
+      onclick: async () => {
+        const ok = await confirmDialog({
+          title: '清空本地阅读记录',
+          message: `确定清空本设备上的全部 ${hist.length} 条阅读记录吗？此操作不可恢复。`,
+          confirmText: '清空记录',
+          danger: true,
+        });
+        if (!ok) return;
+        clearLocalHistory();
+        toast('本地阅读记录已清空');
+        render();
+      },
+    }, icon('trash-2', 15), '清空记录'));
 
     const list = h('div');
     hist.forEach((it) => {
@@ -1460,10 +1507,10 @@ export function localHistoryView(root) {
       // 按记录中的章节/离线状态进入阅读器，避免直接跳过作品上下文。
       const open = () => { if (canOpen) location.hash = href; };
       const coverImage = h('img', { loading: 'lazy', alt: it.name || '漫画封面', fetchpriority: 'low' });
-      const coverHost = h('div', { class: 'avatar', style: 'border-radius:8px' }, coverImage);
+      const coverHost = h('div', { class: 'local-history-cover' }, coverImage);
       installImageRetry(coverImage, imgSrc({ ...it, aid }), { lazy: true });
       const item = h('div', {
-        class: 'comment-item',
+        class: 'comment-item local-history-item',
         style: canOpen ? 'cursor:pointer' : '',
         ...(canOpen ? { role: 'button', tabindex: '0', 'aria-label': `查看${it.name || '漫画'}主页`, onclick: open } : { 'aria-disabled': 'true' }),
       },
@@ -1490,7 +1537,7 @@ export function localHistoryView(root) {
 /* ============================== 我的评论 ============================== */
 
 export function myCommentsView(root, params, ctx) {
-  const page = h('div', { class: 'page' });
+  const page = h('div', { class: 'page page-medium' });
   const content = h('div');
   page.append(content);
   root.append(page);
@@ -1578,7 +1625,7 @@ export function myCommentsView(root, params, ctx) {
     finished = false;
     uid = String(params.get('uid') || '');
     content.replaceChildren(
-      h('div', { class: 'list-head' }, h('h2', null, '我的评论')),
+      h('div', { class: 'list-head' }, subpageBackLink('#/user', '个人中心'), h('h2', null, '我的评论')),
       commentListSkeleton(),
     );
 
@@ -1602,7 +1649,7 @@ export function myCommentsView(root, params, ctx) {
     if (destroyed || seq !== generation || !uid || isInactive(ctx)) return;
     listWrap = h('div');
     sentinel = h('div');
-    content.replaceChildren(h('div', { class: 'list-head' }, h('h2', null, '我的评论')), listWrap, sentinel);
+    content.replaceChildren(h('div', { class: 'list-head' }, subpageBackLink('#/user', '个人中心'), h('h2', null, '我的评论')), listWrap, sentinel);
     obs = new IntersectionObserver((entries) => {
       if (entries.some((entry) => entry.isIntersecting)) loadNext(seq);
     }, { rootMargin: '300px' });
@@ -1636,8 +1683,12 @@ function commentListSkeleton(count = 4) {
 /* ============================== 设置 ============================== */
 
 export async function settingsView(root, ctx) {
-  const page = h('div', { class: 'page settings-page', style: 'max-width:620px' });
-  page.append(h('div', { class: 'list-head' }, h('h2', null, '设置')));
+  const page = h('div', { class: 'page settings-page' });
+  page.append(h('div', { class: 'list-head' },
+    subpageBackLink('#/user', '个人中心'),
+    h('h2', null, '设置'),
+    h('p', { class: 'hint' }, '常用阅读、主题与线路偏好；高级安全与维护请前往完整功能中心。'),
+  ));
   root.append(page);
 
   let cfg;
@@ -1659,6 +1710,12 @@ export async function settingsView(root, ctx) {
     ['scroll', '连续滚动'], ['page', '向右翻页'], ['pageReverse', '向左翻页（RTL）'], ['tap', '纯点击翻页'],
   ], setting.readMode,
     (v) => updateSetting({ readMode: v }));
+
+  /* 桌面滚动栏宽 */
+  const scrollWidthSel = selectRow('桌面滚动栏宽', [
+    ['narrow', '紧凑（720px）'], ['standard', '标准（880px）'], ['wide', '宽栏（1100px）'], ['full', '铺满窗口'],
+  ], setting.scrollWidth || 'standard',
+    (v) => updateSetting({ scrollWidth: v }));
 
   /* 翻页适配 */
   const fitSel = selectRow('翻页适配方式', [['contain', '完整显示'], ['width', '适配宽度']], setting.pageFit,
@@ -1694,24 +1751,32 @@ export async function settingsView(root, ctx) {
 
   page.append(
     h('div', { class: 'setting-group' },
-      h('div', { class: 'setting-item setting-section-title' }, h('div', { class: 'lab' }, '功能入口')),
-      h('div', { class: 'setting-item', style: 'display:flex;gap:8px;flex-wrap:wrap' },
+      h('div', { class: 'setting-item setting-section-title' }, h('div', { class: 'lab' }, '快捷入口')),
+      h('div', { class: 'setting-item setting-actions-wrap' },
         h('a', { class: 'btn', href: '#/advanced' }, icon('layout-grid', 16), '完整功能中心'),
-        h('a', { class: 'btn', href: '#/downloads' }, icon('inbox', 16), '下载与离线缓存'),
+        h('a', { class: 'btn', href: '#/palette' }, icon('sparkles', 16), '调色板与布局'),
+        h('a', { class: 'btn', href: '#/downloads' }, icon('download', 16), '下载与离线缓存'),
         h('a', { class: 'btn', href: '#/ai' }, icon('message-square', 16), 'AI 对话')),
     ),
     h('div', { class: 'setting-group' },
       h('div', { class: 'setting-item setting-section-title' }, h('div', { class: 'lab' }, '外观')),
-      h('div', { class: 'setting-item' }, themeSel),
+      themeSel,
     ),
     h('div', { class: 'setting-group' },
-      h('div', { class: 'setting-item' }, h('div', { class: 'lab' }, '阅读'), modeSel, fitSel, preSel)),
+      h('div', { class: 'setting-item setting-section-title' }, h('div', { class: 'lab' }, '阅读偏好')),
+      modeSel,
+      scrollWidthSel,
+      fitSel,
+      preSel,
+    ),
     h('div', { class: 'setting-group' },
-      h('div', { class: 'setting-item' }, h('div', { class: 'lab' }, '网络'), shuntSel,
-        h('div', { class: 'setting-row', style: 'margin-top:12px' },
+      h('div', { class: 'setting-item setting-section-title' }, h('div', { class: 'lab' }, '网络与线路')),
+      shuntSel,
+      h('div', { class: 'setting-item' },
+        h('div', { class: 'setting-row' },
           h('div', null, h('div', { class: 'lab', style: 'margin-bottom:0' }, 'API 域名')),
           hostSel),
-        h('div', { class: 'hint' }, cfg.apiHostLocked
+        h('div', { class: 'hint', style: 'margin-top:6px' }, cfg.apiHostLocked
           ? 'API 域名已由服务器环境变量 JM_API_BASE 固定'
           : '切换仅对本浏览器生效；接口请求失败时会自动尝试其他域名')),
     ),
@@ -1720,12 +1785,22 @@ export async function settingsView(root, ctx) {
   // 清除本地数据
   page.append(h('div', { class: 'setting-group' },
     h('button', {
-      class: 'setting-item btn ghost', style: 'width:100%;border:none;text-align:left;color:var(--danger)',
-      onclick: () => { clearLocalHistory(); toast('本地阅读记录已清空'); },
-    }, icon('trash-2', 16), ' 清空本地阅读记录'),
+      class: 'setting-item btn ghost', style: 'color:var(--danger)',
+      onclick: async () => {
+        const ok = await confirmDialog({
+          title: '清空本地阅读记录',
+          message: '确定清空本设备保存的所有阅读历史与章节进度吗？此操作不可恢复。',
+          confirmText: '清空记录',
+          danger: true,
+        });
+        if (!ok) return;
+        clearLocalHistory();
+        toast('本地阅读记录已清空');
+      },
+    }, icon('trash-2', 16), '清空本地阅读记录'),
   ));
 
-  page.append(h('div', { style: 'text-align:center;color:var(--text-2);font-size:12px;padding:20px 0' },
+  page.append(h('div', { class: 'settings-footnote' },
     `JM Web · 协议参照 jmcomic-next / jm-mobile（API v${cfg.apiVersion}）`, h('br'),
     '仅供学习研究，请在 24 小时内自觉评估使用风险'));
 }
@@ -1734,7 +1809,7 @@ function selectRow(label, options, current, onChange) {
   const sel = h('select', { class: 'input' },
     options.map(([v, l]) => h('option', { value: v, selected: v === current }, l)));
   sel.addEventListener('change', () => onChange(sel.value));
-  return h('div', { class: 'setting-row' },
+  return h('label', { class: 'setting-item setting-row' },
     h('div', null, h('div', { class: 'lab', style: 'margin-bottom:0' }, label)),
     sel);
 }

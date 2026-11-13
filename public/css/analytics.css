@@ -1,5 +1,5 @@
 /* 数据统计：复用主题变量，原生实现，无外部图表依赖（保持同源 CSP）。 */
-.analytics-page { max-width: 960px; margin-inline: auto; --an-anon: color-mix(in srgb, var(--primary) 35%, var(--card)); }
+.analytics-page { max-width: var(--content-medium, 1040px); margin-inline: auto; --an-anon: color-mix(in srgb, var(--primary) 35%, var(--card)); }
 html[data-theme="dark"] .analytics-page { --an-anon: color-mix(in srgb, var(--primary) 52%, var(--card)); }
 @media (prefers-color-scheme: dark) {
   html[data-theme="auto"] .analytics-page { --an-anon: color-mix(in srgb, var(--primary) 52%, var(--card)); }
@@ -76,7 +76,7 @@ html[data-theme="dark"] .analytics-page { --an-anon: color-mix(in srgb, var(--pr
 .analytics-inspector { display: flex; align-items: center; justify-content: space-between; gap: 8px 16px; margin-top: 10px; padding: 6px 8px; border-radius: 10px; background: var(--bg); }
 .analytics-day-controls { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 .analytics-inspector-date { min-width: 68px; text-align: center; font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.analytics-day-step { display: grid; place-items: center; width: 30px; height: 30px; padding: 0; border: 0; border-radius: 8px; color: var(--text); background: transparent; cursor: pointer; }
+.analytics-day-step { display: grid; place-items: center; width: 36px; height: 36px; padding: 0; border: 0; border-radius: 9px; color: var(--text); background: transparent; cursor: pointer; }
 .analytics-day-step:hover:not(:disabled) { background: var(--card); }
 .analytics-day-step:disabled { opacity: .25; cursor: default; }
 .analytics-inspector-values { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px 16px; padding-right: 6px; }

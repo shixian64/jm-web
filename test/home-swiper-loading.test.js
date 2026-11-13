@@ -176,10 +176,15 @@ function restoreGlobals() {
   assert.strictEqual(slides.length, 6);
   assert.deepStrictEqual(loadedIndexes(slides), [0], '首屏只能请求 active 背景图');
   assert.match(slides[0].style.backgroundImage, /%2Fmedia%2Falbums%2F1\.jpg/);
+  const firstPosterImg = findByClass(slides[0], 'slide-poster')?.children[0];
+  assert.ok(firstPosterImg && /%2Fmedia%2Falbums%2F1\.jpg/.test(firstPosterImg.getAttribute('src') || ''),
+    '首屏 active 轮播应同步挂载右侧清晰 3:4 封面海报');
   assert.strictEqual(slides[0].getAttribute('aria-hidden'), 'false');
   assert.strictEqual(slides[0].tabIndex, 0);
   slides.slice(1).forEach((slide) => {
     assert.strictEqual(slide.dataset.backgroundReady, undefined, '不可见 slide 不应提前进入加载队列');
+    const posterImg = findByClass(slide, 'slide-poster')?.children[0];
+    assert.strictEqual(posterImg?.getAttribute('src') ?? null, null, '不可见 slide 的右侧海报图不得提前发起请求');
     assert.strictEqual(slide.getAttribute('aria-hidden'), 'true');
     assert.strictEqual(slide.tabIndex, -1);
   });

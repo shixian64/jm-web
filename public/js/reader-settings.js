@@ -98,6 +98,14 @@ export function createReaderSettings(options) {
   );
   fitSelect.addEventListener('change', () => options.onSetting('pageFit', fitSelect.value));
 
+  const scrollWidthSelect = h('select', { class: 'r-setting-select', 'aria-label': '桌面滚动栏宽' },
+    h('option', { value: 'narrow' }, '紧凑（720px）'),
+    h('option', { value: 'standard' }, '标准（880px）'),
+    h('option', { value: 'wide' }, '宽栏（1100px）'),
+    h('option', { value: 'full' }, '铺满窗口'),
+  );
+  scrollWidthSelect.addEventListener('change', () => options.onSetting('scrollWidth', scrollWidthSelect.value));
+
   const tapModeSelect = h('select', { class: 'r-setting-select', 'aria-label': '滚动模式点击区域' },
     h('option', { value: 'default' }, '上下区域'),
     h('option', { value: 'side' }, '左右两侧'),
@@ -155,6 +163,25 @@ export function createReaderSettings(options) {
     type: 'button', class: 'r-chapter-btn', onclick: () => options.onChapter(1),
   }, h('span', null, '下一章'), icon('arrow-right', 17));
 
+  const fitRow = h('label', { class: 'r-setting-row' },
+    h('span', { class: 'r-setting-copy' }, h('span', { class: 'r-setting-label' }, '图片适配')),
+    fitSelect,
+  );
+  const scrollWidthRow = h('label', { class: 'r-setting-row' },
+    h('span', { class: 'r-setting-copy' },
+      h('span', { class: 'r-setting-label' }, '桌面滚动栏宽'),
+      h('span', { class: 'r-setting-desc' }, '调整宽屏下漫画页面的最大阅读宽度'),
+    ),
+    scrollWidthSelect,
+  );
+  const tapModeRow = h('label', { class: 'r-setting-row' },
+    h('span', { class: 'r-setting-copy' },
+      h('span', { class: 'r-setting-label' }, '滚动点击区域'),
+      h('span', { class: 'r-setting-desc' }, '点击对应区域快速滚动一屏'),
+    ),
+    tapModeSelect,
+  );
+
   const panel = h('aside', {
     class: 'r-settings', role: 'dialog', 'aria-modal': 'true',
     'aria-labelledby': titleId, 'aria-hidden': 'true',
@@ -167,17 +194,9 @@ export function createReaderSettings(options) {
     h('div', { class: 'r-settings-body' },
       h('section', { class: 'r-setting-section' },
         h('h4', null, '阅读方式'), modeGroup,
-        h('label', { class: 'r-setting-row' },
-          h('span', { class: 'r-setting-copy' }, h('span', { class: 'r-setting-label' }, '图片适配')),
-          fitSelect,
-        ),
-        h('label', { class: 'r-setting-row' },
-          h('span', { class: 'r-setting-copy' },
-            h('span', { class: 'r-setting-label' }, '滚动点击区域'),
-            h('span', { class: 'r-setting-desc' }, '点击对应区域快速滚动一屏'),
-          ),
-          tapModeSelect,
-        ),
+        fitRow,
+        scrollWidthRow,
+        tapModeRow,
       ),
       h('section', { class: 'r-setting-section' },
         h('h4', null, '显示'),
@@ -239,10 +258,16 @@ export function createReaderSettings(options) {
       button.setAttribute('aria-checked', String(selected));
       button.tabIndex = selected ? 0 : -1;
     });
+    const isScroll = mode === 'scroll';
     fitSelect.value = s.pageFit === 'width' ? 'width' : 'contain';
-    fitSelect.disabled = mode === 'scroll';
+    fitSelect.disabled = isScroll;
+    fitRow.hidden = isScroll;
+    scrollWidthSelect.value = ['narrow', 'standard', 'wide', 'full'].includes(s.scrollWidth) ? s.scrollWidth : 'standard';
+    scrollWidthSelect.disabled = !isScroll;
+    scrollWidthRow.hidden = !isScroll;
     tapModeSelect.value = s.tapMode === 'side' ? 'side' : 'default';
-    tapModeSelect.disabled = mode !== 'scroll';
+    tapModeSelect.disabled = !isScroll;
+    tapModeRow.hidden = !isScroll;
     themeSelect.value = ['auto', 'light', 'dark'].includes(s.theme) ? s.theme : 'auto';
     shuntSelect.value = ['1', '2', '3', '4'].includes(String(s.shunt)) ? String(s.shunt) : '1';
     shuntSelect.disabled = s.offline === true || s.sourceRefreshPending === true || !s.sourceReady;

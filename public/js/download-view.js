@@ -10,6 +10,7 @@ import {
 } from './offline.js';
 import { exportAlbumZip, exportAlbumPdf, exportChapterZip, exportChapterPdf } from './export.js';
 import { setting } from './store.js';
+import { toast, confirmDialog, subpageBackLink } from './ui.js';
 
 function element(tag, attrs, ...children) {
   const node = document.createElement(tag);
@@ -44,14 +45,18 @@ function emptyState(title, description = '') {
     description ? element('span', { text: description }) : null);
 }
 
-function confirmLargePdf(chapters, selectedIds = null) {
+async function confirmLargePdf(chapters, selectedIds = null) {
   const wanted = selectedIds && selectedIds.length ? new Set(selectedIds.map(String)) : null;
   const selected = chapters.filter((chapter) => chapter.complete
     && (!wanted || wanted.has(String(chapter.photoId))));
   const pages = selected.reduce((sum, chapter) => sum + Number(chapter.imageCount || 0), 0);
   const size = selected.reduce((sum, chapter) => sum + Number(chapter.totalBytes || 0), 0);
   if (pages < 200 && size < 256 * 1024 * 1024) return true;
-  return confirm(`将一次载入 ${selected.length} 章、约 ${pages} 页（${bytes(size)}）到打印窗口，可能占用较多内存。是否继续？`);
+  return confirmDialog({
+    title: '导出较大 PDF',
+    message: `将一次载入 ${selected.length} 章、约 ${pages} 页（${bytes(size)}）到打印窗口，可能占用较多内存。是否继续？`,
+    confirmText: '继续导出',
+  });
 }
 
 function statusLabel(status) {
@@ -69,7 +74,7 @@ function actionButton(label, fn, kind = '') {
   const button = element('button', { type: 'button', class: `download-action ${kind}`.trim() }, label);
   button.addEventListener('click', async () => {
     button.disabled = true;
-    try { await fn(); } catch (error) { alert(error.message || '操作失败'); }
+    try { await fn(); } catch (error) { toast(error.message || '操作失败'); }
     finally { if (button.isConnected) button.disabled = false; }
   });
   return button;
@@ -140,17 +145,20 @@ export function mountDownloadCenter(root, options = {}) {
   const storageText = element('span', { class: 'download-storage', text: '正在统计空间…' });
   const container = element('div', { class: 'download-center' },
     element('header', { class: 'download-center-head' },
-      element('div', null,
-        element('span', { class: 'download-kicker', text: 'LOCAL LIBRARY' }),
+      element('div', { class: 'download-head-copy' },
+        subpageBackLink('#/user', '个人中心'),
+        element('span', { class: 'download-kicker', text: '本地资料库' }),
         element('h1', { text: '下载与离线' }),
         element('p', { text: '下载后的正文保存在当前浏览器，可断网阅读。' }),
       ),
-      storageText,
-      actionButton('申请持久存储', async () => {
-        const accepted = await requestPersistentStorage();
-        alert(accepted ? '浏览器已允许持久保存' : '浏览器未授予持久保存；仍可正常离线，但空间紧张时缓存可能被清理');
-        refreshStorage();
-      }),
+      element('div', { class: 'download-head-meta' },
+        storageText,
+        actionButton('申请持久存储', async () => {
+          const accepted = await requestPersistentStorage();
+          toast(accepted ? '浏览器已允许持久保存' : '未授予持久保存；空间紧张时缓存可能被系统清理', 3200);
+          refreshStorage();
+        }),
+      ),
     ),
     integrityArea,
     taskArea,
@@ -244,7 +252,15 @@ export function mountDownloadCenter(root, options = {}) {
     if (batchBusy) return;
     const targets = selectedTasks(predicate).slice(0, MAX_BATCH_SELECTION);
     if (!targets.length) return;
-    if (confirmMessage && !confirm(confirmMessage(targets.length))) return;
+    if (confirmMessage) {
+      const ok = await confirmDialog({
+        title: `批量${label}任务`,
+        message: confirmMessage(targets.length),
+        confirmText: `确认${label}`,
+        danger: label === '删除',
+      });
+      if (!ok) return;
+    }
 
     batchBusy = true;
     updateBatchUi();
@@ -281,7 +297,7 @@ export function mountDownloadCenter(root, options = {}) {
     announceBatch(details.join('，'));
     if (failures.length) {
       const first = failures[0];
-      alert(`${label}完成，但有 ${failures.length} 个任务失败：${first}${failures.length > 1 ? '（其余错误请稍后重试）' : ''}`);
+      toast(`${label}完成，但有 ${failures.length} 个任务失败：${first}`, 3500);
     }
   }
 
@@ -389,7 +405,13 @@ export function mountDownloadCenter(root, options = {}) {
     if (task.status === 'paused' || task.status === 'failed') controls.append(actionButton(task.status === 'failed' ? '重试' : '继续', () => downloads.resume(task.id), 'primary'));
     controls.append(actionButton('移除任务', () => downloads.remove(task.id)));
     controls.append(actionButton('删除任务和缓存', async () => {
-      if (confirm(`确定删除“${task.albumName || task.aid}”的全部离线正文吗？`)) await downloads.remove(task.id, { removeData: true });
+      const ok = await confirmDialog({
+        title: '删除任务与离线正文',
+        message: `确定删除“${task.albumName || task.aid}”的任务及全部离线正文吗？`,
+        confirmText: '全部删除',
+        danger: true,
+      });
+      if (ok) await downloads.remove(task.id, { removeData: true });
     }, 'danger'));
     if (restoreFocus) queueMicrotask(() => controls.querySelector('button:not(:disabled)')?.focus({ preventScroll: true }));
   }
@@ -509,9 +531,9 @@ export function mountDownloadCenter(root, options = {}) {
       const chapterList = element('div', { class: 'offline-chapter-list' });
       const selectedChapters = new Set();
       const selectedZip = actionButton('所选 ZIP', () => exportAlbumZip(album.aid, { chapterIds: [...selectedChapters] }));
-      const selectedPdf = actionButton('所选合并 PDF', () => {
+      const selectedPdf = actionButton('所选合并 PDF', async () => {
         const chapterIds = [...selectedChapters];
-        if (!confirmLargePdf(chapters, chapterIds)) return null;
+        if (!await confirmLargePdf(chapters, chapterIds)) return null;
         return exportAlbumPdf(album.aid, { chapterIds });
       });
       selectedZip.disabled = true;
@@ -544,11 +566,17 @@ export function mountDownloadCenter(root, options = {}) {
       }
       const albumActions = element('div', { class: 'download-actions' },
         actionButton('导出整本 ZIP', () => exportAlbumZip(album.aid)),
-        actionButton('导出整本 PDF', () => confirmLargePdf(chapters) ? exportAlbumPdf(album.aid) : null),
+        actionButton('导出整本 PDF', async () => (await confirmLargePdf(chapters)) ? exportAlbumPdf(album.aid) : null),
         selectedZip,
         selectedPdf,
         actionButton('删除离线漫画', async () => {
-          if (confirm(`确定删除“${album.name || album.aid}”的全部离线内容吗？`)) {
+          const ok = await confirmDialog({
+            title: '删除离线漫画',
+            message: `确定删除“${album.name || album.aid}”的全部离线内容吗？此操作不可恢复。`,
+            confirmText: '删除离线漫画',
+            danger: true,
+          });
+          if (ok) {
             await downloads.removeAlbum(album.aid);
             await requestLibraryRender();
             await refreshStorage();

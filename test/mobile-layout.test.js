@@ -90,6 +90,120 @@ assertRule(
   '漫画封面图片必须填满 3:4 容器并使用 object-fit: cover',
 );
 
+// 顶栏与主内容必须计入 safe-area-inset-top，避免全屏/PWA 刘海屏遮挡。
+assertRule(
+  /--safe-top\s*:\s*env\(\s*safe-area-inset-top/,
+  '根变量必须声明 safe-area-inset-top 兜底',
+);
+assertRule(
+  /#topbar\s*\{[^}]*height\s*:\s*var\(--topbar-total-h\)[^}]*padding\s*:\s*var\(--safe-top\)/,
+  '顶栏高度与内边距必须计入顶部安全区',
+);
+assertRule(
+  /#main\s*\{[^}]*padding-top\s*:\s*var\(--topbar-total-h\)/,
+  '主内容顶部内边距必须与含安全区的顶栏高度对齐',
+);
+
+// 调色板衍生色必须动态跟随 --primary / --secondary，避免切换蓝/绿/紫主题后残留粉底。
+assertRule(
+  /--primary-weak\s*:\s*color-mix\(\s*in\s+srgb\s*,\s*var\(--primary\)/,
+  '--primary-weak 必须由 --primary 动态混合生成',
+);
+assertRule(
+  /--accent\s*:\s*var\(--secondary\)/,
+  '--accent 必须接入调色板的 --secondary 变量',
+);
+
+// 触屏输入框字号 >= 16px，阻止 iOS Safari 聚焦自动放大页面。
+assertRule(
+  /@media\s*\(pointer\s*:\s*coarse\)[^{]*\{[\s\S]*?\.input[^{]*\{[^}]*font-size\s*:\s*16px/,
+  '触屏设备输入框必须使用 16px 字号防止浏览器自动缩放',
+);
+
+// 移动端 AI 会话侧栏必须支持抽屉展开，不能彻底隐藏历史会话。
+assertRule(
+  /\.ai-page\.sidebar-open\s+\.ai-sidebar\s*\{[^}]*visibility\s*:\s*visible/,
+  '移动端 AI 页面必须提供可展开的会话抽屉样式',
+);
+
+// 全站前端禁止使用阻塞且破坏移动端体验的原生 alert / confirm / prompt。
+for (const name of fs.readdirSync(path.join(root, 'public', 'js')).filter((item) => item.endsWith('.js'))) {
+  const jsSource = fs.readFileSync(path.join(root, 'public', 'js', name), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  assert.ok(
+    !/\b(?:window\.)?(?:alert|confirm|prompt)\s*\(/.test(jsSource),
+    `${name} 不得调用原生阻塞弹窗 alert/confirm/prompt`,
+  );
+}
+
+const uiSource = fs.readFileSync(path.join(root, 'public', 'js', 'ui.js'), 'utf8');
+assert.match(
+  uiSource,
+  /if\s*\(isEditable\s*&&\s*!shouldAutoFocusEditable\(\)\)\s*return\s+panel/,
+  'openModal / promptDialog 必须在移动端把初始焦点回退到非 editable 的对话框面板',
+);
+assert.match(
+  uiSource,
+  /clipboardPrivate\s*:\s*'true'/,
+  'promptDialog 敏感输入必须标记 data-clipboard-private 防止剪贴板嗅探',
+);
+assert.match(
+  uiSource,
+  /if\s*\(event\.key\s*===\s*'Tab'\)/,
+  'openModal 必须拦截 Tab 键将键盘焦点限制在活动对话框内',
+);
+
+// 遮罩层级不变量：应用锁 < 模态框 < Toast < 隐私失焦伪装，确保应用锁灾难恢复弹窗与提示不被锁屏层遮挡。
+function extractZIndex(pattern, label) {
+  const matched = css.match(pattern);
+  assert.ok(matched, `缺少 ${label} 的 z-index 声明`);
+  return Number(matched[1]);
+}
+const lockZ = extractZIndex(/\.local-lock-overlay[^{]*\{[^}]*z-index\s*:\s*(\d+)/, '应用锁遮罩');
+const modalZ = extractZIndex(/\.jmw-modal-backdrop\s*\{[^}]*z-index\s*:\s*(\d+)/, '模态弹窗遮罩');
+const toastZ = extractZIndex(/\.toast\s*\{[^}]*z-index\s*:\s*(\d+)/, 'Toast 提示');
+const privacyZ = extractZIndex(/\.privacy-mode\.window-blurred\s+body::after\s*\{[^}]*z-index\s*:\s*(\d+)/, '隐私伪装遮罩');
+assert.ok(lockZ < modalZ, '模态框 z-index 必须高于应用锁遮罩，否则灾难恢复输入框会被锁屏挡住');
+assert.ok(modalZ < toastZ, 'Toast z-index 必须高于模态框与锁屏遮罩');
+assert.ok(toastZ < privacyZ, '隐私失焦遮罩 z-index 必须高于普通弹窗与提示');
+
+// 全屏遮罩（模态框、应用锁、首次引导）在手机矮屏/横屏下必须自身可滚动并用 margin: auto 居中卡片，防止顶部内容裁切。
+assertRule(
+  /\.jmw-modal-backdrop\s*\{[^}]*display\s*:\s*flex[^}]*overflow-y\s*:\s*auto/,
+  '模态遮罩必须支持纵向滚动防止矮屏裁切',
+);
+assertRule(
+  /\.jmw-modal\s*\{[^}]*margin\s*:\s*auto/,
+  '模态卡片必须使用 margin: auto 兼顾居中与安全滚动',
+);
+assertRule(
+  /\.local-lock-overlay\s*,\s*\.onboarding-overlay\s*\{[^}]*display\s*:\s*flex[^}]*overflow-y\s*:\s*auto/,
+  '应用锁与引导遮罩必须支持纵向滚动防止 PIN+手势双启用或横屏时裁切解锁控件',
+);
+assertRule(
+  /\.local-lock-card\s*,\s*\.onboarding-card\s*\{[^}]*margin\s*:\s*auto/,
+  '应用锁与引导卡片必须使用 margin: auto 兼顾居中与安全滚动',
+);
+
+// AI 页面在移动端包含 position: fixed 会话抽屉，禁止在 .ai-page 上驻留带 transform 的 forwards/both 动画。
+assertRule(
+  /\.page:not\(\.page-wide\):not\(\.ai-page\)\s*\{\s*animation\s*:\s*page-in\s+[\d.]+s\s+ease-out\s*;\s*\}/,
+  '.page 入场动画必须排除 .ai-page 且不得使用 both/forwards 残留 transform 包含块',
+);
+
+// 历史记录卡片内嵌角标删除按钮必须具备定位锚点并阻止外层 <a> 默认跳转。
+assertRule(
+  /\.comic-card\.has-corner-action\s*\{\s*position\s*:\s*relative\s*;\s*\}/,
+  '带角标操作的漫画卡片必须声明 position: relative',
+);
+const userSource = fs.readFileSync(path.join(root, 'public', 'js', 'user.js'), 'utf8');
+assert.match(
+  userSource,
+  /class:\s*'card-corner-btn'[\s\S]*?onclick:\s*async\s*\(e\)\s*=>\s*\{\s*e\.preventDefault\(\);\s*e\.stopPropagation\(\);/,
+  '历史卡片角标删除按钮必须同时调用 preventDefault 与 stopPropagation，防止触发外层链接跳转',
+);
+
 class FakeStyle {
   constructor() { this.values = new Map(); }
   setProperty(name, value) { this.values.set(name, String(value)); }
