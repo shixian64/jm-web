@@ -1,6 +1,6 @@
 // 应用外壳与路由：顶栏（桌面导航）/ 底部 Tab（手机）/ 各页面挂载
 import { applyTheme, setting } from './store.js';
-import { api, prefetchBootHome, markBootSeen } from './api.js';
+import { api, prefetchBootHome, markBootSeen, commentAvatarSrc } from './api.js';
 import { startAnalytics, trackPage } from './analytics-client.js';
 import { h, toast, errorBox, routeErrorMessage, disposeImageRetries, observeImageRetries } from './ui.js';
 import { icon } from './icons.js';
@@ -488,9 +488,8 @@ async function refreshAvatar() {
     const me = (await api.me()).user;
     if (seq !== avatarRefreshSeq) return;
     if (me) {
-      const src = me.photo
-        ? (/^https?:/i.test(me.photo) ? `/api/img?u=${encodeURIComponent(me.photo)}` : `/api/img?path=${encodeURIComponent(me.photo.startsWith('/') ? me.photo : '/' + me.photo)}`)
-        : '';
+      // 上游 photo 多为裸文件名（如 nopic-Male.gif?v=0），须补齐到 /media/users/。
+      const src = commentAvatarSrc(me.photo);
       const fallback = (me.username || '友').slice(0, 1);
       if (src) {
         const avatar = h('img', { src, alt: '', onerror: () => avatarMini.replaceChildren(fallback) });

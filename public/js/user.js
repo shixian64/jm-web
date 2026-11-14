@@ -1,5 +1,5 @@
 // 用户与设置页面：登录 / 个人中心 / 签到 / 收藏 / 阅读历史 / 评论历史 / 本地记录 / 设置
-import { api, imgSrc, commentContentText, commentPageHasMore, navigationState } from './api.js';
+import { api, imgSrc, commentAvatarSrc, commentContentText, commentPageHasMore, navigationState } from './api.js';
 import {
   h, toast, comicCard, infiniteList, installPullToRefresh, errorBox, loadingBox, installImageRetry,
   confirmDialog, promptDialog, subpageBackLink,
@@ -421,9 +421,8 @@ function renderLogin(page, ctx, reload) {
 }
 
 function renderProfile(page, me, ctx, reload, beforeReplace) {
-  const avatarSrc = me.photo
-    ? (/^https?:/i.test(me.photo) ? `/api/img?u=${encodeURIComponent(me.photo)}` : `/api/img?path=${encodeURIComponent(me.photo.startsWith('/') ? me.photo : '/' + me.photo)}`)
-    : '';
+  // 上游 photo 多为裸文件名（如 nopic-Male.gif?v=0），须补齐到 /media/users/。
+  const avatarSrc = commentAvatarSrc(me.photo);
   const avatarFallback = (me.username || '友').slice(0, 1);
   const avatar = h('div', { class: 'avatar' }, avatarFallback);
   if (avatarSrc) {

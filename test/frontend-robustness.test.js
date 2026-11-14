@@ -124,6 +124,17 @@ function jsonResponse(body, status = 200) {
   );
   assert.strictEqual(commentAvatarSrc('javascript:alert(1)'), '');
   assert.strictEqual(commentAvatarSrc('../private.jpg'), '');
+  // /me 返回的 photo 是带版本 query 的裸文件名；顶栏与个人页头像必须复用同一映射，
+  // 否则会拼出 /api/img?path=/nopic-Male.gif?v=0 并被代理以 400 拒绝。
+  assert.strictEqual(
+    commentAvatarSrc('nopic-Male.gif?v=0'),
+    '/api/img?path=%2Fmedia%2Fusers%2Fnopic-Male.gif',
+  );
+  for (const file of ['app.js', 'user.js']) {
+    const avatarSource = require('fs').readFileSync(path.resolve(__dirname, '../public/js', file), 'utf8');
+    assert.match(avatarSource, /commentAvatarSrc\(me\.photo\)/, `${file} 头像须经 commentAvatarSrc`);
+    assert.doesNotMatch(avatarSource, /api\/img\?path=\$\{encodeURIComponent\(me\.photo/, `${file} 不得手拼头像路径`);
+  }
 
   assert.strictEqual(COMMENT_PAGE_SIZE, 10);
   assert.strictEqual(commentPageCount('95'), 10);
