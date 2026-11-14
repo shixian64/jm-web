@@ -315,12 +315,21 @@ const MIME = {
   '.txt': 'text/plain; charset=utf-8',
 };
 
+// 阅读器直连图片 CDN（失败回退 /api/img 代理）。只放行 fetch 读取原图 Blob，
+// 须与 public/js/api.js 的 DIRECT_IMAGE_HOST_RE 保持一致。
+const IMAGE_DIRECT_CSP_SOURCES = [
+  ...[1, 2, 3, 4, 5].map((n) => `https://*.jmapiproxy${n}.cc`),
+  'https://*.jmapinodeudzn.net',
+  'https://*.jmdanjonproxy.vip',
+  'https://*.jmdanjonproxy.xyz',
+];
+
 const CSP = [
   "default-src 'self'",
   "img-src 'self' data: blob:",
   "style-src 'self' 'unsafe-inline'",
   "script-src 'self'",
-  "connect-src 'self'",
+  `connect-src 'self' ${IMAGE_DIRECT_CSP_SOURCES.join(' ')}`,
   "font-src 'self'",
   "worker-src 'self' blob:",
   "frame-ancestors 'none'",
@@ -3040,6 +3049,7 @@ if (require.main === module) {
 
 module.exports = {
   server,
+  IMAGE_DIRECT_CSP_SOURCES,
   createApiCache,
   albumCacheKey,
   warmPublicFeeds,

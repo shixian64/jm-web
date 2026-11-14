@@ -1729,6 +1729,12 @@ export async function settingsView(root, ctx) {
   const shuntSel = selectRow('图片分流线路', [['1', '线路 1'], ['2', '线路 2'], ['3', '线路 3'], ['4', '线路 4']], String(setting.shunt),
     (v) => updateSetting({ shunt: v }));
 
+  /* 章节图片直连 */
+  const directSel = selectRow('章节图片加载方式', [
+    ['auto', '直连优先（失败自动走服务器）'], ['off', '始终经服务器代理'],
+  ], setting.imageDirect === 'off' ? 'off' : 'auto',
+    (v) => updateSetting({ imageDirect: v }));
+
   /* API 域名（保存到本浏览器会话，不影响其他访客；环境变量锁定时不可改） */
   const hostOptions = [
     ['', '自动（默认线路）'],
@@ -1772,6 +1778,9 @@ export async function settingsView(root, ctx) {
     h('div', { class: 'setting-group' },
       h('div', { class: 'setting-item setting-section-title' }, h('div', { class: 'lab' }, '网络与线路')),
       shuntSel,
+      directSel,
+      h('div', { class: 'setting-item' }, h('div', { class: 'hint' },
+        '直连时由浏览器直接从图片 CDN 下载，CDN 可看到你的 IP；当前网络无法直连时自动改走服务器。')),
       h('div', { class: 'setting-item' },
         h('div', { class: 'setting-row' },
           h('div', null, h('div', { class: 'lab', style: 'margin-bottom:0' }, 'API 域名')),

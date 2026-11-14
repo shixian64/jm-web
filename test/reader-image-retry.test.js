@@ -84,7 +84,9 @@ global.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
     await assert.rejects(fetchReaderImageResponse('/api/img', { signal: abortController.signal }), error => error.name === 'AbortError');
     assert.equal(calls, 1);
     const source = fs.readFileSync(readerPath, 'utf8');
-    assert.match(source, /await fetchReaderImageResponse\(srcOf\(idx\),/);
+    // 阅读器原图经 fetchChapterImageBlob（直连失败回退代理），代理分支仍走准入重试。
+    assert.match(source, /blob = await fetchChapterImageBlob\(\{[\s\S]{0,200}proxyUrl: srcOf\(idx\),/);
+    assert.match(source, /const res = await fetchReaderImageResponse\(proxyUrl, \{/);
     console.log('reader admission retry / bounded backoff / body cleanup / cancellation all pass');
   } finally {
     global.fetch = saved.fetch; global.setTimeout = saved.setTimeout; global.clearTimeout = saved.clearTimeout; Math.random = saved.random;

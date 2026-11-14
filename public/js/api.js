@@ -381,3 +381,20 @@ export function chapterImgSrc(url) {
   const value = typeof url === 'string' ? url.trim() : '';
   return value ? '/api/img?u=' + encodeURIComponent(value) : '';
 }
+
+// 浏览器直连的图片 CDN 白名单：须与服务端 CSP connect-src（server.js IMAGE_DIRECT_CSP_SOURCES）
+// 一致，且是服务端 isKnownImageHost 的子集。不在名单内的地址只走同源代理。
+const DIRECT_IMAGE_HOST_RE = /^(?:(?:cdn-msp\d*|tencent)\.jmapiproxy[1-5]\.cc|cdn-msp\d*\.jmapinodeudzn\.net|(?:cdn-msp\d*|tencent)\.jmdanjonproxy\.(?:vip|xyz))$/;
+
+/** 章节图片的直连地址；不满足 https、白名单主机、/media/ 路径时返回空串。 */
+export function chapterImgDirectSrc(url) {
+  const value = typeof url === 'string' ? url.trim() : '';
+  if (!value) return '';
+  let parsed;
+  try { parsed = new URL(value); } catch (_) { return ''; }
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.port) return '';
+  if (!DIRECT_IMAGE_HOST_RE.test(parsed.hostname.toLowerCase())) return '';
+  if (!parsed.pathname.startsWith('/media/')) return '';
+  parsed.hash = '';
+  return parsed.href;
+}

@@ -15,6 +15,7 @@ const defaultSetting = {
   palette: 'default',   // default | ocean | sunset | forest | lavender | custom
   customColors: { primary: '#e5588a', secondary: '#7c6ee6', tertiary: '#3f9e8f', error: '#c93f55' },
   shunt: '1',           // 图片分流 1-4
+  imageDirect: 'auto',  // 章节图片：auto 直连 CDN 失败回退代理 | off 始终经服务器代理
   readMode: 'scroll',   // scroll | page | pageReverse | tap
   pageFit: 'contain',   // 翻页适配：contain | width
   scrollWidth: 'standard', // 滚动模式桌面栏宽：narrow | standard | wide | full

@@ -1,6 +1,6 @@
 // 阅读器：滚动 / 左右翻页 / 纯点击，Canvas 解扰，预加载，章节抽屉与阅读中设置
 // 协议与还原算法对齐 jm-mobile 的 ComicReadViewModel + ComicPicImageState
-import { apiRequest, chapterImgSrc, imgSrc, selectedDataSource } from './api.js';
+import { apiRequest, chapterImgSrc, chapterImgDirectSrc, imgSrc, selectedDataSource } from './api.js';
 import { trackComic } from './analytics-client.js';
 import { setting, updateSetting, recordAlbumHistory } from './store.js';
 import { needsScramble, decodeFromBlob } from './descramble.js';
@@ -53,6 +53,95 @@ export async function fetchReaderImageResponse(url, options = {}) {
       if (signal?.aborted) onAbort();
     });
   }
+}
+
+// 直连 CDN：单张总时限（含响应体）。慢网下超时后仍可回退代理，不会卡死当前页。
+const DIRECT_IMAGE_TIMEOUT_MS = 15000;
+// 连续直连失败达到阈值后，本页面会话在冷却期内全部改走代理，避免每张图都先等一次失败。
+const DIRECT_IMAGE_FAILURE_LIMIT = 2;
+const DIRECT_IMAGE_COOLDOWN_MS = 10 * 60 * 1000;
+const directImageHealth = { failures: 0, disabledUntil: 0 };
+
+export function resetDirectImageHealth() {
+  directImageHealth.failures = 0;
+  directImageHealth.disabledUntil = 0;
+}
+
+export function directImageAvailable(now = Date.now()) {
+  return now >= directImageHealth.disabledUntil;
+}
+
+function noteDirectImageFailure(now = Date.now()) {
+  directImageHealth.failures++;
+  if (directImageHealth.failures >= DIRECT_IMAGE_FAILURE_LIMIT) {
+    directImageHealth.failures = 0;
+    directImageHealth.disabledUntil = now + DIRECT_IMAGE_COOLDOWN_MS;
+  }
+}
+
+function imageMimeOf(value) {
+  return String(value || '').split(';', 1)[0].trim().toLowerCase();
+}
+
+async function directImageBlob(url, signal, priority) {
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(signal.reason);
+  signal?.addEventListener('abort', onAbort, { once: true });
+  const timer = setTimeout(() => controller.abort(new DOMException('图片直连超时', 'TimeoutError')), DIRECT_IMAGE_TIMEOUT_MS);
+  try {
+    // 不带 Cookie 与 Referer：CDN 允许任意来源（ACAO: *），也不需要知道本站地址。
+    const response = await fetch(url, {
+      method: 'GET', mode: 'cors', credentials: 'omit', referrerPolicy: 'no-referrer',
+      priority, signal: controller.signal,
+    });
+    if (!response.ok || !SAFE_IMAGE_MIME.has(imageMimeOf(response.headers?.get('content-type')))) {
+      try { await response.body?.cancel(); } catch (_) {}
+      return null;
+    }
+    const blob = await response.blob();
+    if (!(blob instanceof Blob) || !blob.size || !SAFE_IMAGE_MIME.has(imageMimeOf(blob.type))) return null;
+    return blob;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+  }
+}
+
+/**
+ * 章节原图：有直连地址且直连未处于冷却时先直连 CDN，任何失败（网络、CSP、超时、
+ * 非图片响应）都回退同源代理；路由取消则直接抛出，不再回退。
+ */
+export async function fetchChapterImageBlob({ directUrl = '', proxyUrl, signal, priority, headers, label = '图片' } = {}) {
+  const throwIfCancelled = () => {
+    if (signal?.aborted) throw signal.reason || new DOMException('阅读器已关闭', 'AbortError');
+  };
+  throwIfCancelled();
+  if (directUrl && directImageAvailable()) {
+    let blob = null;
+    try {
+      blob = await directImageBlob(directUrl, signal, priority);
+    } catch (_) {
+      throwIfCancelled();
+    }
+    throwIfCancelled();
+    if (blob) {
+      directImageHealth.failures = 0;
+      return blob;
+    }
+    noteDirectImageFailure();
+  }
+  // 上游故障仍由代理换线；仅带 Retry-After 的临时准入拒绝有限重试。
+  const res = await fetchReaderImageResponse(proxyUrl, {
+    headers, credentials: 'same-origin', priority, signal,
+  });
+  if (!res.ok) throw new Error(`${label}获取失败（${res.status}）`);
+  if (!SAFE_IMAGE_MIME.has(imageMimeOf(res.headers?.get('content-type')))) {
+    throw new Error(`${label}返回了不支持的内容类型`);
+  }
+  const blob = await res.blob();
+  if (!(blob instanceof Blob) || !blob.size) throw new Error(`${label}返回了空内容`);
+  if (!SAFE_IMAGE_MIME.has(imageMimeOf(blob.type))) throw new Error(`${label}返回了无效图片内容`);
+  return blob;
 }
 
 /**
@@ -1196,23 +1285,15 @@ export function mountReader(root, photoId, query, options = {}) {
       blob = stored?.blob;
       if (!(blob instanceof Blob) || !blob.size) throw new Error(`离线图片 ${idx + 1} 缺失或损坏`);
     } else {
-      // 上游故障仍由代理换线；仅带 Retry-After 的临时准入拒绝有限重试。
       assertImageActive(generation, imageSignal);
-      const res = await fetchReaderImageResponse(srcOf(idx), {
+      blob = await fetchChapterImageBlob({
+        directUrl: setting.imageDirect === 'off' ? '' : chapterImgDirectSrc(state.images[idx].url),
+        proxyUrl: srcOf(idx),
         headers: { 'X-JMW-Data-Source': selectedDataSource() },
-        credentials: 'same-origin',
         priority: idx === state.cur ? 'high' : 'low',
         signal: imageSignal,
+        label: `图片 ${idx + 1} `,
       });
-      if (!res.ok) throw new Error(`图片 ${idx + 1} 获取失败（${res.status}）`);
-      const responseMime = String(res.headers?.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
-      if (!SAFE_IMAGE_MIME.has(responseMime)) {
-        throw new Error(`图片 ${idx + 1} 返回了不支持的内容类型`);
-      }
-      blob = await res.blob();
-      if (!(blob instanceof Blob) || !blob.size) throw new Error(`图片 ${idx + 1} 返回了空内容`);
-      const blobMime = String(blob.type || '').split(';', 1)[0].trim().toLowerCase();
-      if (!SAFE_IMAGE_MIME.has(blobMime)) throw new Error(`图片 ${idx + 1} 返回了无效图片内容`);
     }
     assertImageActive(generation, imageSignal);
     cacheRaw(idx, blob);
