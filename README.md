@@ -225,7 +225,7 @@ docker compose --env-file .env \
 | `ACCESS_PASSWORD` | 空 | 设置后打开网页需要输入口令（容器/反代部署必须设置；至少 16 字节高熵随机值；口令错误有 5 分钟限流） |
 | `JM_API_BASE` | 空 | 覆盖 API 域名，逗号分隔多个候选；**设置后锁定**，网页设置页不可再切换 |
 | `JM_UA` | `okhttp/4.9.3` | 请求上游使用的 UA |
-| `JM_TIMEOUT` | `20000` | 上游单域名超时（毫秒） |
+| `JM_TIMEOUT` | `10000` | 上游单域名超时（毫秒） |
 | `JM_TOTAL_TIMEOUT` | `35000` | 上游全部域名轮询总时间预算（毫秒） |
 | `JMW_DATA_DIR` | `./data` | 会话与设置持久化目录；Compose 内固定为 `/app/data` |
 | `JMW_HOST_DATA_DIR` | `./data` | 仅 Compose：挂载到 `/app/data` 的已存在宿主机目录；原生 Linux 上须可由 `1000:1000` 写入 |

@@ -10,7 +10,7 @@
  *  ACCESS_PASSWORD 设置后所有 /api 需要访问口令（简单访问保护）
  *  JM_API_BASE     固定 API 域名（逗号分隔；设置后锁定，接口不可更改）
  *  JM_UA           上游 UA（默认 okhttp/4.9.3）
- *  JM_TIMEOUT      上游单域名超时 ms（默认 20000）
+ *  JM_TIMEOUT      上游单域名超时 ms（默认 10000）
  *  JM_TOTAL_TIMEOUT 上游全部域名总时间预算 ms（默认 35000）
  *  JMW_MAX_CHAPTER_IMAGES 单章节图片数量上限（默认 2000）
  *  JMW_MAX_IMAGE_CONCURRENCY 图片代理全局并发（默认 12）

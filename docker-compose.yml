@@ -100,7 +100,7 @@ services:
       ACCESS_PASSWORD: "${ACCESS_PASSWORD:-}"
       JM_API_BASE: "${JM_API_BASE:-}"
       JM_UA: "${JM_UA:-okhttp/4.9.3}"
-      JM_TIMEOUT: "${JM_TIMEOUT:-20000}"
+      JM_TIMEOUT: "${JM_TIMEOUT:-10000}"
       JM_TOTAL_TIMEOUT: "${JM_TOTAL_TIMEOUT:-35000}"
       # 包含 analytics/state.json：固定最近 30 个自然日、8 MiB，无新增卷/AI 依赖。
       JMW_DATA_DIR: "/app/data"
